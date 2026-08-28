@@ -1,0 +1,17 @@
+[package]
+name    = "kernel"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "kernel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"
+# Unit tests live in the library (D-005); the binary is a shim and has none.
+test = false
+
+[dependencies]

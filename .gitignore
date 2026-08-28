@@ -1,0 +1,18 @@
+# Build output. `-Map=target/kernel.map` from .cargo/config.toml lands here too.
+/target
+
+# Device tree dumps from `qemu-system-riscv64 -machine dumpdtb=virt.dtb`.
+# Regenerated on demand, never edited by hand.
+*.dtb
+*.dts
+
+# Editor and tooling scratch
+.vscode/
+.idea/
+*.swp
+*~
+.gdb_history
+
+# Cargo.lock is deliberately NOT ignored: tessera builds a binary, and the
+# whole point of pinning the toolchain (D-001) is that a clone reproduces our
+# build exactly. Ignoring the lockfile would undo half of that.
