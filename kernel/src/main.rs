@@ -5,6 +5,7 @@
 #![no_main]
 
 use kernel::csr::{sstatus, sstatus_bits};
+use kernel::mm::{self, PhysAddr};
 use kernel::{kernel_entry, layout, println, qemu, trap};
 
 kernel_entry!(kmain);
@@ -65,6 +66,47 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         layout::kernel_end(),
         (layout::kernel_end() - layout::kernel_start()) / 1024
     );
+
+    // ---- M2a: what physical memory is there? ----
+    let dtb = PhysAddr::new(dtb_pa);
+    let map = match mm::init(dtb, layout::kernel_phys_range()) {
+        Ok(map) => map,
+        Err(e) => panic!("could not read the memory map: {:?}", e),
+    };
+
+    println!();
+    println!("physical memory:");
+    println!("  RAM reported by the device tree:");
+    for r in map.ram.iter() {
+        println!("    {:?}", r);
+    }
+    println!("  reserved (firmware, kernel image, DTB):");
+    for r in map.reserved.iter() {
+        println!("    {:?}", r);
+    }
+    println!("  free:");
+    for r in map.free.iter() {
+        println!("    {:?}  = {} frames", r, r.frame_count());
+    }
+    // Read the numbers out and release the lock *before* printing. A SpinLock
+    // masks interrupts for as long as it is held (D-008), and a formatted
+    // println! polls the UART transmitter for every byte -- on real hardware
+    // that is thousands of cycles with interrupts off, for no reason. It would
+    // also be a lock-order hazard: this is the only place that holds FRAMES and
+    // UART at once, and holding two locks in one order is how the other order
+    // becomes a deadlock later.
+    let usable = mm::FRAMES.lock().bytes_remaining();
+    println!(
+        "  usable: {} KiB in {} frames across {} region(s)",
+        usable / 1024,
+        usable / kernel::mm::PAGE_SIZE,
+        map.free.len()
+    );
+
+    // Prove the allocator works and that frames come back zeroed.
+    let a = mm::alloc_frame().expect("no free frames");
+    let b = mm::alloc_frame().expect("no free frames");
+    println!("  test alloc: {} then {} (delta {} B)", a, b, b.as_usize() - a.as_usize());
 
     // Prove the trap path end to end: take a synchronous exception, have the
     // handler mutate supervisor state (advance sepc past the ebreak), and come

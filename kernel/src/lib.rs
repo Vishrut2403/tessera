@@ -14,6 +14,8 @@
 
 pub mod boot;
 pub mod csr;
+pub mod fdt;
+pub mod mm;
 pub mod qemu;
 pub mod sync;
 pub mod test;
@@ -67,6 +69,19 @@ pub mod layout {
     sym_addr!(pub fn bss_end() = __bss_end);
     sym_addr!(pub fn boot_stack_bottom() = __boot_stack_bottom);
     sym_addr!(pub fn boot_stack_top() = __boot_stack_top);
+
+    /// The kernel image as a physical region, for reserving it during memory
+    /// discovery.
+    ///
+    /// Correct only while the linker's addresses *are* physical addresses,
+    /// which is true until M2c sets `KERNEL_VMA`. At that point this becomes
+    /// `linked address - KERNEL_VMA` and the subtraction must be added here.
+    pub fn kernel_phys_range() -> crate::mm::Region {
+        crate::mm::Region::new(
+            crate::mm::PhysAddr::new(kernel_start()),
+            crate::mm::PhysAddr::new(kernel_end()),
+        )
+    }
 }
 
 /// Bring the kernel to a state where `println!` works and traps are handled.
