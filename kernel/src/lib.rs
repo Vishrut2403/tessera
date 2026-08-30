@@ -11,10 +11,15 @@ pub mod csr;
 pub mod fdt;
 pub mod mm;
 pub mod qemu;
+pub mod sbi;
+pub mod sched;
 pub mod sync;
 pub mod test;
+pub mod thread;
+pub mod time;
 pub mod trap;
 pub mod uart;
+pub mod uprog;
 
 /// Where the linker put us.
 pub mod layout {
@@ -69,6 +74,7 @@ pub mod layout {
 pub fn init() {
     uart::init();
     trap::init();
+    trap::use_default_kernel_stack();
 }
 
 /// Read the current stack pointer.

@@ -5,11 +5,27 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::csr::{scause, sepc, sstatus, sstatus_bits, stval, stvec, stvec_mode};
 use crate::println;
 
-/// The general-purpose register file as the trap entry lays it out.
+/// Everything a trap must preserve, laid out the way the trap entry indexes it.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TrapFrame {
+    /// x0..x31 by architectural number; `x[0]` is written as zero for dumps.
     pub x: [usize; 32],
+    pub sepc: usize,
+    pub sstatus: usize,
+}
+
+/// Bytes the entry reserves for a frame: 272 rounded up to keep `sp` 16-aligned.
+pub const FRAME_SIZE: usize = 288;
+
+const _: () = assert!(size_of::<TrapFrame>() == 272, "the asm offsets below are hand-written");
+
+/// Register indices the trap code and the thread code both need.
+pub mod reg {
+    pub const SP: usize = 2;
+    pub const A0: usize = 10;
+    pub const A1: usize = 11;
+    pub const A7: usize = 17;
 }
 
 /// ABI names, for dumps. Index matches the architectural register number.
@@ -34,27 +50,33 @@ pub fn init() {
 }
 
 /// The trap vector. Never called from Rust; `stvec` points here.
+///
+/// `sscratch` is the whole protocol: it holds the current thread's `TrapFrame`
+/// pointer while in U-mode and zero while in the kernel, so one swap classifies
+/// the trap and lands `sp` somewhere usable in the same instruction (D-024).
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.trap")]
 pub unsafe extern "C" fn trap_entry() -> ! {
     core::arch::naked_asm!(
-        // Carve a TrapFrame out of the interrupted stack (D-007: S-mode traps only).
-        "addi sp, sp, -256",
+        "csrrw sp, sscratch, sp",
+        "bnez  sp, 100f",
 
-        "sd   zero, 0(sp)",   // x0's slot, so dumps read cleanly
-        "sd   x1,   8(sp)",
-        // x2 (sp) is handled below: the value we want is the *pre-trap* sp.
-        "sd   x3,   24(sp)",
-        "sd   x4,   32(sp)",
-        "sd   x5,   40(sp)",
-        "sd   x6,   48(sp)",
-        "sd   x7,   56(sp)",
-        "sd   x8,   64(sp)",
-        "sd   x9,   72(sp)",
-        "sd   x10,  80(sp)",
-        "sd   x11,  88(sp)",
-        "sd   x12,  96(sp)",
+        // From S-mode: sscratch was zero, so undo the swap and carve a frame
+        // out of the stack we were already on.
+        "csrrw sp, sscratch, sp",
+        "addi sp, sp, -{frame_size}",
+        "sd   x1, 8(sp)",
+        "sd   x3, 24(sp)",
+        "sd   x4, 32(sp)",
+        "sd   x5, 40(sp)",
+        "sd   x6, 48(sp)",
+        "sd   x7, 56(sp)",
+        "sd   x8, 64(sp)",
+        "sd   x9, 72(sp)",
+        "sd   x10, 80(sp)",
+        "sd   x11, 88(sp)",
+        "sd   x12, 96(sp)",
         "sd   x13, 104(sp)",
         "sd   x14, 112(sp)",
         "sd   x15, 120(sp)",
@@ -74,27 +96,32 @@ pub unsafe extern "C" fn trap_entry() -> ! {
         "sd   x29, 232(sp)",
         "sd   x30, 240(sp)",
         "sd   x31, 248(sp)",
+        "sd   zero, 0(sp)",
+        "addi t0, sp, {frame_size}",
+        "sd   t0, 16(sp)",
+        "csrr t0, sepc",
+        "sd   t0, 256(sp)",
+        "csrr t0, sstatus",
+        "sd   t0, 264(sp)",
 
-        // Reconstruct the caller's sp.
-        "addi t0, sp, 256",
-        "sd   t0,  16(sp)",
-
-        // &mut TrapFrame is the first argument.
         "mv   a0, sp",
         "call {dispatch}",
 
-        "ld   x1,    8(sp)",
-        // x2 is restored by the stack adjustment, not by a load.
-        "ld   x3,   24(sp)",
-        "ld   x4,   32(sp)",
-        "ld   x5,   40(sp)",
-        "ld   x6,   48(sp)",
-        "ld   x7,   56(sp)",
-        "ld   x8,   64(sp)",
-        "ld   x9,   72(sp)",
-        "ld   x10,  80(sp)",
-        "ld   x11,  88(sp)",
-        "ld   x12,  96(sp)",
+        "ld   t0, 256(sp)",
+        "csrw sepc, t0",
+        "ld   t0, 264(sp)",
+        "csrw sstatus, t0",
+        "ld   x1, 8(sp)",
+        "ld   x3, 24(sp)",
+        "ld   x4, 32(sp)",
+        "ld   x5, 40(sp)",
+        "ld   x6, 48(sp)",
+        "ld   x7, 56(sp)",
+        "ld   x8, 64(sp)",
+        "ld   x9, 72(sp)",
+        "ld   x10, 80(sp)",
+        "ld   x11, 88(sp)",
+        "ld   x12, 96(sp)",
         "ld   x13, 104(sp)",
         "ld   x14, 112(sp)",
         "ld   x15, 120(sp)",
@@ -114,13 +141,143 @@ pub unsafe extern "C" fn trap_entry() -> ! {
         "ld   x29, 232(sp)",
         "ld   x30, 240(sp)",
         "ld   x31, 248(sp)",
-
-        "addi sp, sp, 256",
-
-        // Return to sepc, restoring privilege and interrupt enable from sstatus.
+        "addi sp, sp, {frame_size}",
         "sret",
 
+        // From U-mode: sp is the frame inside the TCB, sscratch is the user sp.
+        "100:",
+        "sd   x1, 8(sp)",
+        "sd   x3, 24(sp)",
+        "sd   x4, 32(sp)",
+        "sd   x5, 40(sp)",
+        "sd   x6, 48(sp)",
+        "sd   x7, 56(sp)",
+        "sd   x8, 64(sp)",
+        "sd   x9, 72(sp)",
+        "sd   x10, 80(sp)",
+        "sd   x11, 88(sp)",
+        "sd   x12, 96(sp)",
+        "sd   x13, 104(sp)",
+        "sd   x14, 112(sp)",
+        "sd   x15, 120(sp)",
+        "sd   x16, 128(sp)",
+        "sd   x17, 136(sp)",
+        "sd   x18, 144(sp)",
+        "sd   x19, 152(sp)",
+        "sd   x20, 160(sp)",
+        "sd   x21, 168(sp)",
+        "sd   x22, 176(sp)",
+        "sd   x23, 184(sp)",
+        "sd   x24, 192(sp)",
+        "sd   x25, 200(sp)",
+        "sd   x26, 208(sp)",
+        "sd   x27, 216(sp)",
+        "sd   x28, 224(sp)",
+        "sd   x29, 232(sp)",
+        "sd   x30, 240(sp)",
+        "sd   x31, 248(sp)",
+        "sd   zero, 0(sp)",
+        "csrr t0, sscratch",
+        "sd   t0, 16(sp)",
+        "csrr t0, sepc",
+        "sd   t0, 256(sp)",
+        "csrr t0, sstatus",
+        "sd   t0, 264(sp)",
+
+        // Zero marks "in the kernel", so a nested trap takes the S-mode path.
+        "csrw sscratch, zero",
+        "mv   a0, sp",
+
+        // Onto the hart's one kernel stack. Whatever was on it is dead: the
+        // kernel runs each trap to completion and never resumes an old frame.
+        "lla  t0, {kernel_sp}",
+        "ld   sp, 0(t0)",
+        "tail {user_trap}",
+
+        frame_size = const FRAME_SIZE,
         dispatch = sym dispatch,
+        user_trap = sym crate::sched::user_trap,
+        kernel_sp = sym KERNEL_SP,
+    )
+}
+
+/// This hart's kernel stack. One per hart, not one per thread (D-024): the
+/// kernel runs every trap to completion, so there is never a frame to preserve.
+#[repr(C, align(16))]
+struct KernelStack([u8; KERNEL_STACK_SIZE]);
+
+const KERNEL_STACK_SIZE: usize = 64 * 1024;
+
+static mut TRAP_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
+
+/// Point the trap path at the built-in kernel stack.
+pub fn use_default_kernel_stack() {
+    let base = (&raw const TRAP_STACK) as usize;
+    set_kernel_stack(base + KERNEL_STACK_SIZE);
+}
+
+/// Top of this hart's kernel stack, in a static so the entry can load it.
+static KERNEL_SP: AtomicUsize = AtomicUsize::new(0);
+
+/// Point the trap path at the kernel stack it should run on.
+pub fn set_kernel_stack(top: usize) {
+    assert!(top & 0xf == 0, "kernel stack top is not 16-byte aligned");
+    KERNEL_SP.store(top, Ordering::Relaxed);
+}
+
+pub fn kernel_stack() -> usize {
+    KERNEL_SP.load(Ordering::Relaxed)
+}
+
+/// Resume a thread: `sret` into U-mode with `frame` restored.
+///
+/// # Safety
+/// `frame` must be a live `TrapFrame` whose `sstatus` returns to U-mode, and the
+/// address space that thread expects must already be installed in `satp`.
+#[unsafe(naked)]
+#[unsafe(link_section = ".text.trap")]
+pub unsafe extern "C" fn return_to_user(frame: *mut TrapFrame) -> ! {
+    core::arch::naked_asm!(
+        // The next trap from U-mode finds its frame here.
+        "csrw sscratch, a0",
+        "mv   t6, a0",
+        "ld   t0, 256(t6)",
+        "csrw sepc, t0",
+        "ld   t0, 264(t6)",
+        "csrw sstatus, t0",
+        "ld   x1, 8(t6)",
+        "ld   x2, 16(t6)",
+        "ld   x3, 24(t6)",
+        "ld   x4, 32(t6)",
+        "ld   x5, 40(t6)",
+        "ld   x6, 48(t6)",
+        "ld   x7, 56(t6)",
+        "ld   x8, 64(t6)",
+        "ld   x9, 72(t6)",
+        "ld   x10, 80(t6)",
+        "ld   x11, 88(t6)",
+        "ld   x12, 96(t6)",
+        "ld   x13, 104(t6)",
+        "ld   x14, 112(t6)",
+        "ld   x15, 120(t6)",
+        "ld   x16, 128(t6)",
+        "ld   x17, 136(t6)",
+        "ld   x18, 144(t6)",
+        "ld   x19, 152(t6)",
+        "ld   x20, 160(t6)",
+        "ld   x21, 168(t6)",
+        "ld   x22, 176(t6)",
+        "ld   x23, 184(t6)",
+        "ld   x24, 192(t6)",
+        "ld   x25, 200(t6)",
+        "ld   x26, 208(t6)",
+        "ld   x27, 216(t6)",
+        "ld   x28, 224(t6)",
+        "ld   x29, 232(t6)",
+        "ld   x30, 240(t6)",
+        // t6 last, out of its own slot.
+        "ld   x31, 248(t6)",
+        "sret",
     )
 }
 
@@ -172,23 +329,24 @@ pub extern "C" fn dispatch(frame: &mut TrapFrame) {
     let cause = Cause::decode(scause::read());
 
     match cause {
-        // M1 handles exactly one trap for real: `ebreak`.
+        Cause::Interrupt(5) => crate::time::on_tick(),
         Cause::Exception(3) => {
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
-            skip_faulting_instruction();
+            skip_faulting_instruction(frame);
         }
         _ => fatal(cause, frame),
     }
 }
 
-/// Advance `sepc` past the instruction that trapped.
-fn skip_faulting_instruction() {
-    let pc = sepc::read();
-    // SAFETY: `sepc` points at an instruction we just executed, so it is mapped and readable.
+/// Advance past the instruction that trapped.
+///
+/// This edits the *frame*, not the CSR: the entry reloads `sepc` from the frame
+/// on the way out, so a write to the CSR here would be thrown away.
+fn skip_faulting_instruction(frame: &mut TrapFrame) {
+    let pc = frame.sepc;
+    // SAFETY: `sepc` points at an instruction we just executed, so it is mapped.
     let low = unsafe { core::ptr::read_volatile(pc as *const u16) };
-    let width = if low & 0b11 == 0b11 { 4 } else { 2 };
-    // SAFETY: resuming past the trapping instruction is defined semantics for a handled breakpoint.
-    unsafe { sepc::write(pc + width) };
+    frame.sepc = pc + if low & 0b11 == 0b11 { 4 } else { 2 };
 }
 
 /// Unhandled trap: dump everything and stop.

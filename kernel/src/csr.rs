@@ -74,6 +74,41 @@ macro_rules! csr_rw {
     };
 }
 
+/// As [`csr_rw`], but for a CSR the `riscv64gc` assembler has no name for.
+macro_rules! csr_num {
+    ($(#[$doc:meta])* $name:ident = $num:literal) => {
+        $(#[$doc])*
+        pub mod $name {
+            #[inline(always)]
+            pub fn read() -> usize {
+                let v: usize;
+                // SAFETY: reading an S-mode CSR from S-mode has no side effects.
+                unsafe {
+                    core::arch::asm!(
+                        concat!("csrr {v}, ", $num),
+                        v = out(reg) v,
+                        options(nostack),
+                    );
+                }
+                v
+            }
+
+            /// # Safety
+            /// The caller must uphold whatever invariant this register carries.
+            #[inline(always)]
+            pub unsafe fn write(v: usize) {
+                unsafe {
+                    core::arch::asm!(
+                        concat!("csrw ", $num, ", {v}"),
+                        v = in(reg) v,
+                        options(nostack),
+                    );
+                }
+            }
+        }
+    };
+}
+
 csr_rw!(
     /// Supervisor status: interrupt enable, previous privilege, MMU access bits.
     sstatus
@@ -142,3 +177,8 @@ pub mod stvec_mode {
     /// Interrupts enter at BASE + 4 * cause; exceptions still at BASE.
     pub const VECTORED: usize = 1;
 }
+
+csr_num!(
+    /// Supervisor timer compare (`sstc`). Not in `riscv64gc`, so it goes by number.
+    stimecmp = "0x14d"
+);

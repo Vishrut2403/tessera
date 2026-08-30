@@ -5,7 +5,9 @@
 
 use kernel::csr::{sstatus, sstatus_bits};
 use kernel::mm::{self, PhysAddr};
-use kernel::{kernel_entry, layout, println, qemu, trap};
+use kernel::mm::{AddressSpace, PAGE_SIZE, PteFlags, VirtAddr};
+use kernel::uprog::{self, A7, ECALL, li};
+use kernel::{kernel_entry, layout, println, qemu, sched, time, trap};
 
 kernel_entry!(kmain);
 
@@ -15,7 +17,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     kernel::init();
 
     println!();
-    println!("tessera :: M2 -- higher half, Sv39");
+    println!("tessera :: M3 -- threads, preemption, round-robin");
     println!("  hart          : {}", hartid);
     println!("  device tree   : {:#x}", dtb_pa);
     println!("  sp            : {:#018x}", kernel::stack_pointer());
@@ -178,7 +180,83 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!("  returned from trap; breakpoints handled: {} -> {}", before, after);
     assert_eq!(after, before + 1, "breakpoint handler did not run");
 
+    // --- M3: threads ---
+    time::init(PhysAddr::new(dtb_pa));
     println!();
-    println!("M2 complete. Parking. (Ctrl-A x to exit QEMU)");
+    println!("timer:");
+    println!("  timebase      : {} Hz (from the device tree)", time::timebase_hz());
+    println!("  sstc          : {}", if time::has_sstc() { "yes" } else { "no, using SBI" });
+    println!("  timeslice     : {} ms", time::TIMESLICE_MS);
+
+    // A thread that branches to itself, queued *first*, then three that each
+    // print a letter and exit. Nothing after the spinner runs unless the timer
+    // takes the hart away from it.
+    let spinner = user_space(&kspace, &[uprog::SPIN]);
+    sched::spawn(&spinner, VirtAddr::new(USER_TEXT), VirtAddr::new(USER_STACK + PAGE_SIZE))
+        .expect("spawn failed");
+    core::mem::forget(spinner);
+    for letter in [b'a', b'b', b'c'] {
+        let space = user_space(&kspace, &greeter(letter));
+        sched::spawn(&space, VirtAddr::new(USER_TEXT), VirtAddr::new(USER_STACK + PAGE_SIZE))
+            .expect("spawn failed");
+        core::mem::forget(space);
+    }
+
+    println!();
+    println!("scheduling {} threads; the first one never yields:", sched::ready_count());
+    kernel::print!("  output        : ");
+
+    time::enable();
+    time::arm_next_tick();
+    // SAFETY: the trap path is installed and the dispatcher handles timer interrupts.
+    unsafe { sstatus::set(sstatus_bits::SIE) };
+
+    // Each greeter exits, so this returns three times; the spinner never does.
+    for _ in 0..3 {
+        sched::run_until_exit();
+    }
+
+    // SAFETY: leaving interrupts masked while we print the summary.
+    unsafe { sstatus::clear(sstatus_bits::SIE) };
+    println!();
+    println!("  spawned       : {}", sched::spawned());
+    println!("  exited        : {}", sched::exited());
+    println!("  still ready   : {} (the spinner, preempted and requeued)", sched::ready_count());
+    println!("  timer ticks   : {}", time::TICKS.load(core::sync::atomic::Ordering::Relaxed));
+
+    println!();
+    println!("M3 complete. Parking. (Ctrl-A x to exit QEMU)");
     qemu::park()
+}
+
+const USER_TEXT: usize = 0x1000_0000;
+const USER_STACK: usize = 0x2000_0000;
+
+/// `putc(letter); exit()` — the smallest program that proves a thread ran.
+fn greeter(letter: u8) -> [u32; 5] {
+    [
+        li(uprog::A0, letter as u32),
+        li(A7, sched::syscall::PUTC as u32),
+        ECALL,
+        li(A7, sched::syscall::EXIT as u32),
+        ECALL,
+    ]
+}
+
+/// An address space with one page of user text and one page of user stack.
+fn user_space(kernel: &mm::Mapper, words: &[u32]) -> AddressSpace {
+    let text = mm::alloc_frame().expect("no frames");
+    let stack = mm::alloc_frame().expect("no frames");
+    // SAFETY: both frames came from the allocator, so nothing else owns them.
+    unsafe { uprog::write_to_frame(text, words) };
+
+    let mut alloc = mm::FRAMES.lock();
+    let mut space = AddressSpace::new(kernel, &mut *alloc).expect("address space");
+    space
+        .map(VirtAddr::new(USER_TEXT), text, 0, PteFlags::USER_RX, &mut *alloc)
+        .expect("map text");
+    space
+        .map(VirtAddr::new(USER_STACK), stack, 0, PteFlags::USER_RW, &mut *alloc)
+        .expect("map stack");
+    space
 }
