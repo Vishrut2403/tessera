@@ -155,6 +155,19 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     }
     println!("  direct map rw: verified at {}", mm::phys_to_virt(probe));
 
+    // --- M2d: a user address space over the shared kernel half ---
+    let uspace = {
+        let mut alloc = mm::FRAMES.lock();
+        mm::AddressSpace::new(&kspace, &mut *alloc).expect("could not build a user space")
+    };
+    let text = kernel::mm::VirtAddr::new(layout::text_start());
+    println!();
+    println!("user address space (root at {}):", uspace.root());
+    println!("  satp         : {:#018x}  asid {}", uspace.satp(), uspace.asid().as_u16());
+    println!("  kernel half  : shared, .text -> {}", uspace.translate(text).unwrap().0);
+    println!("  user half    : empty ({:?} at 0x1000)", uspace.translate(
+        kernel::mm::VirtAddr::new(0x1000)));
+
     // Prove the trap path end to end.
     println!();
     println!("trap test: executing ebreak...");
@@ -166,6 +179,6 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     assert_eq!(after, before + 1, "breakpoint handler did not run");
 
     println!();
-    println!("M1 complete. Parking. (Ctrl-A x to exit QEMU)");
+    println!("M2 complete. Parking. (Ctrl-A x to exit QEMU)");
     qemu::park()
 }

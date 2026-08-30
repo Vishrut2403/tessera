@@ -45,6 +45,13 @@ impl PteFlags {
     pub const KERNEL_RW: Self =
         Self(Self::V.0 | Self::R.0 | Self::W.0 | Self::G.0 | Self::A.0 | Self::D.0);
 
+    /// User data: never executable, never Global (an ASID switch must drop it).
+    pub const USER_RW: Self =
+        Self(Self::V.0 | Self::R.0 | Self::W.0 | Self::U.0 | Self::A.0 | Self::D.0);
+    /// User code.
+    pub const USER_RX: Self =
+        Self(Self::V.0 | Self::R.0 | Self::X.0 | Self::U.0 | Self::A.0);
+
     pub const fn bits(self) -> u64 {
         self.0
     }
@@ -255,6 +262,17 @@ impl Mapper {
 
     pub const fn root(&self) -> PhysAddr {
         self.root
+    }
+
+    /// The root table itself, for copying the kernel half into a new space.
+    pub fn root_table(&self) -> &PageTable {
+        // SAFETY: `self.root` is this Mapper's own root frame, borrowed with the tree.
+        unsafe { table_ref(self.root) }
+    }
+
+    pub fn root_table_mut(&mut self) -> &mut PageTable {
+        // SAFETY: as above; `&mut self` is exclusive access to the tree.
+        unsafe { table_mut(self.root) }
     }
 
     /// Map one page of the size implied by `level`.

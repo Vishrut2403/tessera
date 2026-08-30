@@ -1,6 +1,7 @@
 //! Memory management: address types, region arithmetic, physical frames.
 
 pub mod addr;
+pub mod address_space;
 pub mod frame;
 pub mod kernel_space;
 pub mod page_table;
@@ -9,6 +10,7 @@ pub mod region;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub use addr::{KERNEL_VMA, PAGE_SHIFT, PAGE_SIZE, PhysAddr, VirtAddr};
+pub use address_space::{AddressSpace, AddressSpaceError, Asid};
 pub use frame::BumpAllocator;
 pub use page_table::{
     FrameAllocator, MapError, Mapper, PageTable, Pte, PteFlags, flush_tlb_all, flush_tlb_page,
