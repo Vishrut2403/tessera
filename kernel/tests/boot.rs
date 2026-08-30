@@ -1,9 +1,4 @@
 //! What `_start` is supposed to have established by the time Rust runs.
-//!
-//! Every assertion here is about an invariant that is invisible until it is
-//! violated, at which point it presents as an unrelated mystery: a static that
-//! is not zero, a stack pointer in the middle of nowhere, a `gp` that makes
-//! every global access read the wrong address.
 
 #![no_std]
 #![no_main]
@@ -23,13 +18,7 @@ extern "C" fn test_main_entry(_hartid: usize, _dtb_pa: usize) -> ! {
     qemu::exit_success()
 }
 
-// Placing a static in a *particular* section takes some care. An immutable
-// `static X: u64 = 0` is read-only data and lands in .rodata no matter what it
-// contains, which would make a "is .bss zeroed?" test silently test nothing.
-// Interior mutability is what forces a static into writable memory, and then the
-// initialiser decides which half: all-zero goes to .bss (or .sbss), anything
-// else goes to .data (or .sdata). The linker script folds the small-data
-// variants into the same ranges, so the address checks below hold either way.
+// Placing a static in a *particular* section takes some care.
 
 /// Must read back as zero, or the zeroing loop in `_start` is wrong.
 static BSS_PROBE: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
@@ -90,6 +79,15 @@ fn stack_has_room_to_spare() {
 }
 
 #[test_case]
-fn kernel_is_where_opensbi_expects_it() {
-    assert_eq!(layout::kernel_start(), 0x8020_0000);
+fn kernel_is_loaded_where_opensbi_expects_it() {
+    // The load address, not the link address -- see D-002.
+    assert_eq!(layout::kernel_phys_range().start.as_usize(), 0x8020_0000);
+}
+
+#[test_case]
+fn paging_is_on_and_we_are_in_the_high_half() {
+    assert_eq!(kernel::mm::phys_offset(), kernel::mm::KERNEL_VMA);
+    assert!(layout::text_start() > kernel::mm::KERNEL_VMA);
+    // satp MODE field: 8 is Sv39.
+    assert_eq!(kernel::csr::satp::read() >> 60, 8, "satp is not in Sv39 mode");
 }

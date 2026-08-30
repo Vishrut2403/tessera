@@ -2,6 +2,7 @@
 
 pub mod addr;
 pub mod frame;
+pub mod kernel_space;
 pub mod page_table;
 pub mod region;
 
@@ -17,8 +18,7 @@ pub use region::{CapacityExceeded, Region, RegionList};
 use crate::fdt::{Fdt, FdtError, read_cells};
 use crate::sync::SpinLock;
 
-/// The kernel's frame allocator. Used during boot for page tables, then handed
-/// over to M4 as untyped capabilities and never used again.
+/// The kernel's frame allocator; boot only.
 pub static FRAMES: SpinLock<BumpAllocator> = SpinLock::new(BumpAllocator::new());
 
 /// Hand out one zeroed physical frame, or `None` if boot memory is exhausted.
@@ -33,21 +33,12 @@ pub fn init(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverError> {
     Ok(map)
 }
 
-/// Bound on how many regions any one list holds. Sized generously: QEMU virt
-/// reports one RAM region and a handful of reservations, and a real board with
-/// several DRAM banks and a dozen carve-outs still fits.
+/// Bound on how many regions any one list holds.
 pub const MAX_REGIONS: usize = 32;
 
 pub type Regions = RegionList<MAX_REGIONS>;
 
 /// Translating between physical and virtual addresses.
-///
-/// Zero until M2c enables paging, then [`KERNEL_VMA`]. Keeping it in a variable
-/// rather than a constant is what lets the same allocator and the same page
-/// table walker run correctly both before and after the switch — before, the
-/// hart is executing at physical addresses and the identity is right; after, the
-/// direct map is right. Getting this wrong in either direction produces a fault
-/// at an address that looks entirely reasonable.
 static PHYS_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
 /// Where a physical address is readable from, right now.
@@ -104,39 +95,18 @@ pub struct MemoryMap {
 }
 
 /// Read the memory map out of the device tree.
-///
-/// Must run before paging is enabled, or through a mapping that covers the blob:
-/// `dtb` is the raw physical pointer OpenSBI left in `a1`.
-///
-/// Four things get reserved, and leaving out any one of them corrupts something
-/// subtle:
-///
-/// 1. **The memory reservation block.** Firmware's own claim — on this platform
-///    it is how OpenSBI protects the region its PMPs also guard.
-/// 2. **`/reserved-memory` children.** The device tree's structured form of the
-///    same idea.
-/// 3. **The kernel image.** Nothing in the device tree knows where we were
-///    loaded, so nothing else will protect us from allocating over ourselves.
-/// 4. **The DTB blob itself.** It sits in ordinary RAM, and it is not
-///    necessarily covered by its own reservation block. Handing it out as a free
-///    frame means the memory map gets overwritten by the first thing that uses
-///    it — after we have already read it, so the failure surfaces much later.
 pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverError> {
-    // SAFETY: `dtb` is the pointer OpenSBI passed in a1, per the SBI boot
-    // convention (D-003), and paging is off so it is directly addressable.
-    let fdt = unsafe { Fdt::from_ptr(dtb.as_usize() as *const u8) }?;
+    // SAFETY: `dtb` is the pointer OpenSBI passed in a1, per the SBI boot convention (D-003).
+    let fdt = unsafe { Fdt::from_ptr(phys_to_virt(dtb).as_ptr::<u8>()) }?;
 
     let mut ram = Regions::new();
     let mut reserved = Regions::new();
 
-    // Cell counts come from the root node. Two and two on RV64, but a 32-bit
-    // board says otherwise and we would rather read than assume.
+    // Cell counts come from the root node.
     let mut address_cells = 2usize;
     let mut size_cells = 2usize;
 
-    // First pass: the root's cell counts. They can appear after the child nodes
-    // that need them in the token stream, so this cannot be folded into the
-    // pass below.
+    // First pass: the root's cell counts.
     fdt.for_each_property(|p| {
         if p.depth == 0 {
             match p.name {
@@ -164,16 +134,14 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
             return;
         }
 
-        // `/memory` or `/memory@80000000` at depth 1 is RAM; anything under
-        // `/reserved-memory` is a carve-out.
+        // `/memory*` at depth 1 is RAM; anything under `/reserved-memory` is a carve-out.
         let is_ram = p.depth == 1 && (p.node == "memory" || p.node.starts_with("memory@"));
         let is_reserved = p.depth == 2 && p.parent == "reserved-memory";
         if !is_ram && !is_reserved {
             return;
         }
 
-        // `reg` is a list of (address, size) pairs, not a single one: a node may
-        // describe several banks.
+        // `reg` is a list of (address, size) pairs: a node may describe several banks.
         let mut off = 0;
         while off + entry_bytes <= p.value.len() {
             let base = read_cells(p.value, off, address_cells);
@@ -211,10 +179,7 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
         return Err(DiscoverError::NoMemory);
     }
 
-    // Subtract first, then trim to page boundaries. The other order would round
-    // a reservation's edges outward *before* subtracting, which is the safe
-    // direction, but would also let a sub-page gap between two reservations
-    // survive as a zero-frame region.
+    // Subtract first, then trim to page boundaries.
     let mut free = ram.subtract(&reserved)?;
     for r in free.as_mut_slice() {
         *r = r.page_aligned();

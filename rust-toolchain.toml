@@ -1,9 +1,4 @@
-# D-001: the project is pinned to nightly.
-#
-# `channel = "nightly"` is the bootstrap value. Once the toolchain is installed
-# and the build is green, this is tightened to an exact `nightly-YYYY-MM-DD` so
-# that a clone reproduces our compiler exactly. We do not pin a date we have not
-# seen build.
+# D-001: nightly. To be tightened to an exact nightly-YYYY-MM-DD once green.
 [toolchain]
 channel    = "nightly"
 profile    = "minimal"

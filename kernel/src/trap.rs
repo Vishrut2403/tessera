@@ -1,30 +1,4 @@
 //! Trap entry and dispatch.
-//!
-//! A trap is the only way control transfers into the kernel: a timer fires, a
-//! page faults, a thread executes `ecall`. The hardware's contribution is
-//! minimal and worth stating exactly, because everything here exists to fill the
-//! gaps it leaves. On a trap to S-mode the hart:
-//!
-//! 1. writes the faulting PC into `sepc`,
-//! 2. writes the reason into `scause` and the associated value into `stval`,
-//! 3. copies `sstatus.SIE` into `sstatus.SPIE` and clears `SIE` (so we are not
-//!    immediately re-interrupted),
-//! 4. records the previous privilege in `sstatus.SPP`,
-//! 5. sets `pc` to `stvec`.
-//!
-//! Note what it does *not* do: it does not switch stacks, and it does not save a
-//! single general-purpose register. The trap handler is running on whatever `sp`
-//! the interrupted code had, with every register still live. That is why the
-//! entry point below must be naked — a compiler-generated prologue would clobber
-//! registers we have not saved yet.
-//!
-//! **D-007: the entry below is correct only for traps taken in S-mode.** In M1
-//! there is no user mode, so "the current stack" is always a kernel stack. When
-//! M3 introduces threads that trap from U-mode, this needs the standard
-//! `csrrw sp, sscratch, sp` swap and a per-thread kernel stack, and the frame
-//! has to land in the TCB rather than on whatever stack happened to be live. The
-//! 31 save/restore instructions survive that change; the prologue and epilogue
-//! do not.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -32,14 +6,6 @@ use crate::csr::{scause, sepc, sstatus, sstatus_bits, stval, stvec, stvec_mode};
 use crate::println;
 
 /// The general-purpose register file as the trap entry lays it out.
-///
-/// `#[repr(C)]` because the assembly below indexes it by hand: `x[n]` lives at
-/// byte offset `n * 8`. `x[0]` is the slot for the hardwired-zero register; the
-/// entry stores an explicit zero there so dumps are not confusing.
-///
-/// Size is exactly 256 bytes, which keeps `sp` 16-byte aligned as the ABI
-/// requires — 31 registers would be 248, and an unaligned `sp` is the kind of
-/// bug that only shows up once something starts using vector or float loads.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrapFrame {
@@ -53,39 +19,27 @@ const REG_NAMES: [&str; 32] = [
     "t5", "t6",
 ];
 
-/// Number of breakpoint exceptions handled since boot. Exists so a test can
-/// prove the trap path actually ran rather than inferring it from not crashing.
+/// Breakpoints handled since boot; lets a test observe the trap path.
 pub static BREAKPOINTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the trap vector.
 pub fn init() {
-    // Via `*const ()`: casting a function item straight to an integer is
-    // linted against (function_casts_as_integer) because it silently decays a
-    // typed item through a pointer. Naming the pointer step makes it explicit.
+    // Via `*const ()`: a direct fn-item-to-integer cast is linted against.
     let base = trap_entry as *const () as usize;
-    // stvec's low two bits are the mode field, so a misaligned base would
-    // silently select vectored mode. The linker script aligns `.text.trap` to 4;
-    // this asserts that it worked.
+    // stvec's low two bits are the mode field, so a misaligned base selects vectored mode.
     assert!(base & 0b11 == 0, "trap entry is not 4-byte aligned");
 
-    // SAFETY: `trap_entry` is a valid trap handler that saves and restores every
-    // register it touches and ends in `sret`. Nothing has enabled interrupts
-    // yet, so there is no window in which an old stvec is half-replaced.
+    // SAFETY: `trap_entry` saves and restores every register it touches and ends in `sret`.
     unsafe { stvec::write(base | stvec_mode::DIRECT) };
 }
 
 /// The trap vector. Never called from Rust; `stvec` points here.
-///
-/// Naked for the reason in the module docs: on entry, every general-purpose
-/// register still belongs to the interrupted code, and a prologue would destroy
-/// them before we could save them.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.trap")]
 pub unsafe extern "C" fn trap_entry() -> ! {
     core::arch::naked_asm!(
-        // Carve a TrapFrame out of the interrupted stack (D-007: valid only
-        // because that stack is a kernel stack in M1).
+        // Carve a TrapFrame out of the interrupted stack (D-007: S-mode traps only).
         "addi sp, sp, -256",
 
         "sd   zero, 0(sp)",   // x0's slot, so dumps read cleanly
@@ -121,7 +75,7 @@ pub unsafe extern "C" fn trap_entry() -> ! {
         "sd   x30, 240(sp)",
         "sd   x31, 248(sp)",
 
-        // Reconstruct the caller's sp. Safe to clobber t0 now: it is saved.
+        // Reconstruct the caller's sp.
         "addi t0, sp, 256",
         "sd   t0,  16(sp)",
 
@@ -130,8 +84,7 @@ pub unsafe extern "C" fn trap_entry() -> ! {
         "call {dispatch}",
 
         "ld   x1,    8(sp)",
-        // x2 is restored by the stack adjustment, not by a load: the handler is
-        // not permitted to relocate the interrupted stack in M1.
+        // x2 is restored by the stack adjustment, not by a load.
         "ld   x3,   24(sp)",
         "ld   x4,   32(sp)",
         "ld   x5,   40(sp)",
@@ -164,8 +117,7 @@ pub unsafe extern "C" fn trap_entry() -> ! {
 
         "addi sp, sp, 256",
 
-        // Return to sepc, restoring the pre-trap privilege from sstatus.SPP and
-        // the pre-trap interrupt enable from sstatus.SPIE.
+        // Return to sepc, restoring privilege and interrupt enable from sstatus.
         "sret",
 
         dispatch = sym dispatch,
@@ -181,9 +133,7 @@ pub enum Cause {
 
 impl Cause {
     pub fn decode(scause: usize) -> Self {
-        // The top bit distinguishes the two spaces; the rest is the code. Both
-        // number from zero, so cause 5 is either "timer interrupt" or "load
-        // access fault" depending entirely on this bit.
+        // The top bit distinguishes the two spaces; the rest is the code.
         const INTERRUPT: usize = 1 << (usize::BITS - 1);
         if scause & INTERRUPT != 0 {
             Cause::Interrupt(scause & !INTERRUPT)
@@ -222,9 +172,7 @@ pub extern "C" fn dispatch(frame: &mut TrapFrame) {
     let cause = Cause::decode(scause::read());
 
     match cause {
-        // M1 handles exactly one trap for real: `ebreak`. It is the cheapest
-        // possible proof that the whole path works — save, dispatch, mutate
-        // supervisor state, restore, resume.
+        // M1 handles exactly one trap for real: `ebreak`.
         Cause::Exception(3) => {
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
             skip_faulting_instruction();
@@ -234,23 +182,12 @@ pub extern "C" fn dispatch(frame: &mut TrapFrame) {
 }
 
 /// Advance `sepc` past the instruction that trapped.
-///
-/// `sepc` points *at* the faulting instruction, not after it, so returning
-/// without touching it would re-execute the `ebreak` forever. The width is not a
-/// constant: with the C extension, `ebreak` may have been assembled as the
-/// 2-byte `c.ebreak`. RISC-V encodes length in the low bits — an instruction
-/// whose bottom two bits are both set is 4 bytes wide, anything else is 2 — so
-/// we read the halfword at `sepc` and ask it.
 fn skip_faulting_instruction() {
     let pc = sepc::read();
-    // SAFETY: `sepc` points at an instruction we just executed, so it is mapped
-    // and readable. In M1 the MMU is off, so no address-space question arises;
-    // from M3 this same read on a user PC needs sstatus.SUM set and a fault
-    // handler behind it.
+    // SAFETY: `sepc` points at an instruction we just executed, so it is mapped and readable.
     let low = unsafe { core::ptr::read_volatile(pc as *const u16) };
     let width = if low & 0b11 == 0b11 { 4 } else { 2 };
-    // SAFETY: resuming at the instruction after the one that trapped is the
-    // defined semantics of a handled breakpoint.
+    // SAFETY: resuming past the trapping instruction is defined semantics for a handled breakpoint.
     unsafe { sepc::write(pc + width) };
 }
 

@@ -1,10 +1,4 @@
-//! Memory discovery and the frame allocator, against the real device tree
-//! OpenSBI hands us.
-//!
-//! These are the assertions that would otherwise be a boot-time printout nobody
-//! reads carefully. The interesting ones are the invariants that connect the
-//! three lists: free memory must not intersect anything reserved, must be page
-//! aligned, and must add up.
+//! Memory discovery and the frame allocator, against the real device tree.
 
 #![no_std]
 #![no_main]
@@ -67,8 +61,7 @@ fn device_tree_blob_is_reserved() {
 
 #[test_case]
 fn firmware_reservation_is_honoured() {
-    // OpenSBI publishes its own footprint in the memory reservation block. If we
-    // ignored it we would allocate over the running firmware.
+    // OpenSBI publishes its own footprint in the memory reservation block.
     let m = map();
     assert!(
         m.reserved.iter().any(|r| r.contains(PhysAddr::new(0x8000_0000))),
@@ -121,8 +114,7 @@ fn free_regions_are_disjoint_and_ordered() {
 
 #[test_case]
 fn accounting_adds_up() {
-    // Everything free, plus everything reserved that lies inside RAM, must equal
-    // RAM -- modulo the sub-page fragments page alignment discards.
+    // Free + reserved must equal RAM, modulo sub-page fragments lost to alignment.
     let m = map();
     let free = m.free.total_bytes();
     let ram = m.ram.total_bytes();
@@ -160,8 +152,7 @@ fn allocated_frames_are_inside_free_memory() {
 
 #[test_case]
 fn allocated_frames_are_zeroed() {
-    // Page tables depend on this: an unzeroed table is full of entries with
-    // random V bits pointing at random physical addresses.
+    // Page tables depend on this.
     let f = mm::alloc_frame().expect("out of frames");
     let ptr = mm::phys_to_virt(f).as_ptr::<u8>();
     for i in 0..PAGE_SIZE {
@@ -173,8 +164,7 @@ fn allocated_frames_are_zeroed() {
 
 #[test_case]
 fn dirty_frames_are_zeroed_on_the_next_allocation() {
-    // Write a pattern, then confirm a later frame still comes back clean --
-    // proving the zeroing happens per allocation, not once at init.
+    // Proves zeroing happens per allocation, not once at init.
     let f = mm::alloc_frame().expect("out of frames");
     let ptr = mm::phys_to_virt(f).as_mut_ptr::<u8>();
     // SAFETY: we own this frame.
@@ -188,8 +178,7 @@ fn dirty_frames_are_zeroed_on_the_next_allocation() {
 
 #[test_case]
 fn allocation_shrinks_what_is_left_for_userspace() {
-    // The remainder is what M4 will hand out as untyped capabilities, so it has
-    // to track allocation exactly.
+    // The remainder is what M4 hands out as untyped capabilities.
     let before = mm::FRAMES.lock().bytes_remaining();
     let _ = mm::alloc_frame().expect("out of frames");
     let after = mm::FRAMES.lock().bytes_remaining();

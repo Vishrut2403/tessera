@@ -1,23 +1,10 @@
-//! Half-open physical address ranges, and the set arithmetic over them that
-//! turns "what RAM exists" plus "what is already spoken for" into "what is
-//! free".
-//!
-//! Fixed-capacity arrays throughout. That is not a limitation working around the
-//! lack of a heap — it is the point (A-002). A kernel that cannot allocate
-//! cannot fail to allocate, so every one of these lists has a bound that is
-//! visible in the type and an overflow that is an explicit error rather than a
-//! silent truncation.
+//! Half-open physical address ranges and set arithmetic over them.
 
 use core::fmt;
 
 use super::addr::{PAGE_SIZE, PhysAddr};
 
 /// A half-open range `[start, end)`.
-///
-/// Half-open because it composes: adjacent regions share an endpoint, an empty
-/// region is `start == end` rather than a special case, and length is
-/// `end - start` with no off-by-one. Inclusive ranges make the region ending at
-/// the top of the address space unrepresentable.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Region {
     pub start: PhysAddr,
@@ -51,10 +38,6 @@ impl Region {
     }
 
     /// Shrink to whole pages: start rounds up, end rounds down.
-    ///
-    /// Deliberately conservative in both directions. A partial page at either
-    /// end is unusable as a frame, and rounding *outward* would hand out memory
-    /// that belongs to whatever the region was carved out of.
     pub const fn page_aligned(&self) -> Self {
         Self { start: self.start.align_up(PAGE_SIZE), end: self.end.align_down(PAGE_SIZE) }
     }
@@ -70,8 +53,7 @@ impl fmt::Debug for Region {
     }
 }
 
-/// Overflow of a fixed-capacity list. Always a bug in the caller's sizing, never
-/// something to recover from at runtime.
+/// Overflow of a fixed-capacity list; always a sizing bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacityExceeded;
 
@@ -121,10 +103,6 @@ impl<const N: usize> RegionList<N> {
     }
 
     /// Remove any region that has become empty.
-    ///
-    /// Page-aligning a region smaller than a page collapses it to nothing, and
-    /// a zero-length region left in the list would later be reported as usable
-    /// memory containing no frames.
     pub fn drop_empty(&mut self) {
         let mut write = 0;
         for read in 0..self.len {
@@ -136,8 +114,7 @@ impl<const N: usize> RegionList<N> {
         self.len = write;
     }
 
-    /// Append a region. Empty regions are dropped rather than stored, so callers
-    /// never have to filter them out downstream.
+    /// Append a region. Empty regions are dropped rather than stored.
     pub fn push(&mut self, region: Region) -> Result<(), CapacityExceeded> {
         if region.is_empty() {
             return Ok(());
@@ -155,13 +132,6 @@ impl<const N: usize> RegionList<N> {
     }
 
     /// Sort by start address and merge every overlapping or touching pair.
-    ///
-    /// Insertion sort: N is at most a couple of dozen, and an insertion sort is
-    /// a dozen lines that are obviously correct, which beats a clever sort we
-    /// would have to trust. Merging *touching* regions (`end == start`) and not
-    /// just overlapping ones matters — the reserved ranges we get from firmware
-    /// are frequently exactly adjacent, and leaving them separate would make the
-    /// subtraction below emit zero-length gaps between them.
     pub fn normalize(&mut self) {
         let s = &mut self.regions[..self.len];
         for i in 1..s.len() {
@@ -189,12 +159,6 @@ impl<const N: usize> RegionList<N> {
     }
 
     /// Everything in `self` that is not in `cuts`.
-    ///
-    /// `cuts` is normalized first, so the inner loop can assume sorted,
-    /// non-overlapping cuts and walk each region once — the whole thing is
-    /// linear rather than quadratic. `cursor` tracks how far into the current
-    /// region we have accounted for; every gap between the cursor and the next
-    /// cut is free memory.
     pub fn subtract<const M: usize>(
         &self,
         cuts: &RegionList<M>,
@@ -262,8 +226,7 @@ mod tests {
 
     #[test_case]
     fn normalize_merges_touching_regions() {
-        // end == start, no overlap. Firmware reservations are frequently exactly
-        // adjacent, and leaving these separate makes subtract emit empty gaps.
+        // end == start, no overlap.
         let mut l = list::<8>(&[r(100, 200), r(200, 300)]);
         l.normalize();
         assert_eq!(l.as_slice(), &[r(100, 300)]);

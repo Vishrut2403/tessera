@@ -1,22 +1,4 @@
 //! Thin wrappers over the S-mode control and status registers.
-//!
-//! Hand-written rather than pulled from the `riscv` crate, on purpose: the point
-//! of the project is to know the privileged spec, and a CSR wrapper is four
-//! instructions of surface area. What we get in exchange for typing it out is
-//! that every CSR access in the kernel is greppable and every bit constant has a
-//! name we chose.
-//!
-//! Convention: **reads are safe, writes are `unsafe`.** Reading any CSR here is
-//! side-effect free. Writing one can redirect traps (`stvec`), change the
-//! address space (`satp`, from M2), or re-enable interrupts in the middle of a
-//! critical section (`sstatus`) — all of which can violate invariants the safe
-//! Rust above depends on.
-//!
-//! None of the `asm!` blocks below is marked `nomem`. A CSR write is not a
-//! memory operation in the obvious sense, but `satp` and `sstatus.SUM` change
-//! what memory *means*, and marking those `nomem` would license the compiler to
-//! move loads and stores across them. Uniformity here is worth more than the
-//! handful of cycles.
 
 /// Generate a module of accessors for one CSR.
 macro_rules! csr_rw {
@@ -27,8 +9,7 @@ macro_rules! csr_rw {
             #[inline(always)]
             pub fn read() -> usize {
                 let v: usize;
-                // SAFETY: `csrr` on an S-mode CSR from S-mode has no side
-                // effects and cannot fault.
+                // SAFETY: `csrr` on an S-mode CSR from S-mode has no side effects and cannot fault.
                 unsafe {
                     core::arch::asm!(
                         concat!("csrr {v}, ", stringify!($name)),
@@ -42,8 +23,7 @@ macro_rules! csr_rw {
             /// Write the CSR.
             ///
             /// # Safety
-            /// The caller must uphold whatever invariant this register carries;
-            /// see the module docs for the specific hazards.
+            /// The caller must uphold whatever invariant this register carries.
             #[inline(always)]
             pub unsafe fn write(v: usize) {
                 unsafe {
@@ -115,19 +95,19 @@ csr_rw!(
     sepc
 );
 csr_rw!(
-    /// Why we trapped: bit 63 distinguishes interrupt from exception, the low
-    /// bits are the cause code.
+    /// Trap cause: bit 63 selects interrupt vs exception.
     scause
 );
 csr_rw!(
-    /// Trap value: the faulting address for page faults, the instruction bits
-    /// for illegal-instruction, zero for most others.
+    /// Trap value: the faulting address for page faults.
     stval
 );
 csr_rw!(
-    /// A scratch word the hardware never touches. From M3 this holds the
-    /// per-hart kernel stack pointer and the trap entry swaps it with `sp`
-    /// (D-007).
+    /// Translation control: MODE, ASID, root page table PPN.
+    satp
+);
+csr_rw!(
+    /// Scratch word the hardware never touches; holds the kernel sp from M3.
     sscratch
 );
 

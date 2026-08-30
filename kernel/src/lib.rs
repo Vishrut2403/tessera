@@ -1,10 +1,4 @@
 //! tessera — a capability-based microkernel for RV64.
-//!
-//! Milestone 1: boot under OpenSBI, establish a Rust-shaped machine state, print
-//! to the UART, and take a trap.
-//!
-//! The kernel is a library so that integration tests can link it; the binary in
-//! `main.rs` is a shim (D-005).
 
 #![no_std]
 #![cfg_attr(test, no_main)]
@@ -23,10 +17,6 @@ pub mod trap;
 pub mod uart;
 
 /// Where the linker put us.
-///
-/// These symbols have no storage — only addresses — which is why every accessor
-/// takes the address of the symbol rather than reading it. Reading one would
-/// load whatever byte happens to live at the boundary.
 pub mod layout {
     unsafe extern "C" {
         static __kernel_start: u8;
@@ -47,11 +37,7 @@ pub mod layout {
         ($(#[$doc:meta])* $vis:vis fn $f:ident() = $sym:ident) => {
             $(#[$doc])*
             $vis fn $f() -> usize {
-                // No `unsafe` needed: `&raw const` forms an address without
-                // performing an access, which is the whole reason it exists.
-                // Reading one of these statics *would* be unsafe, and would also
-                // be meaningless -- it would load whatever byte happens to sit
-                // at the section boundary.
+                // `&raw const` forms an address without an access, so no unsafe is needed.
                 &raw const $sym as usize
             }
         };
@@ -70,33 +56,22 @@ pub mod layout {
     sym_addr!(pub fn boot_stack_bottom() = __boot_stack_bottom);
     sym_addr!(pub fn boot_stack_top() = __boot_stack_top);
 
-    /// The kernel image as a physical region, for reserving it during memory
-    /// discovery.
-    ///
-    /// Correct only while the linker's addresses *are* physical addresses,
-    /// which is true until M2c sets `KERNEL_VMA`. At that point this becomes
-    /// `linked address - KERNEL_VMA` and the subtraction must be added here.
+    /// The kernel image as a physical region.
     pub fn kernel_phys_range() -> crate::mm::Region {
         crate::mm::Region::new(
-            crate::mm::PhysAddr::new(kernel_start()),
-            crate::mm::PhysAddr::new(kernel_end()),
+            crate::mm::PhysAddr::new(kernel_start() - crate::mm::KERNEL_VMA),
+            crate::mm::PhysAddr::new(kernel_end() - crate::mm::KERNEL_VMA),
         )
     }
 }
 
 /// Bring the kernel to a state where `println!` works and traps are handled.
-///
-/// Order matters: the trap vector is installed second so that a fault during
-/// UART setup still hits OpenSBI's default handler, which at least prints
-/// something, rather than jumping through an `stvec` pointing at uninitialised
-/// memory.
 pub fn init() {
     uart::init();
     trap::init();
 }
 
-/// Read the current stack pointer. Used by tests to prove `_start` installed the
-/// boot stack, and by dumps.
+/// Read the current stack pointer.
 #[inline(always)]
 pub fn stack_pointer() -> usize {
     let sp: usize;
@@ -107,8 +82,7 @@ pub fn stack_pointer() -> usize {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Deliberately bypasses the UART lock (D-009): the panicking code may be
-    // holding it, and a panic handler that deadlocks prints nothing at all.
+    // Bypasses the UART lock: the panicking code may still hold it (D-009).
     crate::println_unlocked!();
     crate::println_unlocked!("=== KERNEL PANIC ===");
     if let Some(loc) = info.location() {
@@ -118,9 +92,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     qemu::exit_failure(1)
 }
 
-// ---------------------------------------------------------------------------
-// Unit-test image: `cargo test` builds the library as its own bootable kernel.
-// ---------------------------------------------------------------------------
+// --- Unit-test image ---
 
 #[cfg(test)]
 crate::kernel_entry!(test_kmain);
@@ -153,7 +125,21 @@ mod tests {
     }
 
     #[test_case]
-    fn linked_where_opensbi_expects_us() {
-        assert_eq!(layout::kernel_start(), 0x8020_0000);
+    fn loaded_low_and_linked_high() {
+        // The two halves of D-002, pinned together.
+        assert_eq!(layout::kernel_phys_range().start.as_usize(), 0x8020_0000);
+        assert_eq!(layout::kernel_start(), mm::KERNEL_VMA + 0x8020_0000);
+        assert_eq!(
+            layout::kernel_start() - layout::kernel_phys_range().start.as_usize(),
+            mm::KERNEL_VMA
+        );
+    }
+
+    #[test_case]
+    fn we_are_executing_in_the_high_half() {
+        // Not a tautology: a failed jump would still run, just at physical addresses.
+        let sp = stack_pointer();
+        assert!(sp > mm::KERNEL_VMA, "sp {sp:#x} is not a high-half address");
+        assert_eq!(mm::phys_offset(), mm::KERNEL_VMA);
     }
 }

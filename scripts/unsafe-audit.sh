@@ -1,27 +1,16 @@
 #!/usr/bin/env sh
-# Measure the TCB: how many lines of kernel there are, and how many of them sit
-# inside `unsafe`.
+# Measure the TCB: kernel lines, and how many sit inside `unsafe`.
 #
-# The project's claim is that "the TCB is N lines, M of them unsafe". That has to
-# be measured rather than asserted. This is the measurement.
-#
-# What counts as an unsafe line: every line from the start of an `unsafe` item or
-# block through its closing brace — `unsafe fn`, `unsafe impl`, `unsafe extern`,
-# and `unsafe { }` blocks. The `#[unsafe(naked)]` / `#[unsafe(no_mangle)]`
-# attribute form is *not* counted: it is a 2024-edition spelling of an attribute,
-# not a region where the compiler stops checking.
-#
-# Method: comment-stripped brace matching in awk. It is approximate at the edges
-# — a `//` inside a string literal, or a brace inside one, can confuse it — so
-# treat the number as a good-faith measurement, not a proof. Blank lines and
-# comment-only lines are excluded from both counts.
+# An unsafe line is any line from the start of an `unsafe` item or block through
+# its closing brace; the `#[unsafe(...)]` attribute form does not count. Method is
+# comment-stripped brace matching in awk: approximate at the edges (a `//` or a
+# brace inside a string literal confuses it), so a measurement, not a proof.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SRC="${1:-$ROOT/kernel/src}"
 
-# Paths here never contain spaces; keeping one awk process is what makes the
-# running totals in END correct.
+# One awk process, so the running totals in END are correct.
 # shellcheck disable=SC2046
 awk '
 function report(file, total, unsafe_lines, regions) {

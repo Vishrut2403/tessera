@@ -3,20 +3,15 @@ target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
-    # The linker script. Path is relative to the workspace root, so all cargo
-    # commands must be run from there. rust-lld is this target's default linker
-    # (linker-flavor gnu-lld), so -T reaches it unmodified.
+    # Path is relative to the workspace root: run cargo from there.
     "-C", "link-arg=-Tkernel/link.ld",
-    # Emit a link map next to the ELF; invaluable when a section lands somewhere
-    # unexpected.
+    # Link map next to the ELF.
     "-C", "link-arg=-Map=target/kernel.map",
-    # Frame pointers make gdb backtraces work through naked/asm frames, which is
-    # most of what we will be debugging.
+    # Frame pointers keep gdb backtraces working through naked/asm frames.
     "-C", "force-frame-pointers=yes",
 ]
 
-# `cargo run` and `cargo test` both go through this. QEMU appends the ELF path
-# after `-kernel`. OpenSBI (`-bios default`) loads it and enters it in S-mode.
+# `cargo run` and `cargo test` both go through this; OpenSBI is `-bios default`.
 runner = [
     "qemu-system-riscv64",
     "-machine", "virt",
@@ -29,8 +24,7 @@ runner = [
 ]
 
 [alias]
-# `cargo kdebug` — identical to `cargo run` but QEMU starts halted with a gdb
-# stub on localhost:1234. Attach with ./scripts/gdb.sh from a second terminal.
+# `cargo run` with QEMU halted on a gdb stub at localhost:1234; see scripts/gdb.sh.
 kdebug = [
     "run", "--config",
     "target.riscv64gc-unknown-none-elf.runner=['qemu-system-riscv64','-machine','virt','-cpu','rv64','-smp','1','-m','128M','-nographic','-bios','default','-s','-S','-kernel']",

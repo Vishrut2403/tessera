@@ -1,12 +1,6 @@
 #!/usr/bin/env sh
-# Attach gdb to a `cargo kdebug` session.
-#
-#   terminal 1:  cargo kdebug          # QEMU starts halted, gdb stub on :1234
-#   terminal 2:  ./scripts/gdb.sh      # attach, break at _start
-#
-# Arch's gdb is built multiarch and already knows riscv:rv64, so there is no
-# cross-gdb to install. Pass an alternate ELF as $1 to debug a test image:
-#   ./scripts/gdb.sh target/riscv64gc-unknown-none-elf/debug/deps/traps-<hash>
+# Attach gdb to a `cargo kdebug` session (terminal 1: cargo kdebug).
+# Pass an alternate ELF as $1 to debug a test image.
 set -eu
 
 ELF="${1:-target/riscv64gc-unknown-none-elf/debug/tessera}"

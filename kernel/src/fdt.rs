@@ -1,33 +1,4 @@
 //! A minimal flattened device tree reader.
-//!
-//! OpenSBI handed us a DTB pointer in `a1` (D-003), and that blob is the only
-//! honest answer to "how much RAM is there and what is already spoken for".
-//! Hardcoding QEMU virt's map would work today and be wrong on the Milk-V.
-//!
-//! We read three things and nothing else: the `/memory` nodes, the
-//! `/reserved-memory` children, and the memory reservation block. This is not a
-//! general device tree library — M7 will extend it for virtio discovery.
-//!
-//! ## Format, briefly
-//!
-//! A DTB is three blocks behind a header, all big-endian (the format predates
-//! RISC-V and was born on big-endian PowerPC):
-//!
-//! - the **memory reservation block**: `(u64 address, u64 size)` pairs, ending
-//!   with a pair of zeroes. Firmware uses it to say "do not touch this".
-//! - the **structure block**: a token stream. `BEGIN_NODE` (1) opens a node and
-//!   is followed by its NUL-terminated name; `PROP` (3) is followed by a length,
-//!   an offset into the strings block for the property's name, and the value;
-//!   `END_NODE` (2) closes; `NOP` (4) is padding; `END` (9) terminates. Every
-//!   item is padded to a 4-byte boundary.
-//! - the **strings block**: property names, deduplicated, referenced by offset.
-//!
-//! ## Where the unsafe is
-//!
-//! Exactly one place: [`Fdt::from_ptr`], which turns a raw pointer from firmware
-//! into a `&[u8]`. Everything above it is safe code doing bounds-checked slice
-//! reads, so a malformed blob produces an `FdtError` rather than a wild read.
-//! That is design requirement (b) in miniature.
 
 use core::fmt;
 
@@ -53,8 +24,7 @@ const FDT_PROP: u32 = 3;
 const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
 
-/// Deepest nesting we track node names for. The device tree is far deeper than
-/// this in general, but we only ever look at depth 0, 1 and 2.
+/// Deepest nesting we track node names for.
 const MAX_DEPTH: usize = 8;
 
 const HEADER_SIZE: usize = 40;
@@ -91,17 +61,9 @@ impl<'a> Fdt<'a> {
     /// Interpret `ptr` as a flattened device tree.
     ///
     /// # Safety
-    /// `ptr` must point at a DTB whose declared `totalsize` bytes are all
-    /// readable and will not be mutated for `'a`. In practice this is the
-    /// pointer OpenSBI passed in `a1`, and it must be called before paging is
-    /// enabled or through a mapping that covers the blob.
+    /// `ptr` must point at a DTB whose `totalsize` bytes stay readable and unmutated for `'a`.
     pub unsafe fn from_ptr(ptr: *const u8) -> Result<Self, FdtError> {
-        // Read the header through a minimal slice first: we cannot trust
-        // `totalsize` until we have validated the magic, and we cannot read
-        // `totalsize` without a slice. 40 bytes is the fixed header size, so
-        // this bootstrap read is bounded even for a garbage pointer.
-        // SAFETY: caller guarantees the blob is readable; the header is the
-        // first 40 bytes of any valid DTB.
+        // Bounded header read first: totalsize is untrustworthy until the magic checks out.
         let head = unsafe { core::slice::from_raw_parts(ptr, HEADER_SIZE) };
 
         if be32(head, 0)? != FDT_MAGIC {
@@ -120,13 +82,10 @@ impl<'a> Fdt<'a> {
             return Err(FdtError::Truncated);
         }
 
-        // SAFETY: magic checked, so this really is a DTB and `total_size` is
-        // its own account of its length, which the caller has promised is
-        // readable.
+        // SAFETY: magic checked, so `total_size` is the blob's own length, readable per the caller.
         let blob = unsafe { core::slice::from_raw_parts(ptr, header.total_size) };
 
-        // Validate the block offsets now, once, so every later read is against
-        // a blob we have already established is self-consistent.
+        // Validate the block offsets once, so every later read is against a checked blob.
         if header.off_struct + header.size_struct > blob.len()
             || header.off_strings > blob.len()
             || header.off_rsvmap > blob.len()
@@ -150,8 +109,7 @@ impl<'a> Fdt<'a> {
         loop {
             let addr = be64(self.blob, off)?;
             let size = be64(self.blob, off + 8)?;
-            // A zero-length entry terminates the list; it is not a reservation
-            // of zero bytes at address zero.
+            // A zero-length entry terminates the list, not a zero-byte reservation at address zero.
             if addr == 0 && size == 0 {
                 return Ok(());
             }
@@ -161,11 +119,6 @@ impl<'a> Fdt<'a> {
     }
 
     /// Walk the structure block, calling `f` for every property.
-    ///
-    /// One pass, no allocation, no index built. Callers filter on the node and
-    /// property names they care about. `names` is a small stack of the node
-    /// names currently open, which is what lets a visitor distinguish a `reg`
-    /// under `/reserved-memory` from one under `/soc`.
     pub fn for_each_property<F>(&self, mut f: F) -> Result<(), FdtError>
     where
         F: FnMut(Property<'_>),
@@ -190,9 +143,7 @@ impl<'a> Fdt<'a> {
                     depth += 1;
                 }
                 FDT_END_NODE => {
-                    // Saturating rather than panicking: a corrupt blob with an
-                    // unbalanced END_NODE should not take the kernel down
-                    // before we have even found out how much RAM exists.
+                    // Saturating: a corrupt blob should not take the kernel down.
                     depth = depth.saturating_sub(1);
                 }
                 FDT_PROP => {
@@ -231,11 +182,6 @@ impl fmt::Debug for Fdt<'_> {
 }
 
 /// Read `cells` consecutive 4-byte big-endian cells as one number.
-///
-/// The device tree describes addresses in units of 32-bit cells, with the count
-/// given by the enclosing node's `#address-cells` / `#size-cells`. On RV64 both
-/// are 2, so an address is two cells concatenated most-significant first — but
-/// reading it generically means a 32-bit board does not need a second code path.
 pub fn read_cells(value: &[u8], offset: usize, cells: usize) -> Result<u64, FdtError> {
     let mut acc: u64 = 0;
     for i in 0..cells {

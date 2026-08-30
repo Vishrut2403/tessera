@@ -1,10 +1,4 @@
 //! Sv39 page tables, exercised with the MMU still off.
-//!
-//! This is the whole reason M2b is separate from M2c: a page table is a data
-//! structure, and `translate` is a software model of what the hardware walker
-//! does. We can check the two agree by construction *before* betting the
-//! machine's ability to fetch instructions on it. Once `satp` is live, a bug
-//! here is a fault at an address that no longer means what you think it does.
 
 #![no_std]
 #![no_main]
@@ -29,16 +23,11 @@ extern "C" fn test_main_entry(_hartid: usize, dtb_pa: usize) -> ! {
 }
 
 /// A fresh, empty address space plus the allocator that feeds it.
-///
-/// The allocator guard is held for the whole test: `SpinLock` is not reentrant,
-/// so calling `mm::alloc_frame()` while holding it would deadlock against
-/// ourselves.
 macro_rules! with_mapper {
     (|$m:ident, $alloc:ident| $body:block) => {{
         let mut guard = mm::FRAMES.lock();
         let $alloc = &mut *guard;
-        // Some tests only call translate(), which takes &self. The macro serves
-        // both, so the mut is redundant in those.
+        // Some tests only call translate(), which takes &self.
         #[allow(unused_mut)]
         let mut $m = Mapper::new($alloc).expect("no frames for a root table");
         $body
@@ -47,9 +36,7 @@ macro_rules! with_mapper {
 
 const KVA: usize = 0xFFFF_FFD0_0000_0000;
 
-// ---------------------------------------------------------------------------
-// Flag encoding
-// ---------------------------------------------------------------------------
+// --- Flag encoding ---
 
 #[test_case]
 fn flags_distinguish_leaf_from_branch() {
@@ -100,9 +87,7 @@ fn branch_entry_has_no_permission_bits() {
     assert!(!pte.flags().intersects(PteFlags::A | PteFlags::D | PteFlags::U));
 }
 
-// ---------------------------------------------------------------------------
-// Mapping and translation
-// ---------------------------------------------------------------------------
+// --- Mapping and translation ---
 
 #[test_case]
 fn map_then_translate_a_4k_page() {
@@ -140,8 +125,7 @@ fn megapage_maps_two_megabytes() {
         let (_, _, level) = m.translate(va).unwrap();
         assert_eq!(level, 1, "expected a level-1 leaf");
 
-        // The offset mask must come from the level, not from PAGE_SIZE: the last
-        // byte of a 2 MiB leaf is 2 MiB - 1 into the frame, not 4 KiB - 1.
+        // The offset mask must come from the level, not from PAGE_SIZE.
         let last = page_size(1) - 1;
         let (got, _, _) = m.translate(va.offset(last)).unwrap();
         assert_eq!(got, pa.offset(last));
@@ -153,8 +137,7 @@ fn gigapage_lives_in_the_root_table() {
     with_mapper!(|m, alloc| {
         let va = VirtAddr::new(KVA);
         let pa = PhysAddr::new(0x8000_0000);
-        // A 1 GiB leaf sits in the root itself, so this must consume no
-        // intermediate tables at all.
+        // A 1 GiB leaf sits in the root itself, so this must consume no intermediate tables at all.
         let before = alloc.frames_allocated();
         m.map(va, pa, MAX_LEVEL, PteFlags::KERNEL_RW, alloc).unwrap();
         assert_eq!(alloc.frames_allocated(), before, "a gigapage allocated a table");
@@ -221,9 +204,7 @@ fn unmapping_nothing_is_an_error() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Rejections -- each of these is a fault we would otherwise debug at runtime
-// ---------------------------------------------------------------------------
+// --- Rejections ---
 
 #[test_case]
 fn double_mapping_is_rejected() {
@@ -240,8 +221,7 @@ fn double_mapping_is_rejected() {
 #[test_case]
 fn misaligned_superpage_is_rejected() {
     with_mapper!(|m, alloc| {
-        // A 2 MiB leaf whose physical address is only 4 KiB aligned. The
-        // hardware does not round -- it faults -- so we refuse to build it.
+        // A 2 MiB leaf whose physical address is only 4 KiB aligned.
         assert_eq!(
             m.map(
                 VirtAddr::new(KVA),
@@ -310,8 +290,7 @@ fn mapping_inside_a_superpage_is_refused() {
     with_mapper!(|m, alloc| {
         let base = VirtAddr::new(KVA);
         m.map(base, PhysAddr::new(0x8000_0000), 1, PteFlags::KERNEL_RW, alloc).unwrap();
-        // Splitting a live superpage is not implemented; say so rather than
-        // silently corrupting the tree.
+        // Splitting a live superpage is unimplemented; say so rather than corrupt the tree.
         assert_eq!(
             m.map(
                 base.offset(PAGE_SIZE),
@@ -335,9 +314,7 @@ fn bad_level_is_rejected() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// map_range and superpage selection
-// ---------------------------------------------------------------------------
+// --- map_range and superpage selection ---
 
 #[test_case]
 fn map_range_uses_a_gigapage_when_it_can() {
@@ -351,8 +328,7 @@ fn map_range_uses_a_gigapage_when_it_can() {
             alloc,
         )
         .unwrap();
-        // One 1 GiB leaf in the root: no tables at all. This is the whole
-        // argument for D-016 -- 4 KiB pages would be 262144 entries.
+        // One 1 GiB leaf in the root: no tables at all.
         assert_eq!(alloc.frames_allocated(), before);
         assert_eq!(m.translate(VirtAddr::new(KVA)).unwrap().2, MAX_LEVEL);
     });
@@ -361,8 +337,7 @@ fn map_range_uses_a_gigapage_when_it_can() {
 #[test_case]
 fn map_range_falls_back_to_smaller_pages() {
     with_mapper!(|m, alloc| {
-        // 4 KiB past a gigapage boundary, so the first page cannot be a
-        // superpage; the mapper must step down to level 0.
+        // 4 KiB past a gigapage boundary, so the mapper must step down to level 0.
         let va = VirtAddr::new(KVA + PAGE_SIZE);
         m.map_range(va, PhysAddr::new(0x8000_1000), PAGE_SIZE * 4, PteFlags::KERNEL_RW, alloc)
             .unwrap();

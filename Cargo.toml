@@ -10,15 +10,13 @@ members  = ["kernel"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-# The riscv64gc-unknown-none-elf target already forces panic=abort, so we do not
-# restate it here (cargo would warn that `panic` is ignored for the test profile).
+# The target already forces panic=abort; restating it warns for the test profile.
 [profile.dev]
 opt-level = 0
 debug     = true
 
 [profile.release]
-# Keep debug info in release too: we will be reading disassembly and stepping
-# optimized code when the M5 IPC fast path gets measured.
+# Debug info in release too, for reading disassembly when M5 gets measured.
 debug         = true
 lto           = true
 codegen-units = 1

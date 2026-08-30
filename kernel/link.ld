@@ -1,29 +1,18 @@
-/* tessera kernel linker script.
- *
- * D-002: in M1 the MMU is off and the kernel is linked at the physical address
- * OpenSBI drops us at, so KERNEL_VMA is 0 and every AT() below is the identity.
- * The VMA/LMA machinery is written out anyway so that M2's move to a higher-half
- * kernel is a one-line change here plus a boot trampoline, not a rewrite:
- *
- *     KERNEL_VMA = 0xffffffc000000000;
- *
- * At that point VMA = KERNEL_VMA + KERNEL_LMA + offset and LMA stays physical,
- * which is exactly what AT(ADDR(section) - KERNEL_VMA) expresses.
- */
+/* tessera kernel linker script: linked high, loaded physical (D-002).
+ * VMA = KERNEL_VMA + KERNEL_LMA, LMA stays physical -- what AT() expresses. */
 
 OUTPUT_ARCH(riscv)
-ENTRY(_start)
 
-/* Where OpenSBI hands off. OpenSBI itself occupies 0x80000000..0x80200000 on
- * QEMU virt; 0x80200000 is the conventional S-mode payload address. */
+/* e_entry must be physical: OpenSBI jumps to it with the MMU off. */
+ENTRY(_start_phys)
+
+/* Where OpenSBI hands off: the conventional S-mode payload address. */
 KERNEL_LMA = 0x80200000;
 
-/* Virtual offset applied to the kernel. Zero until M2. */
-KERNEL_VMA = 0x0;
+/* Virtual offset applied to the kernel. */
+KERNEL_VMA = 0xffffffc000000000;
 
-/* Boot stack for the single hart that runs M1. Lives in .bss, so it costs
- * nothing in the image. 64 KiB is generous; it exists so a deep panic-format
- * call chain cannot silently run off the end. */
+/* Boot stack for the boot hart. In .bss, so it costs nothing in the image. */
 BOOT_STACK_SIZE = 64K;
 
 SECTIONS
@@ -35,21 +24,21 @@ SECTIONS
     {
         __text_start = .;
 
-        /* The entry point must be the first thing in the image. KEEP() stops
-         * --gc-sections from removing it: nothing in Rust ever calls _start. */
+        /* First in the image; KEEP() because nothing in Rust calls _start. */
         KEEP(*(.text.boot))
 
-        /* stvec holds the trap entry and requires 4-byte alignment (its low two
-         * bits are the mode field, D-006). Aligning here rather than relying on
-         * the compiler's function alignment makes the requirement explicit and
-         * survives the C extension's 2-byte function alignment.
-         * This claim must come before *(.text.*) — lld matches in order. */
+        /* stvec's low two bits are the mode field, so the trap entry needs
+         * 4-byte alignment (D-006). Must precede *(.text.*): lld matches in order. */
         . = ALIGN(4);
         KEEP(*(.text.trap))
 
         *(.text .text.*)
         __text_end = .;
     }
+
+    /* Plain assignment, not PROVIDE(): ENTRY() does not count as a reference,
+     * so PROVIDE would leave it undefined and e_entry would come out 0. */
+    _start_phys = _start - KERNEL_VMA;
 
     . = ALIGN(4096);
     .rodata : AT(ADDR(.rodata) - KERNEL_VMA)
@@ -67,10 +56,8 @@ SECTIONS
         __data_start = .;
         *(.data .data.*)
 
-        /* RISC-V linker relaxation rewrites some global accesses to be
-         * gp-relative. gp must point 0x800 past the start of the small-data
-         * area so that a signed 12-bit offset covers .sdata and .sbss.
-         * D-012: _start loads this before any Rust code runs. */
+        /* gp sits 0x800 into the small-data area so a signed 12-bit offset
+         * covers .sdata and .sbss; _start loads it before any Rust runs (D-012). */
         . = ALIGN(8);
         PROVIDE(__global_pointer$ = . + 0x800);
         *(.sdata .sdata.*)
@@ -86,15 +73,14 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
 
-        /* The boot stack is inside the zeroed range. That is only safe because
-         * the zeroing loop in _start uses no stack at all (D-012). */
+        /* Inside the zeroed range: safe only because _start's zeroing loop
+         * uses no stack (D-012). */
         . = ALIGN(16);
         __boot_stack_bottom = .;
         . += BOOT_STACK_SIZE;
         __boot_stack_top = .;
 
-        /* The zeroing loop stores 8 bytes at a time and does not check for a
-         * ragged tail, so the end must be 8-byte aligned. */
+        /* The zeroing loop stores 8 bytes at a time with no ragged-tail check. */
         . = ALIGN(8);
         __bss_end = .;
     }
@@ -104,7 +90,7 @@ SECTIONS
 
     /DISCARD/ :
     {
-        /* panic=abort: unwind tables are dead weight in a kernel image. */
+        /* panic=abort: unwind tables are dead weight. */
         *(.eh_frame .eh_frame_hdr)
         *(.note .note.*)
         *(.comment)

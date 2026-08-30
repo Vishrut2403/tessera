@@ -1,10 +1,4 @@
-//! The trap path: does a trap actually reach us, do we come back, and does the
-//! register file survive the round trip?
-//!
-//! The register test matters more than it looks. A wrong offset in one of the 31
-//! save/restore pairs in `trap_entry` corrupts exactly one register, which then
-//! misbehaves somewhere unrelated, long after the trap. Checking all of them at
-//! the point of the trap turns a haunting into a test failure.
+//! The trap path: does a trap reach us, do we return, is the register file intact?
 
 #![no_std]
 #![no_main]
@@ -39,8 +33,7 @@ fn stvec_points_at_our_handler() {
 #[test_case]
 fn breakpoint_is_handled_and_returns() {
     let before = trap::BREAKPOINTS.load(Ordering::Relaxed);
-    // SAFETY: `ebreak` raises a breakpoint exception, which the dispatcher
-    // handles by advancing sepc past it.
+    // SAFETY: `ebreak` raises a breakpoint; the dispatcher advances sepc past it.
     unsafe { core::arch::asm!("ebreak") };
     assert_eq!(trap::BREAKPOINTS.load(Ordering::Relaxed), before + 1);
 }
@@ -57,12 +50,9 @@ fn breakpoints_are_repeatable() {
 
 #[test_case]
 fn temporaries_survive_a_trap() {
-    // Load recognisable values into the caller-saved temporaries, trap, and read
-    // them back. `out`/`inout` with explicit registers stops the compiler from
-    // keeping these anywhere but where we asked.
+    // Load recognisable values into the caller-saved temporaries, trap, and read them back.
     let (t0, t1, t2, a4, a5): (usize, usize, usize, usize, usize);
-    // SAFETY: the asm writes only the registers named as outputs and takes a
-    // breakpoint the kernel handles.
+    // SAFETY: the asm writes only its named outputs and takes a breakpoint the kernel handles.
     unsafe {
         core::arch::asm!(
             "li t0, 0x1111",
@@ -76,9 +66,7 @@ fn temporaries_survive_a_trap() {
             out("t2") t2,
             out("a4") a4,
             out("a5") a5,
-            // No `options(nostack)`: `ebreak` traps, and the trap entry
-            // allocates a 256-byte frame below sp. Promising the compiler that
-            // this asm leaves the stack alone would be a lie.
+            // No `options(nostack)`: the trap entry allocates a 256-byte frame below sp.
         );
     }
     assert_eq!(t0, 0x1111);
@@ -90,9 +78,7 @@ fn temporaries_survive_a_trap() {
 
 #[test_case]
 fn saved_registers_survive_a_trap() {
-    // The callee-saved half. s0 is the frame pointer and s1..s11 are otherwise
-    // in use by the compiler, so we save and restore them around the test
-    // ourselves rather than asking the register allocator for them.
+    // The callee-saved half.
     let (s2, s3, s10, s11): (usize, usize, usize, usize);
     // SAFETY: as above; every register touched is declared.
     unsafe {
