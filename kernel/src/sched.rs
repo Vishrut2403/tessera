@@ -178,7 +178,14 @@ fn activate(mut tcb: NonNull<Tcb>) -> *mut TrapFrame {
     }
     // SAFETY: the space was built by `AddressSpace`, so it maps the kernel half.
     unsafe { crate::csr::satp::write(t.satp) };
-    crate::mm::flush_tlb_all();
+
+    // An unassigned space is ASID 0, which every other unassigned space also
+    // uses, so its entries have to go. Once an ASID pool has given the space a
+    // number of its own, the tag keeps them apart and the flush is unnecessary
+    // -- which is what D-022 deferred and M4e delivers.
+    if (t.satp >> 44) & 0xffff == 0 {
+        crate::mm::flush_tlb_all();
+    }
 
     QUEUE.lock().current = Some(tcb);
     t.frame_ptr()

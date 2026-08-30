@@ -7,6 +7,7 @@
 #![reexport_test_harness_main = "test_main"]
 
 pub mod boot;
+pub mod cap;
 pub mod csr;
 pub mod fdt;
 pub mod mm;

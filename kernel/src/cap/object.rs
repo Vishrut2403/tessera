@@ -1,0 +1,97 @@
+//! The object model: what untyped memory can become.
+
+use crate::mm::PAGE_SHIFT;
+
+/// A capability slot is 64 bytes, so a CNode of 2^n slots is 2^(n+6) bytes.
+pub const SLOT_BITS: u8 = 6;
+
+/// Every kind of object the kernel knows how to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ObjectType {
+    /// An empty slot. Not an object.
+    Null,
+    /// Physical memory with no type yet. The only thing that can become anything.
+    Untyped,
+    /// A table of capability slots. Also a level of a CSpace.
+    CNode,
+    /// A page of memory userspace can map.
+    Frame,
+    /// One level of an Sv39 page table.
+    PageTable,
+    /// A thread.
+    Tcb,
+    /// An IPC rendezvous point. M5 gives it behaviour; M4 only makes it.
+    Endpoint,
+}
+
+impl ObjectType {
+    /// Whether the object's size is fixed, or chosen when it is made.
+    pub const fn is_variable_size(self) -> bool {
+        matches!(self, ObjectType::Untyped | ObjectType::CNode)
+    }
+
+    /// Log2 of the object's size in bytes.
+    ///
+    /// `size_bits` is only consulted for the variable-size kinds; for the rest
+    /// it is the type that decides, which is why passing one is an error.
+    pub const fn size_bits(self, requested: u8) -> Option<u8> {
+        match self {
+            ObjectType::Null => None,
+            ObjectType::Untyped | ObjectType::CNode => Some(requested),
+            ObjectType::Frame | ObjectType::PageTable | ObjectType::Tcb => {
+                Some(PAGE_SHIFT as u8)
+            }
+            ObjectType::Endpoint => Some(SLOT_BITS),
+        }
+    }
+
+    /// Slots in a CNode of this size, if it is one.
+    pub const fn slots(self, size_bits: u8) -> Option<usize> {
+        match self {
+            ObjectType::CNode if size_bits >= SLOT_BITS => {
+                Some(1usize << (size_bits - SLOT_BITS))
+            }
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            ObjectType::Null => "null",
+            ObjectType::Untyped => "untyped",
+            ObjectType::CNode => "cnode",
+            ObjectType::Frame => "frame",
+            ObjectType::PageTable => "page-table",
+            ObjectType::Tcb => "tcb",
+            ObjectType::Endpoint => "endpoint",
+        }
+    }
+}
+
+/// Zero-sized markers naming an object kind in a capability's type.
+pub mod kind {
+    macro_rules! kinds {
+        ($($name:ident => $ty:ident),* $(,)?) => { $(
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            pub struct $name;
+            impl super::ObjectKind for $name {
+                const TYPE: super::ObjectType = super::ObjectType::$ty;
+            }
+        )* };
+    }
+
+    kinds! {
+        Untyped => Untyped,
+        CNode => CNode,
+        Frame => Frame,
+        PageTable => PageTable,
+        Tcb => Tcb,
+        Endpoint => Endpoint,
+    }
+}
+
+/// Ties a marker type to the runtime tag it must match on lookup.
+pub trait ObjectKind {
+    const TYPE: ObjectType;
+}

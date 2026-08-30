@@ -5,6 +5,10 @@
 
 use kernel::csr::{sstatus, sstatus_bits};
 use kernel::mm::{self, PhysAddr};
+use kernel::cap::asid::AsidPool;
+use kernel::cap::cspace::bootstrap;
+use kernel::cap::rights::{ALL, GRANT, READ};
+use kernel::cap::{ObjectType, RawCap};
 use kernel::mm::{AddressSpace, PAGE_SIZE, PteFlags, VirtAddr};
 use kernel::uprog::{self, A7, ECALL, li};
 use kernel::{kernel_entry, layout, println, qemu, sched, time, trap};
@@ -17,7 +21,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     kernel::init();
 
     println!();
-    println!("tessera :: M3 -- threads, preemption, round-robin");
+    println!("tessera :: M4 -- capabilities, untyped memory, revocation");
     println!("  hart          : {}", hartid);
     println!("  device tree   : {:#x}", dtb_pa);
     println!("  sp            : {:#018x}", kernel::stack_pointer());
@@ -224,8 +228,83 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!("  still ready   : {} (the spinner, preempted and requeued)", sched::ready_count());
     println!("  timer ticks   : {}", time::TICKS.load(core::sync::atomic::Ordering::Relaxed));
 
+    // --- M4: capabilities ---
+    // One 2 MiB region of untyped memory, and a capability space rooted in a
+    // CNode carved out of it. Everything below comes from that one region.
+    let region = {
+        let mut alloc = mm::FRAMES.lock();
+        let mut first = alloc.alloc_frame().expect("no frames");
+        while first.as_usize() & (2 * 1024 * 1024 - 1) != 0 {
+            first = alloc.alloc_frame().expect("no frames");
+        }
+        for _ in 1..512 {
+            alloc.alloc_frame().expect("no frames");
+        }
+        RawCap {
+            kind: ObjectType::Untyped,
+            rights: ALL,
+            size_bits: 21,
+            paddr: first,
+            watermark: 0,
+            badge: 0,
+        }
+    };
+
+    let mut cs = bootstrap(region, 12).expect("could not bootstrap a capability space");
     println!();
-    println!("M3 complete. Parking. (Ctrl-A x to exit QEMU)");
+    println!("capability space (root CNode at {}):", cs.root().paddr);
+    println!("  untyped       : {} .. {:#012x}", region.paddr, region.end());
+    println!("  root slots    : {}", cs.root_slots());
+
+    let mut made = [RawCap::NULL; 4];
+    cs.retype((0, 6), ObjectType::Frame, 0, (8, 6), &mut made).expect("retype");
+    cs.retype((0, 6), ObjectType::Endpoint, 0, (12, 6), &mut made[..1]).expect("retype");
+    println!(
+        "  retyped       : 4 frames + 1 endpoint, watermark now {} KiB",
+        cs.read(0, 6).unwrap().watermark / 1024
+    );
+
+    // Delegate the endpoint twice, weaker each time.
+    cs.mint((12, 6), (13, 6), READ | GRANT, 0x51de).expect("mint");
+    cs.mint((13, 6), (14, 6), READ, 0xfeed).expect("mint");
+    for slot in [12u64, 13, 14] {
+        let c = cs.read(slot, 6).unwrap();
+        println!(
+            "  slot {slot:<2}       : {} rights={} badge={:#x}",
+            c.kind.name(),
+            kernel::cap::rights::name(c.rights),
+            c.badge
+        );
+    }
+    println!("  descendants   : {} under slot 12", cs.descendants(12, 6).unwrap());
+
+    // A capability without GRANT cannot be delegated further.
+    match cs.mint((14, 6), (15, 6), READ, 0) {
+        Err(e) => println!("  re-delegating slot 14 : refused ({e:?})"),
+        Ok(()) => panic!("a capability without GRANT was delegated"),
+    }
+
+    let gone = cs.revoke(12, 6).expect("revoke");
+    println!("  revoke slot 12: {gone} capabilities destroyed, slot 12 {}",
+        if cs.read(12, 6).unwrap().is_null() { "empty" } else { "intact" });
+
+    // --- M4e: ASIDs (D-022) ---
+    let bits = kernel::cap::asid::init();
+    let mut pool = AsidPool::new(bits);
+    println!();
+    println!("asid pool:");
+    println!("  hart supports : {bits} bits ({} usable ids)", pool.capacity());
+    let mut demo_space = {
+        let mut alloc = mm::FRAMES.lock();
+        AddressSpace::new(&kspace, &mut *alloc).expect("address space")
+    };
+    println!("  before assign : satp {:#018x}", demo_space.satp());
+    let asid = pool.assign(&mut demo_space).expect("assign");
+    println!("  after  assign : satp {:#018x} (asid {})", demo_space.satp(), asid.as_u16());
+    println!("  switching to it no longer needs a full TLB flush");
+
+    println!();
+    println!("M4 complete. Parking. (Ctrl-A x to exit QEMU)");
     qemu::park()
 }
 
