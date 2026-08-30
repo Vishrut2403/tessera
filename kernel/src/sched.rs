@@ -3,18 +3,61 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::cap::cspace::CSpace;
+use crate::cap::{ObjectType, RawCap};
+use crate::ipc::{self, EndpointState, MessageInfo};
 use crate::mm::{AddressSpace, VirtAddr};
 use crate::sync::SpinLock;
 use crate::thread::{Tcb, ThreadId, ThreadState};
 use crate::trap::{Cause, TrapFrame, reg, return_to_user};
 
-/// The system calls M3 understands. M4 replaces all of them with capability
-/// invocations; they exist so a user thread has something to say.
+/// The system call numbers.
+///
+/// Everything a thread can ask of a *kernel object* goes through `CALL` on a
+/// capability, with a label selecting the operation (D-032). These few numbers
+/// are the whole ambient surface; `PUTC` and `GET_ID` are M3 scaffolding that a
+/// console capability replaces in M7.
 pub mod syscall {
     pub const YIELD: usize = 0;
     pub const EXIT: usize = 1;
     pub const PUTC: usize = 2;
     pub const GET_ID: usize = 3;
+    /// Send and block until taken; no reply expected.
+    pub const SEND: usize = 4;
+    /// Block until a message arrives.
+    pub const RECV: usize = 5;
+    /// Send and block until replied to. The fast path.
+    pub const CALL: usize = 6;
+    /// Answer the caller whose reply capability we hold.
+    pub const REPLY: usize = 7;
+    /// Reply, then wait for the next message. What a server loop runs.
+    pub const REPLY_RECV: usize = 8;
+}
+
+/// Labels selecting an operation on a kernel object (D-032).
+///
+/// An endpoint never has its label read by the kernel: everything at or above
+/// [`label::APP_BASE`] is the application's own business.
+pub mod label {
+    /// Untyped: carve objects out of a region.
+    pub const RETYPE: u64 = 1;
+    /// CNode: copy a capability with reduced rights.
+    pub const MINT: u64 = 2;
+    /// CNode: destroy everything derived from a capability.
+    pub const REVOKE: u64 = 3;
+    /// CNode: destroy a capability and its derivatives.
+    pub const DELETE: u64 = 4;
+    /// The first label the kernel does not interpret.
+    pub const APP_BASE: u64 = 0x1000;
+}
+
+/// What a syscall returns in `a0`.
+pub mod result {
+    pub const OK: usize = 0;
+    pub const ERR_BAD_CAP: usize = usize::MAX;
+    pub const ERR_BAD_LABEL: usize = usize::MAX - 1;
+    pub const ERR_NO_REPLY: usize = usize::MAX - 2;
+    pub const ERR_NO_CSPACE: usize = usize::MAX - 3;
 }
 
 /// Callee-saved state of the kernel context that called [`run`].
@@ -29,7 +72,6 @@ struct KernelContext {
 struct RunQueue {
     head: Option<NonNull<Tcb>>,
     tail: Option<NonNull<Tcb>>,
-    current: Option<NonNull<Tcb>>,
     ready: usize,
 }
 
@@ -39,7 +81,7 @@ unsafe impl Send for RunQueue {}
 
 impl RunQueue {
     const fn new() -> Self {
-        Self { head: None, tail: None, current: None, ready: 0 }
+        Self { head: None, tail: None, ready: 0 }
     }
 
     fn push(&mut self, mut tcb: NonNull<Tcb>) {
@@ -55,6 +97,9 @@ impl RunQueue {
 
     fn pop(&mut self) -> Option<NonNull<Tcb>> {
         let mut head = self.head?;
+        // Counted, not for statistics: invariant 4 says a call/reply pair must
+        // not consult the run queue, and this is what a test can assert on.
+        POPS.fetch_add(1, Ordering::Relaxed);
         // SAFETY: as above.
         let next = unsafe { head.as_mut().next.take() };
         self.head = next;
@@ -73,6 +118,16 @@ static SPAWNED: AtomicUsize = AtomicUsize::new(0);
 static EXITED: AtomicUsize = AtomicUsize::new(0);
 static KILLED: AtomicUsize = AtomicUsize::new(0);
 static STOP_ON_EXIT: AtomicBool = AtomicBool::new(false);
+static POPS: AtomicUsize = AtomicUsize::new(0);
+
+/// The thread on this hart, outside the run queue's lock.
+///
+/// Which thread is current is per-hart state that no other hart reads, so
+/// putting it behind the queue lock cost a compare-exchange and an interrupt
+/// mask/unmask every time the fast path asked "who am I?" (D-033). With more
+/// harts this becomes an array indexed by hartid, not a shared lock.
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+static LAST_BADGE: AtomicUsize = AtomicUsize::new(0);
 
 impl KernelContext {
     const fn new_const() -> Self {
@@ -92,12 +147,24 @@ pub fn spawn(
     entry: VirtAddr,
     stack_top: VirtAddr,
 ) -> Result<ThreadId, SpawnError> {
+    spawn_with_cspace(space, entry, stack_top, RawCap::NULL)
+}
+
+/// As [`spawn`], giving the thread a capability space to invoke through.
+pub fn spawn_with_cspace(
+    space: &AddressSpace,
+    entry: VirtAddr,
+    stack_top: VirtAddr,
+    cspace: RawCap,
+) -> Result<ThreadId, SpawnError> {
     let frame = crate::mm::alloc_frame().ok_or(SpawnError::OutOfFrames)?;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
     // SAFETY: `frame` came from the allocator, so we own it and nothing else
     // has a TCB in it.
-    let tcb = unsafe { Tcb::create(frame, id, space, entry, stack_top) };
+    let mut tcb = unsafe { Tcb::create(frame, id, space, entry, stack_top) };
+    // SAFETY: we just made it; nothing else refers to it yet.
+    unsafe { tcb.as_mut().cspace = cspace };
 
     QUEUE.lock().push(tcb);
     SPAWNED.fetch_add(1, Ordering::Relaxed);
@@ -122,10 +189,24 @@ pub fn killed() -> usize {
     KILLED.load(Ordering::Relaxed)
 }
 
+/// How many times a thread has been taken off the run queue.
+///
+/// The fast path must not move this: a `call`/`reply` pair switches directly
+/// from one thread to the other, so the only pops in a ping-pong are the two
+/// that started the threads (invariant 4, D-031).
+pub fn queue_pops() -> usize {
+    POPS.load(Ordering::Relaxed)
+}
+
+/// The badge delivered by the most recent receive, for tests.
+pub fn last_badge() -> u64 {
+    LAST_BADGE.load(Ordering::Relaxed) as u64
+}
+
 /// The id of the thread on this hart, if one is running.
 pub fn current_id() -> Option<ThreadId> {
-    // SAFETY: read under the lock; the TCB outlives the queue entry.
-    QUEUE.lock().current.map(|t| unsafe { t.as_ref().id })
+    // SAFETY: the TCB is live for as long as it is current.
+    current_tcb().map(|t| unsafe { t.as_ref().id })
 }
 
 /// Run threads until the run queue empties, then return.
@@ -158,7 +239,7 @@ pub fn run_until_exit() {
 /// may be current when it is called.
 pub fn kill_all() -> usize {
     let mut n = 0;
-    assert!(QUEUE.lock().current.is_none(), "kill_all with a thread on the hart");
+    assert!(current_tcb().is_none(), "kill_all with a thread on the hart");
     while let Some(mut tcb) = take_next() {
         // SAFETY: off the queue and not current, so we are its only writer.
         unsafe { tcb.as_mut().state = ThreadState::Exited };
@@ -176,18 +257,24 @@ fn activate(mut tcb: NonNull<Tcb>) -> *mut TrapFrame {
     if t.uses_fp() {
         crate::thread::restore_fp(&t.fp);
     }
-    // SAFETY: the space was built by `AddressSpace`, so it maps the kernel half.
-    unsafe { crate::csr::satp::write(t.satp) };
+    // Threads that share an address space need no switch at all: `satp` already
+    // holds the right value, and writing it would flush for nothing. seL4's
+    // fast path makes the same check, and it is why threads in one process can
+    // talk to each other almost for free (D-033).
+    if crate::csr::satp::read() != t.satp {
+        // SAFETY: the space was built by `AddressSpace`, so it maps the kernel half.
+        unsafe { crate::csr::satp::write(t.satp) };
 
-    // An unassigned space is ASID 0, which every other unassigned space also
-    // uses, so its entries have to go. Once an ASID pool has given the space a
-    // number of its own, the tag keeps them apart and the flush is unnecessary
-    // -- which is what D-022 deferred and M4e delivers.
-    if (t.satp >> 44) & 0xffff == 0 {
-        crate::mm::flush_tlb_all();
+        // An unassigned space is ASID 0, which every other unassigned space
+        // also uses, so its entries have to go. Once an ASID pool has given the
+        // space a number of its own, the tag keeps them apart and the flush is
+        // unnecessary -- what D-022 deferred and M4e delivered.
+        if (t.satp >> 44) & 0xffff == 0 {
+            crate::mm::flush_tlb_all();
+        }
     }
 
-    QUEUE.lock().current = Some(tcb);
+    set_current(Some(tcb));
     t.frame_ptr()
 }
 
@@ -204,11 +291,15 @@ enum Retire {
     Exited,
     /// Faulted, and the kernel destroyed it.
     Killed,
+    /// Parked on an endpoint. Its state is already set and it is on no queue
+    /// the scheduler owns; the endpoint will make it runnable again.
+    Blocked,
 }
 
 /// Stop running the current thread and resume whatever is next.
 fn retire(why: Retire) -> ! {
-    let current = QUEUE.lock().current.take();
+    let current = current_tcb();
+    set_current(None);
 
     if let Some(mut tcb) = current {
         // SAFETY: the current thread is not on the queue, so we are its only writer.
@@ -232,6 +323,9 @@ fn retire(why: Retire) -> ! {
                 t.state = ThreadState::Exited;
                 KILLED.fetch_add(1, Ordering::Relaxed);
             }
+            // Already queued on an endpoint; touching the run queue here is
+            // exactly the bug invariant 4 is about.
+            Retire::Blocked => {}
         }
     }
 
@@ -300,14 +394,286 @@ fn syscall(tcb: &mut Tcb) -> ! {
         syscall::EXIT => retire(Retire::Exited),
         syscall::PUTC => {
             crate::print!("{}", arg as u8 as char);
-            tcb.set_return(0);
+            tcb.set_return(result::OK);
         }
         syscall::GET_ID => tcb.set_return(tcb.id),
+        syscall::CALL => invoke(tcb, true),
+        syscall::SEND => invoke(tcb, false),
+        syscall::RECV => sys_recv(tcb),
+        syscall::REPLY => sys_reply(tcb, false),
+        syscall::REPLY_RECV => sys_reply(tcb, true),
         _ => tcb.set_return(usize::MAX),
     }
 
     // SAFETY: the thread is still current and its frame is intact.
     unsafe { return_to_user(tcb.frame_ptr()) }
+}
+
+/// Resume `next` without consulting the run queue.
+///
+/// This is the direct switch invariant 4 is about: a `call`/`reply` pair moves
+/// the hart from one thread to another and the scheduler never runs (D-031).
+fn switch_direct(next: NonNull<Tcb>) -> ! {
+    // Whatever is leaving the hart still owns the FP registers if it ever
+    // touched one (D-025). `activate` restores them for the thread arriving.
+    if let Some(mut outgoing) = current_tcb() {
+        // SAFETY: the outgoing thread is not on any queue we are walking.
+        let t = unsafe { outgoing.as_mut() };
+        if t.uses_fp() {
+            crate::thread::save_fp(&mut t.fp);
+        }
+    }
+    // SAFETY: `next` is a runnable thread whose frame `Tcb::create` built.
+    unsafe { return_to_user(activate(next)) }
+}
+
+/// Finish a syscall that did not block, returning `value` in `a0`.
+fn finish(tcb: &mut Tcb, value: usize) -> ! {
+    tcb.set_return(value);
+    // SAFETY: the thread is still current and its frame is intact.
+    unsafe { return_to_user(tcb.frame_ptr()) }
+}
+
+/// The capability space of the running thread.
+fn cspace_of(tcb: &Tcb) -> Option<CSpace> {
+    CSpace::new(tcb.cspace).ok()
+}
+
+/// `call` or `send` on whatever `a0` names (D-032).
+fn invoke(tcb: &mut Tcb, is_call: bool) -> ! {
+    let cptr = tcb.frame.x[reg::A0] as u64;
+    let info = ipc::message_of(tcb);
+
+    let Some(cs) = cspace_of(tcb) else { finish(tcb, result::ERR_NO_CSPACE) };
+    let Ok(cap) = cs.read(cptr, cs.root_depth()) else {
+        finish(tcb, result::ERR_BAD_CAP);
+    };
+
+    match cap.kind {
+        ObjectType::Endpoint => ipc_send(tcb, cap, info, is_call),
+        ObjectType::Untyped => invoke_untyped(tcb, cs, cptr, info),
+        ObjectType::CNode => invoke_cnode(tcb, cs, cptr, info),
+        _ => finish(tcb, result::ERR_BAD_CAP),
+    }
+}
+
+/// Hand a message to a receiver, or block until one arrives.
+fn ipc_send(tcb: &mut Tcb, ep_cap: RawCap, info: MessageInfo, is_call: bool) -> ! {
+    // SAFETY: `ep_cap` came from this thread's CSpace, so it names a live
+    // endpoint object, and only this hart is running kernel code.
+    let ep = unsafe { ipc::endpoint_at(ep_cap.paddr) };
+
+    // SAFETY: the queue holds live TCBs the kernel owns.
+    if let Some(mut waiting) = unsafe { ep.dequeue(EndpointState::Receiving) } {
+        // SAFETY: taken off the endpoint queue, so nothing else refers to it.
+        let receiver = unsafe { waiting.as_mut() };
+        ipc::transfer(tcb, receiver, info, ep_cap.badge);
+        LAST_BADGE.store(ep_cap.badge as usize, Ordering::Relaxed);
+
+        if is_call {
+            receiver.reply = ipc::reply_cap(tcb.self_paddr);
+            tcb.state = ThreadState::AwaitingReply;
+            tcb.call_pending = false;
+        } else {
+            receiver.reply = RawCap::NULL;
+            tcb.state = ThreadState::Ready;
+        }
+        receiver.state = ThreadState::Ready;
+
+        if is_call {
+            // The caller is not runnable, so nothing goes on the run queue and
+            // the receiver gets the rest of this timeslice. The whole point.
+            switch_direct(waiting);
+        }
+        // A bare `send` stays runnable; the receiver still gets the hart, and
+        // the sender goes to the back of the queue.
+        tcb.set_return(result::OK);
+        // The lock is not reentrant, so `current_tcb` must be resolved before
+        // `push` takes it -- Rust evaluates the receiver first.
+        let me = current_tcb().expect("no current thread");
+        QUEUE.lock().push(me);
+        switch_direct(waiting);
+    }
+
+    // Nobody is waiting: park on the endpoint.
+    tcb.badge = ep_cap.badge;
+    tcb.call_pending = is_call;
+    tcb.state = ThreadState::BlockedOnSend;
+    let me = current_tcb().expect("no current thread");
+    // SAFETY: this thread is current, so it is on no other queue.
+    unsafe { ep.enqueue(me, EndpointState::Sending) };
+    retire(Retire::Blocked)
+}
+
+/// Take a queued message, or block waiting for one.
+fn sys_recv(tcb: &mut Tcb) -> ! {
+    let cptr = tcb.frame.x[reg::A0] as u64;
+    let Some(cs) = cspace_of(tcb) else { finish(tcb, result::ERR_NO_CSPACE) };
+    let Ok(ep_cap) = cs.read(cptr, cs.root_depth()) else {
+        finish(tcb, result::ERR_BAD_CAP);
+    };
+    if ep_cap.kind != ObjectType::Endpoint {
+        finish(tcb, result::ERR_BAD_CAP)
+    } else {
+        receive_on(tcb, ep_cap)
+    }
+}
+
+/// The receive half, shared by `recv` and `reply_recv`.
+fn receive_on(tcb: &mut Tcb, ep_cap: RawCap) -> ! {
+    // SAFETY: `ep_cap` came from a CSpace, so it names a live endpoint.
+    let ep = unsafe { ipc::endpoint_at(ep_cap.paddr) };
+
+    // SAFETY: the queue holds live TCBs.
+    if let Some(mut queued) = unsafe { ep.dequeue(EndpointState::Sending) } {
+        // SAFETY: off the queue, so nothing else refers to it.
+        let sender = unsafe { queued.as_mut() };
+        let info = ipc::message_of(sender);
+        ipc::transfer(sender, tcb, info, sender.badge);
+        LAST_BADGE.store(sender.badge as usize, Ordering::Relaxed);
+
+        if sender.call_pending {
+            tcb.reply = ipc::reply_cap(sender.self_paddr);
+            sender.state = ThreadState::AwaitingReply;
+            sender.call_pending = false;
+        } else {
+            tcb.reply = RawCap::NULL;
+            sender.state = ThreadState::Ready;
+            sender.set_return(result::OK);
+            QUEUE.lock().push(queued);
+        }
+        // We already have the hart and a message; just go back to user mode.
+        // SAFETY: this thread is current and its frame is intact.
+        unsafe { return_to_user(tcb.frame_ptr()) };
+    }
+
+    tcb.state = ThreadState::BlockedOnRecv;
+    let me = current_tcb().expect("no current thread");
+    // SAFETY: this thread is current, so it is on no other queue.
+    unsafe { ep.enqueue(me, EndpointState::Receiving) };
+    retire(Retire::Blocked)
+}
+
+/// Answer the caller whose reply capability this thread holds.
+fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
+    if tcb.reply.kind != ObjectType::Reply {
+        finish(tcb, result::ERR_NO_REPLY);
+    }
+    let info = ipc::message_of(tcb);
+
+    // The reply capability names the caller's TCB directly, so answering it
+    // costs no lookup at all.
+    let mut caller = NonNull::new(crate::mm::phys_to_virt(tcb.reply.paddr).as_mut_ptr::<Tcb>())
+        .expect("reply capability with a null TCB");
+    // SAFETY: the caller is blocked in `AwaitingReply`, so it is on no queue
+    // and nothing else is writing it.
+    let callee = unsafe { caller.as_mut() };
+    ipc::transfer(tcb, callee, info, 0);
+    callee.state = ThreadState::Ready;
+    tcb.reply = RawCap::NULL;
+
+    if then_receive {
+        let cptr = tcb.frame.x[reg::A0] as u64;
+        if let Some(cs) = cspace_of(tcb)
+            && let Ok(ep_cap) = cs.read(cptr, cs.root_depth())
+            && ep_cap.kind == ObjectType::Endpoint
+        {
+            // SAFETY: a live endpoint from this thread's CSpace.
+            let ep = unsafe { ipc::endpoint_at(ep_cap.paddr) };
+            // SAFETY: the queue holds live TCBs.
+            let waiting = unsafe { ep.dequeue(EndpointState::Sending) };
+            if waiting.is_some() {
+                // Someone was already queued: the caller we just answered goes
+                // on the run queue and we keep the hart.
+                QUEUE.lock().push(caller);
+                // Put it back; `receive_on` takes it properly.
+                // SAFETY: as above.
+                unsafe { ep.enqueue(waiting.unwrap(), EndpointState::Sending) };
+                receive_on(tcb, ep_cap);
+            }
+            tcb.state = ThreadState::BlockedOnRecv;
+            // SAFETY: this thread is current, so it is on no other queue.
+            let me = current_tcb().expect("no current thread");
+            // SAFETY: this thread is current, so it is on no other queue.
+            unsafe { ep.enqueue(me, EndpointState::Receiving) };
+            // The server is parked, so the thread we just answered gets the
+            // hart directly -- the other half of the fast path.
+            switch_direct(caller);
+        }
+        finish(tcb, result::ERR_BAD_CAP);
+    }
+
+    // A bare reply: we stay runnable, but the caller gets the hart.
+    tcb.set_return(result::OK);
+    tcb.state = ThreadState::Ready;
+    // As above: resolve the current thread before taking the lock to push it.
+    let me = current_tcb().expect("no current thread");
+    QUEUE.lock().push(me);
+    switch_direct(caller)
+}
+
+/// The thread on this hart, as a pointer. One atomic load.
+#[inline(always)]
+fn current_tcb() -> Option<NonNull<Tcb>> {
+    NonNull::new(CURRENT.load(Ordering::Relaxed) as *mut Tcb)
+}
+
+#[inline(always)]
+fn set_current(tcb: Option<NonNull<Tcb>>) {
+    CURRENT.store(tcb.map_or(0, |t| t.as_ptr() as usize), Ordering::Relaxed);
+}
+
+// --- Invocations on kernel objects (D-032) ---
+
+fn invoke_untyped(tcb: &mut Tcb, mut cs: CSpace, cptr: u64, info: MessageInfo) -> ! {
+    if info.label() != label::RETYPE {
+        finish(tcb, result::ERR_BAD_LABEL);
+    }
+    let depth = cs.root_depth();
+    let kind = object_type_from(tcb.frame.x[reg::A0 + 2]);
+    let size_bits = tcb.frame.x[reg::A0 + 3] as u8;
+    let dst = tcb.frame.x[reg::A0 + 4] as u64;
+    let count = tcb.frame.x[reg::A0 + 5];
+
+    let Some(kind) = kind else { finish(tcb, result::ERR_BAD_LABEL) };
+    if count == 0 || count > 32 {
+        finish(tcb, result::ERR_BAD_LABEL);
+    }
+
+    let mut made = [RawCap::NULL; 32];
+    let value = match cs.retype((cptr, depth), kind, size_bits, (dst, depth), &mut made[..count]) {
+        Ok(()) => result::OK,
+        Err(_) => result::ERR_BAD_CAP,
+    };
+    finish(tcb, value)
+}
+
+fn invoke_cnode(tcb: &mut Tcb, mut cs: CSpace, _cptr: u64, info: MessageInfo) -> ! {
+    let depth = cs.root_depth();
+    let src = tcb.frame.x[reg::A0 + 2] as u64;
+    let dst = tcb.frame.x[reg::A0 + 3] as u64;
+    let rights = tcb.frame.x[reg::A0 + 4] as u8;
+    let badge = tcb.frame.x[reg::A0 + 5] as u64;
+
+    let outcome = match info.label() {
+        label::MINT => cs.mint((src, depth), (dst, depth), rights, badge).map(|()| result::OK),
+        label::REVOKE => cs.revoke(src, depth).map(|_| result::OK),
+        label::DELETE => cs.delete(src, depth).map(|_| result::OK),
+        _ => finish(tcb, result::ERR_BAD_LABEL),
+    };
+    finish(tcb, outcome.unwrap_or(result::ERR_BAD_CAP))
+}
+
+fn object_type_from(n: usize) -> Option<ObjectType> {
+    Some(match n {
+        1 => ObjectType::Untyped,
+        2 => ObjectType::CNode,
+        3 => ObjectType::Frame,
+        4 => ObjectType::PageTable,
+        5 => ObjectType::Tcb,
+        6 => ObjectType::Endpoint,
+        _ => return None,
+    })
 }
 
 /// Save the calling kernel context into `ctx`, then resume `frame` in U-mode.

@@ -25,6 +25,13 @@ runner = [
 
 [alias]
 # `cargo run` with QEMU halted on a gdb stub at localhost:1234; see scripts/gdb.sh.
+# `cargo bench-ipc` -- the IPC measurement, with -icount so the instruction
+# counter tracks guest execution instead of host wall-clock time (O-009).
+bench-ipc = [
+    "test", "--test", "bench", "--config",
+    "target.riscv64gc-unknown-none-elf.runner=['qemu-system-riscv64','-machine','virt','-cpu','rv64','-smp','1','-m','128M','-nographic','-bios','default','-icount','shift=0','-kernel']",
+]
+
 kdebug = [
     "run", "--config",
     "target.riscv64gc-unknown-none-elf.runner=['qemu-system-riscv64','-machine','virt','-cpu','rv64','-smp','1','-m','128M','-nographic','-bios','default','-s','-S','-kernel']",

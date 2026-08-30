@@ -62,6 +62,11 @@ impl CSpace {
         &self.root
     }
 
+    /// Bits of a capability address the root CNode consumes: its radix.
+    pub const fn root_depth(&self) -> u8 {
+        self.root.size_bits - SLOT_BITS
+    }
+
     /// Slots in the root CNode.
     pub const fn root_slots(&self) -> usize {
         1usize << (self.root.size_bits - SLOT_BITS)
@@ -209,6 +214,13 @@ impl CSpace {
         let watermark = cap.retype(target, size_bits, out)?;
 
         for (i, made) in out.iter().enumerate() {
+            if made.kind == ObjectType::Endpoint {
+                // SAFETY: just carved out of the untyped, so nothing refers to
+                // it yet. Zeroed memory happens to be `Endpoint::EMPTY`, but
+                // relying on that would make the enum's discriminant
+                // load-bearing.
+                unsafe { crate::ipc::init_endpoint(made.paddr) };
+            }
             if made.kind == ObjectType::CNode {
                 // SAFETY: just carved out of the untyped, so nothing refers to
                 // it yet. `zero` already made every slot empty -- an all-zero

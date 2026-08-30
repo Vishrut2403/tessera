@@ -10,6 +10,7 @@ pub mod boot;
 pub mod cap;
 pub mod csr;
 pub mod fdt;
+pub mod ipc;
 pub mod mm;
 pub mod qemu;
 pub mod sbi;

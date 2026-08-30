@@ -21,8 +21,11 @@ pub enum ObjectType {
     PageTable,
     /// A thread.
     Tcb,
-    /// An IPC rendezvous point. M5 gives it behaviour; M4 only makes it.
+    /// An IPC rendezvous point.
     Endpoint,
+    /// A one-shot right to reply to a caller. Only the kernel mints these, on
+    /// `call`, so it is deliberately absent from everything `retype` accepts.
+    Reply,
 }
 
 impl ObjectType {
@@ -43,6 +46,8 @@ impl ObjectType {
                 Some(PAGE_SHIFT as u8)
             }
             ObjectType::Endpoint => Some(SLOT_BITS),
+            // Never retyped into: minted by the kernel, pointing at a TCB.
+            ObjectType::Reply => None,
         }
     }
 
@@ -65,6 +70,7 @@ impl ObjectType {
             ObjectType::PageTable => "page-table",
             ObjectType::Tcb => "tcb",
             ObjectType::Endpoint => "endpoint",
+            ObjectType::Reply => "reply",
         }
     }
 }
@@ -88,6 +94,7 @@ pub mod kind {
         PageTable => PageTable,
         Tcb => Tcb,
         Endpoint => Endpoint,
+        Reply => Reply,
     }
 }
 

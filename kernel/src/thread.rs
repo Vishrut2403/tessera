@@ -3,6 +3,7 @@
 use core::ptr::NonNull;
 
 use crate::csr::sstatus_bits;
+use crate::cap::RawCap;
 use crate::mm::{AddressSpace, PAGE_SIZE, PhysAddr, VirtAddr, phys_to_virt};
 use crate::trap::{TrapFrame, reg};
 
@@ -14,8 +15,28 @@ pub enum ThreadState {
     Ready,
     /// Currently on a hart.
     Running,
+    /// Queued on an endpoint with a message to hand over.
+    BlockedOnSend,
+    /// Queued on an endpoint waiting for one.
+    BlockedOnRecv,
+    /// Sent a `call` and is waiting for the reply capability to be used.
+    AwaitingReply,
     /// Finished. Its frame is never resumed again.
     Exited,
+}
+
+impl ThreadState {
+    /// Whether the thread may be put on the run queue.
+    pub const fn is_runnable(self) -> bool {
+        matches!(self, ThreadState::Ready | ThreadState::Running)
+    }
+
+    pub const fn is_blocked(self) -> bool {
+        matches!(
+            self,
+            ThreadState::BlockedOnSend | ThreadState::BlockedOnRecv | ThreadState::AwaitingReply
+        )
+    }
 }
 
 /// `sstatus.FS`, the two bits that decide whether `f0-f31` are usable (D-025).
@@ -48,6 +69,23 @@ pub struct Tcb {
     pub satp: usize,
     /// Intrusive run queue link. The queue owns no memory of its own.
     pub next: Option<NonNull<Tcb>>,
+    /// Intrusive endpoint queue link. Separate from `next` so a thread can be
+    /// taken off an endpoint and put on the run queue without the two lists
+    /// fighting over one field.
+    pub ipc_next: Option<NonNull<Tcb>>,
+    /// The one-shot reply capability handed over by a `call` this thread
+    /// received. Null when the thread is not serving anyone.
+    pub reply: RawCap,
+    /// Root CNode of this thread's capability space.
+    pub cspace: RawCap,
+    /// Badge of the capability the last sender invoked, delivered on receive.
+    pub badge: u64,
+    /// True while this thread is blocked on a `call` rather than a bare `send`,
+    /// so whoever receives knows to take a reply capability.
+    pub call_pending: bool,
+    /// This TCB's own physical address. A reply capability names the caller by
+    /// its TCB, so `reply` finds the thread without a lookup.
+    pub self_paddr: PhysAddr,
 }
 
 const _: () = assert!(size_of::<Tcb>() <= PAGE_SIZE, "a TCB must fit in one frame");
@@ -67,6 +105,7 @@ impl Tcb {
         stack_top: VirtAddr,
     ) -> NonNull<Tcb> {
         let ptr = phys_to_virt(frame_pa).as_mut_ptr::<Tcb>();
+        let self_paddr = frame_pa;
 
         let mut frame = TrapFrame::default();
         frame.x[reg::SP] = stack_top.as_usize();
@@ -85,6 +124,12 @@ impl Tcb {
                 id,
                 satp: space.satp(),
                 next: None,
+                ipc_next: None,
+                reply: RawCap::NULL,
+                cspace: RawCap::NULL,
+                badge: 0,
+                call_pending: false,
+                self_paddr,
             });
             NonNull::new_unchecked(ptr)
         }
