@@ -54,6 +54,37 @@ pub const fn bne(rs1: usize, rs2: usize, offset: i32) -> u32 {
         | 0x63
 }
 
+/// `slli rd, rs1, shamt`.
+pub const fn slli(rd: usize, rs1: usize, shamt: u32) -> u32 {
+    ((shamt & 0x3f) << 20) | ((rs1 as u32) << 15) | (0b001 << 12) | ((rd as u32) << 7) | 0x13
+}
+
+/// `srli rd, rs1, shamt`.
+pub const fn srli(rd: usize, rs1: usize, shamt: u32) -> u32 {
+    ((shamt & 0x3f) << 20) | ((rs1 as u32) << 15) | (0b101 << 12) | ((rd as u32) << 7) | 0x13
+}
+
+/// `mv rd, rs` — `addi rd, rs, 0`.
+pub const fn mv(rd: usize, rs: usize) -> u32 {
+    addi(rd, rs, 0)
+}
+
+/// `sd rs2, offset(rs1)`.
+pub const fn sd(rs1: usize, rs2: usize, offset: i32) -> u32 {
+    let imm = offset as u32;
+    ((imm & 0xfe0) << 20)
+        | ((rs2 as u32) << 20)
+        | ((rs1 as u32) << 15)
+        | (0b011 << 12)
+        | ((imm & 0x1f) << 7)
+        | 0x23
+}
+
+/// `ld rd, offset(rs1)`.
+pub const fn ld(rd: usize, rs1: usize, offset: i32) -> u32 {
+    (((offset as u32) & 0xfff) << 20) | ((rs1 as u32) << 15) | (0b011 << 12) | ((rd as u32) << 7) | 0x03
+}
+
 /// A small program, assembled into a fixed buffer.
 ///
 /// `li` only reaches 12 bits, and a packed message header does not fit, so

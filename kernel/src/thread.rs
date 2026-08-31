@@ -83,6 +83,12 @@ pub struct Tcb {
     /// True while this thread is blocked on a `call` rather than a bare `send`,
     /// so whoever receives knows to take a reply capability.
     pub call_pending: bool,
+    /// Where this thread's faults are delivered (D-034). Null means a fault
+    /// kills the thread, which is what happens before a pager is attached.
+    pub fault_ep: RawCap,
+    /// True while the thread is blocked on a fault rather than a syscall, so
+    /// the reply resumes it instead of overwriting its registers.
+    pub faulted: bool,
     /// This TCB's own physical address. A reply capability names the caller by
     /// its TCB, so `reply` finds the thread without a lookup.
     pub self_paddr: PhysAddr,
@@ -129,6 +135,8 @@ impl Tcb {
                 cspace: RawCap::NULL,
                 badge: 0,
                 call_pending: false,
+                fault_ep: RawCap::NULL,
+                faulted: false,
                 self_paddr,
             });
             NonNull::new_unchecked(ptr)

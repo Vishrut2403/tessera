@@ -7,10 +7,12 @@ use kernel::csr::{sstatus, sstatus_bits};
 use kernel::mm::{self, PhysAddr};
 use kernel::cap::asid::AsidPool;
 use kernel::cap::cspace::bootstrap;
-use kernel::cap::rights::{ALL, GRANT, READ};
+use kernel::cap::rights::{ALL, GRANT, READ, WRITE};
+use kernel::cap::object::SLOT_BITS;
+use kernel::cap::vspace::vspace_cap;
 use kernel::cap::{ObjectType, RawCap};
 use kernel::mm::{AddressSpace, PAGE_SIZE, PteFlags, VirtAddr};
-use kernel::uprog::{self, A7, ECALL, li};
+use kernel::uprog::{self, A7, ECALL, Prog, li};
 use kernel::{kernel_entry, layout, println, qemu, sched, time, trap};
 
 kernel_entry!(kmain);
@@ -21,7 +23,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     kernel::init();
 
     println!();
-    println!("tessera :: M4 -- capabilities, untyped memory, revocation");
+    println!("tessera :: M6 -- faults as IPC, a userspace pager");
     println!("  hart          : {}", hartid);
     println!("  device tree   : {:#x}", dtb_pa);
     println!("  sp            : {:#018x}", kernel::stack_pointer());
@@ -240,17 +242,10 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         for _ in 1..512 {
             alloc.alloc_frame().expect("no frames");
         }
-        RawCap {
-            kind: ObjectType::Untyped,
-            rights: ALL,
-            size_bits: 21,
-            paddr: first,
-            watermark: 0,
-            badge: 0,
-        }
+        RawCap::untyped(first, 21, ALL)
     };
 
-    let mut cs = bootstrap(region, 12).expect("could not bootstrap a capability space");
+    let mut cs = bootstrap(region, 6 + SLOT_BITS).expect("could not bootstrap a capability space");
     println!();
     println!("capability space (root CNode at {}):", cs.root().paddr);
     println!("  untyped       : {} .. {:#012x}", region.paddr, region.end());
@@ -303,8 +298,17 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!("  after  assign : satp {:#018x} (asid {})", demo_space.satp(), asid.as_u16());
     println!("  switching to it no longer needs a full TLB flush");
 
+    // --- M6: a page fault handled by a userspace pager ---
+    // The spinner from the M3 demo is still runnable and never exits, so it has
+    // to go or the run below would never come back.
+    let left = sched::kill_all();
     println!();
-    println!("M4 complete. Parking. (Ctrl-A x to exit QEMU)");
+    println!("demand paging:");
+    println!("  cleaned up    : {left} thread(s) left over from the scheduling demo");
+    demand_paging_demo(&kspace);
+
+    println!();
+    println!("M6 complete. Parking. (Ctrl-A x to exit QEMU)");
     qemu::park()
 }
 
@@ -338,4 +342,117 @@ fn user_space(kernel: &mm::Mapper, words: &[u32]) -> AddressSpace {
         .map(VirtAddr::new(USER_STACK), stack, 0, PteFlags::USER_RW, &mut *alloc)
         .expect("map stack");
     space
+}
+
+/// The address a client touches that nothing maps up front.
+const LAZY: usize = 0x4000_0000;
+
+/// Spawn a client that stores to an unmapped page and a pager that maps it.
+///
+/// The kernel's whole contribution is delivering the fault and doing the map it
+/// is asked for. Which frame, and where it comes from, it never sees.
+fn demand_paging_demo(kernel: &mm::Mapper) {
+    const FAULT_EP: u64 = 8;
+    const VSPACE: u64 = 9;
+    const L1: u64 = 10;
+    const L0: u64 = 11;
+    const FRAME: u64 = 12;
+    const D: u8 = 6;
+
+    let region = |bits: u8| {
+        let size = 1usize << bits;
+        let mut first = mm::alloc_frame().expect("no frames");
+        while first.as_usize() & (size - 1) != 0 {
+            first = mm::alloc_frame().expect("no frames");
+        }
+        for _ in 1..(size / PAGE_SIZE) {
+            mm::alloc_frame().expect("no frames");
+        }
+        RawCap::untyped(first, bits, ALL)
+    };
+
+    let mut ep_cs = bootstrap(region(18), D + SLOT_BITS).expect("bootstrap");
+    let mut made = [RawCap::NULL; 1];
+    ep_cs.retype((0, D), ObjectType::Endpoint, 0, (16, D), &mut made).expect("endpoint");
+    let ep = made[0];
+
+    // The client stores 0x5a5a at LAZY, which nothing maps.
+    let client_prog = Prog::<32>::new()
+        .li(9, (LAZY >> 12) as u32)
+        .raw(uprog::slli(9, 9, 12))
+        .li(uprog::A0, 0x5a5a)
+        .raw(uprog::sd(9, uprog::A0, 0))
+        .exit();
+    let client = user_space(kernel, client_prog.as_slice());
+
+    // The pager installs both intermediate tables and a frame, then replies.
+    let map4 = kernel::ipc::MessageInfo::new(kernel::sched::label::MAP, 4, false).bits() as u32;
+    let mut pager_prog = Prog::<64>::new()
+        .li(uprog::A0, FAULT_EP as u32)
+        .syscall(sched::syscall::RECV)
+        .raw(uprog::srli(9, uprog::A0 + 2, 12))
+        .raw(uprog::slli(9, 9, 12));
+    for (slot, level, rights) in [(L1, 2u32, 0u32), (L0, 1, 0), (FRAME, 0, (READ | WRITE) as u32)] {
+        pager_prog = pager_prog
+            .li(uprog::A0, slot as u32)
+            .li(uprog::A0 + 1, map4)
+            .li(uprog::A0 + 2, VSPACE as u32)
+            .raw(uprog::mv(uprog::A0 + 3, 9))
+            .li(uprog::A0 + 4, rights)
+            .li(uprog::A0 + 5, level)
+            .syscall(sched::syscall::CALL);
+    }
+    let pager_prog = pager_prog
+        .li(uprog::A0 + 1, kernel::ipc::MessageInfo::new(0, 0, false).bits() as u32)
+        .syscall(sched::syscall::REPLY)
+        .exit();
+    let pager = user_space(kernel, pager_prog.as_slice());
+
+    let mut pager_cs = bootstrap(region(19), D + SLOT_BITS).expect("bootstrap");
+    pager_cs.insert(FAULT_EP, D, ep, None).expect("fault ep");
+    pager_cs.insert(VSPACE, D, vspace_cap(client.root()), None).expect("vspace");
+    pager_cs.retype((0, D), ObjectType::PageTable, 0, (L1, D), &mut made).expect("l1");
+    pager_cs.retype((0, D), ObjectType::PageTable, 0, (L0, D), &mut made).expect("l0");
+    pager_cs.retype((0, D), ObjectType::Frame, 0, (FRAME, D), &mut made).expect("frame");
+    let client_cs = bootstrap(region(18), D + SLOT_BITS).expect("bootstrap");
+
+    println!("  client        : stores to {:#x}, which nothing maps", LAZY);
+    println!("  pager         : holds a fault endpoint, a vspace cap and 3 objects");
+    assert!(client.translate(VirtAddr::new(LAZY)).is_none());
+
+    sched::spawn_with_cspace(
+        &pager,
+        VirtAddr::new(USER_TEXT),
+        VirtAddr::new(USER_STACK + PAGE_SIZE),
+        *pager_cs.root(),
+    )
+    .expect("spawn pager");
+    sched::spawn_full(
+        &client,
+        VirtAddr::new(USER_TEXT),
+        VirtAddr::new(USER_STACK + PAGE_SIZE),
+        *client_cs.root(),
+        ep,
+    )
+    .expect("spawn client");
+
+    time::enable();
+    time::arm_next_tick();
+    // SAFETY: the trap path is installed and the dispatcher handles timers.
+    unsafe { sstatus::set(sstatus_bits::SIE) };
+    sched::run();
+    // SAFETY: masking again before the summary is printed.
+    unsafe { sstatus::clear(sstatus_bits::SIE) };
+    time::disarm();
+
+    match client.translate(VirtAddr::new(LAZY)) {
+        Some((pa, flags, _)) => {
+            // SAFETY: a frame the pager mapped, reachable through the direct map.
+            let v = unsafe { core::ptr::read_volatile(mm::phys_to_virt(pa).as_ptr::<u64>()) };
+            println!("  after fault   : {:#x} -> {}  {:?}", LAZY, pa, flags);
+            println!("  client's store: {v:#x} (it retried the instruction and it worked)");
+        }
+        None => println!("  after fault   : still unmapped -- the pager did not run"),
+    }
+    core::mem::forget((ep_cs, pager_cs, client_cs));
 }

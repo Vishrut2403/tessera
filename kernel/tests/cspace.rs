@@ -8,6 +8,7 @@
 
 use kernel::cap::asid::{AsidError, AsidPool};
 use kernel::cap::cspace::{CSpace, ResolveError, bootstrap};
+use kernel::cap::object::SLOT_BITS;
 use kernel::cap::rights::{ALL, GRANT, READ, WRITE};
 use kernel::cap::{CapError, ObjectType, RawCap, kind};
 use kernel::mm::{self, PhysAddr};
@@ -32,21 +33,14 @@ fn region(bits: u8) -> RawCap {
     for _ in 1..(size / mm::PAGE_SIZE) {
         mm::alloc_frame().expect("no frames");
     }
-    RawCap {
-        kind: ObjectType::Untyped,
-        rights: ALL,
-        size_bits: bits,
-        paddr: first,
-        watermark: 0,
-        badge: 0,
-    }
+    RawCap::untyped(first, bits, ALL)
 }
 
 /// A capability space rooted in a 64-slot CNode, so the root radix is 6.
 const D: u8 = 6;
 
 fn space() -> CSpace {
-    bootstrap(region(21), D + 6).expect("bootstrap failed")
+    bootstrap(region(21), D + SLOT_BITS).expect("bootstrap failed")
 }
 
 // --- Bootstrap and resolution ---
@@ -88,7 +82,7 @@ fn a_cnode_in_a_slot_becomes_a_second_level() {
     let mut cs = space();
     let mut made = [RawCap::NULL; 1];
     // A 64-slot CNode in slot 2, so (2 << 6) | n at depth 12 addresses it.
-    cs.retype((0, D), ObjectType::CNode, D + 6, (2, D), &mut made).expect("retype");
+    cs.retype((0, D), ObjectType::CNode, D + SLOT_BITS, (2, D), &mut made).expect("retype");
 
     let inner = cs.read(2, D).unwrap();
     assert_eq!(inner.kind, ObjectType::CNode);

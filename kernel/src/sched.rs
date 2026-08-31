@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::cap::cspace::CSpace;
-use crate::cap::{ObjectType, RawCap};
+use crate::cap::{CapError, ObjectType, RawCap};
 use crate::ipc::{self, EndpointState, MessageInfo};
 use crate::mm::{AddressSpace, VirtAddr};
 use crate::sync::SpinLock;
@@ -47,6 +47,16 @@ pub mod label {
     pub const REVOKE: u64 = 3;
     /// CNode: destroy a capability and its derivatives.
     pub const DELETE: u64 = 4;
+    /// Frame or PageTable: install into an address space.
+    pub const MAP: u64 = 5;
+    /// Frame or PageTable: remove whatever mapping it records.
+    pub const UNMAP: u64 = 6;
+    /// TCB: attach a fault endpoint.
+    pub const SET_FAULT_EP: u64 = 7;
+
+    /// What the kernel sends a pager when a thread faults (D-034).
+    pub const FAULT_VM: u64 = 0x100;
+
     /// The first label the kernel does not interpret.
     pub const APP_BASE: u64 = 0x1000;
 }
@@ -58,6 +68,7 @@ pub mod result {
     pub const ERR_BAD_LABEL: usize = usize::MAX - 1;
     pub const ERR_NO_REPLY: usize = usize::MAX - 2;
     pub const ERR_NO_CSPACE: usize = usize::MAX - 3;
+    pub const ERR_MAP: usize = usize::MAX - 4;
 }
 
 /// Callee-saved state of the kernel context that called [`run`].
@@ -129,6 +140,32 @@ static POPS: AtomicUsize = AtomicUsize::new(0);
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static LAST_BADGE: AtomicUsize = AtomicUsize::new(0);
 
+/// The last few badges delivered, so a test can check that messages arrive in
+/// the order they were sent. Counted for the same reason as [`queue_pops`]:
+/// FIFO delivery is a property, not an implementation detail.
+static BADGE_LOG: [AtomicUsize; 8] = [const { AtomicUsize::new(usize::MAX) }; 8];
+static BADGE_LOG_LEN: AtomicUsize = AtomicUsize::new(0);
+
+fn log_badge(badge: u64) {
+    let n = BADGE_LOG_LEN.fetch_add(1, Ordering::Relaxed);
+    if n < BADGE_LOG.len() {
+        BADGE_LOG[n].store(badge as usize, Ordering::Relaxed);
+    }
+}
+
+/// Badges delivered since [`reset_badge_log`], oldest first.
+pub fn badge_log(out: &mut [u64]) -> usize {
+    let n = BADGE_LOG_LEN.load(Ordering::Relaxed).min(BADGE_LOG.len()).min(out.len());
+    for (i, slot) in out.iter_mut().enumerate().take(n) {
+        *slot = BADGE_LOG[i].load(Ordering::Relaxed) as u64;
+    }
+    n
+}
+
+pub fn reset_badge_log() {
+    BADGE_LOG_LEN.store(0, Ordering::Relaxed);
+}
+
 impl KernelContext {
     const fn new_const() -> Self {
         Self { ra: 0, sp: 0, s: [0; 12] }
@@ -157,6 +194,22 @@ pub fn spawn_with_cspace(
     stack_top: VirtAddr,
     cspace: RawCap,
 ) -> Result<ThreadId, SpawnError> {
+    spawn_full(space, entry, stack_top, cspace, RawCap::NULL)
+}
+
+/// As [`spawn_with_cspace`], with a fault endpoint so the thread has a pager.
+///
+/// A TCB is not yet a capability a thread can invoke, so this is set at spawn
+/// time rather than by a `SET_FAULT_EP` invocation. Wiring that up needs threads
+/// to be made by retyping, which is the same deferred item as everything else
+/// about TCB objects.
+pub fn spawn_full(
+    space: &AddressSpace,
+    entry: VirtAddr,
+    stack_top: VirtAddr,
+    cspace: RawCap,
+    fault_ep: RawCap,
+) -> Result<ThreadId, SpawnError> {
     let frame = crate::mm::alloc_frame().ok_or(SpawnError::OutOfFrames)?;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -164,7 +217,10 @@ pub fn spawn_with_cspace(
     // has a TCB in it.
     let mut tcb = unsafe { Tcb::create(frame, id, space, entry, stack_top) };
     // SAFETY: we just made it; nothing else refers to it yet.
-    unsafe { tcb.as_mut().cspace = cspace };
+    unsafe {
+        tcb.as_mut().cspace = cspace;
+        tcb.as_mut().fault_ep = fault_ep;
+    }
 
     QUEUE.lock().push(tcb);
     SPAWNED.fetch_add(1, Ordering::Relaxed);
@@ -372,6 +428,10 @@ pub extern "C" fn user_trap(frame: *mut TrapFrame) -> ! {
             // SAFETY: the thread is still current and its frame is intact.
             unsafe { return_to_user(tcb.frame_ptr()) }
         }
+        // Instruction, load and store page faults all go to the pager (D-034).
+        cause @ (Cause::Exception(12) | Cause::Exception(13) | Cause::Exception(15)) => {
+            deliver_fault(tcb, cause)
+        }
         cause => {
             crate::println!(
                 "thread {} killed: {} at {:#x}",
@@ -453,6 +513,7 @@ fn invoke(tcb: &mut Tcb, is_call: bool) -> ! {
         ObjectType::Endpoint => ipc_send(tcb, cap, info, is_call),
         ObjectType::Untyped => invoke_untyped(tcb, cs, cptr, info),
         ObjectType::CNode => invoke_cnode(tcb, cs, cptr, info),
+        ObjectType::Frame | ObjectType::PageTable => invoke_mapping(tcb, cs, cptr, info),
         _ => finish(tcb, result::ERR_BAD_CAP),
     }
 }
@@ -467,8 +528,9 @@ fn ipc_send(tcb: &mut Tcb, ep_cap: RawCap, info: MessageInfo, is_call: bool) -> 
     if let Some(mut waiting) = unsafe { ep.dequeue(EndpointState::Receiving) } {
         // SAFETY: taken off the endpoint queue, so nothing else refers to it.
         let receiver = unsafe { waiting.as_mut() };
-        ipc::transfer(tcb, receiver, info, ep_cap.badge);
+        deliver(tcb, receiver, info, ep_cap.badge);
         LAST_BADGE.store(ep_cap.badge as usize, Ordering::Relaxed);
+        log_badge(ep_cap.badge);
 
         if is_call {
             receiver.reply = ipc::reply_cap(tcb.self_paddr);
@@ -529,8 +591,9 @@ fn receive_on(tcb: &mut Tcb, ep_cap: RawCap) -> ! {
         // SAFETY: off the queue, so nothing else refers to it.
         let sender = unsafe { queued.as_mut() };
         let info = ipc::message_of(sender);
-        ipc::transfer(sender, tcb, info, sender.badge);
+        deliver(sender, tcb, info, sender.badge);
         LAST_BADGE.store(sender.badge as usize, Ordering::Relaxed);
+        log_badge(sender.badge);
 
         if sender.call_pending {
             tcb.reply = ipc::reply_cap(sender.self_paddr);
@@ -568,7 +631,14 @@ fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
     // SAFETY: the caller is blocked in `AwaitingReply`, so it is on no queue
     // and nothing else is writing it.
     let callee = unsafe { caller.as_mut() };
-    ipc::transfer(tcb, callee, info, 0);
+    if callee.faulted {
+        // The reply is permission to carry on, not a return value. Its
+        // registers and `sepc` are untouched, so it re-runs the instruction
+        // that faulted against whatever the pager has now arranged.
+        callee.faulted = false;
+    } else {
+        deliver(tcb, callee, info, 0);
+    }
     callee.state = ThreadState::Ready;
     tcb.reply = RawCap::NULL;
 
@@ -580,15 +650,11 @@ fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
         {
             // SAFETY: a live endpoint from this thread's CSpace.
             let ep = unsafe { ipc::endpoint_at(ep_cap.paddr) };
-            // SAFETY: the queue holds live TCBs.
-            let waiting = unsafe { ep.dequeue(EndpointState::Sending) };
-            if waiting.is_some() {
+            if ep.has_waiting(EndpointState::Sending) {
                 // Someone was already queued: the caller we just answered goes
-                // on the run queue and we keep the hart.
+                // on the run queue, we keep the hart, and `receive_on` takes
+                // the sender that has been waiting longest.
                 QUEUE.lock().push(caller);
-                // Put it back; `receive_on` takes it properly.
-                // SAFETY: as above.
-                unsafe { ep.enqueue(waiting.unwrap(), EndpointState::Sending) };
                 receive_on(tcb, ep_cap);
             }
             tcb.state = ThreadState::BlockedOnRecv;
@@ -610,6 +676,50 @@ fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
     let me = current_tcb().expect("no current thread");
     QUEUE.lock().push(me);
     switch_direct(caller)
+}
+
+/// Move a capability from the sender's CSpace into the receiver's (D-036).
+///
+/// The sender names the source in `a6` and the receiver names the destination
+/// in `a6`, so both ends state their own half of the transfer. The copy becomes
+/// a derivative of the original, which is what makes it revocable.
+fn transfer_cap(from: &Tcb, to: &mut Tcb) -> Result<(), CapError> {
+    let src = from.frame.x[reg::A0 + 6] as u64;
+    let dst = to.frame.x[reg::A0 + 6] as u64;
+
+    let from_cs = CSpace::new(from.cspace)?;
+    let mut to_cs = CSpace::new(to.cspace)?;
+
+    let slot = from_cs.resolve(src, from_cs.root_depth())?;
+    // SAFETY: a live slot in the sender's CSpace, which only this hart touches.
+    let cap = unsafe { slot.as_ref().cap };
+    if cap.is_null() {
+        return Err(CapError::Null);
+    }
+    if cap.rights & crate::cap::rights::GRANT == 0 {
+        return Err(CapError::MissingRights {
+            wanted: crate::cap::rights::GRANT,
+            held: cap.rights,
+        });
+    }
+
+    let depth = to_cs.root_depth();
+    // The copy carries no badge of its own: badges identify a holder to a
+    // server, and this is a new holder.
+    to_cs.insert(dst, depth, RawCap { badge: 0, ..cap }, Some(slot))
+}
+
+/// Deliver a message, and the capability riding with it if there is one.
+fn deliver(from: &Tcb, to: &mut Tcb, info: MessageInfo, badge: u64) {
+    ipc::transfer(from, to, info, badge);
+    if info.carries_cap() {
+        // A failed transfer is reported in the receiver's a0, not by killing
+        // anyone: the sender may simply have named a slot that is full.
+        if transfer_cap(from, to).is_err() {
+            to.frame.x[reg::A1] =
+                MessageInfo::new(info.label(), info.length(), false).bits() as usize;
+        }
+    }
 }
 
 /// The thread on this hart, as a pointer. One atomic load.
@@ -662,6 +772,72 @@ fn invoke_cnode(tcb: &mut Tcb, mut cs: CSpace, _cptr: u64, info: MessageInfo) ->
         _ => finish(tcb, result::ERR_BAD_LABEL),
     };
     finish(tcb, outcome.unwrap_or(result::ERR_BAD_CAP))
+}
+
+/// `Map` and `Unmap`, invoked on the frame or page table being mapped (D-034).
+fn invoke_mapping(tcb: &mut Tcb, cs: CSpace, cptr: u64, info: MessageInfo) -> ! {
+    let depth = cs.root_depth();
+    let vspace_cptr = tcb.frame.x[reg::A0 + 2] as u64;
+    let vaddr = VirtAddr::new(tcb.frame.x[reg::A0 + 3]);
+    let rights_mask = tcb.frame.x[reg::A0 + 4] as u8;
+    let level = tcb.frame.x[reg::A0 + 5];
+
+    let Ok(target) = cs.resolve(cptr, depth) else { finish(tcb, result::ERR_BAD_CAP) };
+
+    match info.label() {
+        label::MAP => {
+            let Ok(vspace) = cs.read(vspace_cptr, depth) else {
+                finish(tcb, result::ERR_BAD_CAP)
+            };
+            // SAFETY: `target` is a live slot in this thread's CSpace, which
+            // only this hart is touching.
+            let cap = unsafe { &mut target.clone().as_mut().cap };
+            let outcome = if cap.kind == ObjectType::PageTable {
+                crate::cap::vspace::map_table(cap, &vspace, vaddr, level)
+            } else {
+                // Executable only when the caller asks for it *and* the
+                // capability carries GRANT -- mapping someone else's memory
+                // executable is not something a plain WRITE right should allow.
+                let executable = level != 0 && cap.rights & crate::cap::rights::GRANT != 0;
+                crate::cap::vspace::map_frame(cap, &vspace, vaddr, rights_mask, executable)
+            };
+            finish(tcb, outcome.map_or(result::ERR_MAP, |()| result::OK))
+        }
+        label::UNMAP => {
+            // SAFETY: as above.
+            let cap = unsafe { &mut target.clone().as_mut().cap };
+            finish(tcb, crate::cap::vspace::unmap(cap).map_or(result::ERR_MAP, |()| result::OK))
+        }
+        _ => finish(tcb, result::ERR_BAD_LABEL),
+    }
+}
+
+/// Deliver a fault to this thread's pager as if the thread had called it.
+///
+/// The thread blocks in `AwaitingReply` exactly as a caller does, and the reply
+/// resumes it *without* touching its registers or advancing `sepc`, so the
+/// faulting instruction runs again against whatever the pager arranged.
+fn deliver_fault(tcb: &mut Tcb, cause: Cause) -> ! {
+    if tcb.fault_ep.kind != ObjectType::Endpoint {
+        crate::println!(
+            "thread {} killed: {} at {:#x} (no fault endpoint)",
+            tcb.id,
+            cause.name(),
+            tcb.frame.sepc
+        );
+        retire(Retire::Killed)
+    }
+
+    let is_write = matches!(cause, Cause::Exception(15));
+    let is_fetch = matches!(cause, Cause::Exception(12));
+    tcb.frame.x[reg::A0 + 2] = crate::csr::stval::read();
+    tcb.frame.x[reg::A0 + 3] = tcb.frame.sepc;
+    tcb.frame.x[reg::A0 + 4] = is_write as usize | ((is_fetch as usize) << 1);
+    tcb.frame.x[reg::A1] = MessageInfo::new(label::FAULT_VM, 3, false).bits() as usize;
+    tcb.faulted = true;
+
+    let ep = tcb.fault_ep;
+    ipc_send(tcb, ep, MessageInfo::new(label::FAULT_VM, 3, false), true)
 }
 
 fn object_type_from(n: usize) -> Option<ObjectType> {

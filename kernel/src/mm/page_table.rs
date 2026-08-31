@@ -226,6 +226,9 @@ pub enum MapError {
     CoveredBySuperpage,
     /// The frame allocator is empty.
     OutOfFrames,
+    /// An intermediate page table is missing. Userspace supplies them, so this
+    /// is a request for one rather than something the kernel fixes (D-035).
+    MissingTable,
 }
 
 /// Source of page table frames; becomes a capability in M4.
@@ -329,6 +332,112 @@ impl Mapper {
             return Err(MapError::AlreadyMapped);
         }
         *entry = Pte::leaf(pa, flags);
+        Ok(())
+    }
+
+    /// Install a leaf without an allocator, failing if a branch is missing.
+    ///
+    /// Userspace supplies its own page table objects (D-035), so the kernel has
+    /// nothing to allocate from here: a missing intermediate table is a
+    /// [`MapError::MissingTable`] for the pager to fix, not a frame the kernel
+    /// quietly takes. That is what keeps invariant 1 true on this path.
+    pub fn map_leaf(
+        &mut self,
+        va: VirtAddr,
+        pa: PhysAddr,
+        level: usize,
+        flags: PteFlags,
+    ) -> Result<(), MapError> {
+        self.check_leaf(va, pa, level, flags)?;
+
+        let mut table = self.root;
+        let mut current = MAX_LEVEL;
+        while current > level {
+            // SAFETY: reached by branches from this Mapper's root.
+            let entry = unsafe { table_mut(table) }.entries[va.vpn(current)];
+            if !entry.is_valid() {
+                return Err(MapError::MissingTable);
+            }
+            if entry.is_leaf() {
+                return Err(MapError::CoveredBySuperpage);
+            }
+            table = entry.phys_addr();
+            current -= 1;
+        }
+
+        // SAFETY: as above.
+        let entry = &mut unsafe { table_mut(table) }.entries[va.vpn(level)];
+        if entry.is_valid() {
+            return Err(MapError::AlreadyMapped);
+        }
+        *entry = Pte::leaf(pa, flags);
+        Ok(())
+    }
+
+    /// Install an intermediate table supplied by userspace at `level`.
+    pub fn map_table(
+        &mut self,
+        va: VirtAddr,
+        table_pa: PhysAddr,
+        level: usize,
+    ) -> Result<(), MapError> {
+        if level == 0 || level > MAX_LEVEL {
+            return Err(MapError::BadLevel);
+        }
+        if !va.is_canonical() {
+            return Err(MapError::NonCanonical);
+        }
+        if !table_pa.is_aligned(PAGE_SIZE) {
+            return Err(MapError::MisalignedPhys);
+        }
+
+        let mut table = self.root;
+        let mut current = MAX_LEVEL;
+        while current > level {
+            // SAFETY: reached by branches from this Mapper's root.
+            let entry = unsafe { table_mut(table) }.entries[va.vpn(current)];
+            if !entry.is_valid() {
+                return Err(MapError::MissingTable);
+            }
+            if entry.is_leaf() {
+                return Err(MapError::CoveredBySuperpage);
+            }
+            table = entry.phys_addr();
+            current -= 1;
+        }
+
+        // SAFETY: as above.
+        let entry = &mut unsafe { table_mut(table) }.entries[va.vpn(level)];
+        if entry.is_valid() {
+            return Err(MapError::AlreadyMapped);
+        }
+        *entry = Pte::branch(table_pa);
+        Ok(())
+    }
+
+    fn check_leaf(
+        &self,
+        va: VirtAddr,
+        pa: PhysAddr,
+        level: usize,
+        flags: PteFlags,
+    ) -> Result<(), MapError> {
+        if level > MAX_LEVEL {
+            return Err(MapError::BadLevel);
+        }
+        if !va.is_canonical() {
+            return Err(MapError::NonCanonical);
+        }
+        if !flags.is_leaf() || !flags.is_valid_combination() {
+            return Err(MapError::BadFlags);
+        }
+        let size = page_size(level);
+        if !va.is_aligned(size) {
+            return Err(MapError::MisalignedVirt);
+        }
+        if !pa.is_aligned(size) {
+            return Err(MapError::MisalignedPhys);
+        }
         Ok(())
     }
 

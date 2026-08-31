@@ -120,6 +120,15 @@ impl Endpoint {
         Some(head)
     }
 
+    /// Whether anyone is queued for `wanted`, without disturbing the order.
+    ///
+    /// `reply_recv` needs to know whether a sender is already waiting before it
+    /// decides who gets the hart. Answering that by dequeuing and re-enqueuing
+    /// would move the head to the tail and quietly break FIFO delivery.
+    pub fn has_waiting(&self, wanted: EndpointState) -> bool {
+        self.state == wanted && self.head.is_some()
+    }
+
     /// Remove `tcb` from this queue wherever it is. Needed when a blocked
     /// thread is destroyed rather than woken.
     ///
@@ -208,6 +217,8 @@ pub fn reply_cap(caller: PhysAddr) -> RawCap {
         paddr: caller,
         watermark: 0,
         badge: 0,
+        mapped_root: PhysAddr::new(0),
+        mapped_vaddr: 0,
     }
 }
 

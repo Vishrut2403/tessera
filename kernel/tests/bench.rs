@@ -12,6 +12,7 @@
 
 use kernel::cap::asid::AsidPool;
 use kernel::cap::cspace::{CSpace, bootstrap};
+use kernel::cap::object::SLOT_BITS;
 use kernel::cap::rights::ALL;
 use kernel::cap::{ObjectType, RawCap};
 use kernel::ipc::MessageInfo;
@@ -70,14 +71,7 @@ fn aligned_region(bits: u8) -> RawCap {
     for _ in 1..(size / PAGE_SIZE) {
         mm::alloc_frame().expect("no frames");
     }
-    RawCap {
-        kind: ObjectType::Untyped,
-        rights: ALL,
-        size_bits: bits,
-        paddr: first,
-        watermark: 0,
-        badge: 0,
-    }
+    RawCap::untyped(first, bits, ALL)
 }
 
 /// As [`user_space`], optionally giving the space an ASID so switching to it
@@ -106,13 +100,13 @@ fn user_space_maybe_tagged(words: &[u32], pool: Option<&mut AsidPool>) -> Addres
 }
 
 fn cspace_with(endpoint: RawCap) -> CSpace {
-    let mut cs = bootstrap(aligned_region(18), D + 6).expect("bootstrap");
+    let mut cs = bootstrap(aligned_region(18), D + SLOT_BITS).expect("bootstrap");
     cs.insert(EP_SLOT, D, endpoint, None).expect("insert endpoint");
     cs
 }
 
 fn endpoint() -> RawCap {
-    let mut cs = bootstrap(aligned_region(18), D + 6).expect("bootstrap");
+    let mut cs = bootstrap(aligned_region(18), D + SLOT_BITS).expect("bootstrap");
     let mut made = [RawCap::NULL; 1];
     cs.retype((0, D), ObjectType::Endpoint, 0, (16, D), &mut made).expect("retype");
     core::mem::forget(cs);

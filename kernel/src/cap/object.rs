@@ -2,8 +2,14 @@
 
 use crate::mm::PAGE_SHIFT;
 
-/// A capability slot is 64 bytes, so a CNode of 2^n slots is 2^(n+6) bytes.
-pub const SLOT_BITS: u8 = 6;
+/// A capability slot is 128 bytes, so a CNode of 2^n slots is 2^(n+7) bytes.
+///
+/// It grew from 64 in M6: a frame capability has to record *where* it is
+/// mapped, or revoking it cannot remove the mapping and revocation does not
+/// actually revoke (D-034). Overlaying those fields onto ones only other kinds
+/// use would have kept 64 bytes and made the capability a union by convention,
+/// which is what seL4 does and what is hardest to read there.
+pub const SLOT_BITS: u8 = 7;
 
 /// Every kind of object the kernel knows how to make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

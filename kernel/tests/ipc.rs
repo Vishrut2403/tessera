@@ -7,6 +7,7 @@
 #![reexport_test_harness_main = "test_main"]
 
 use kernel::cap::cspace::{CSpace, bootstrap};
+use kernel::cap::object::SLOT_BITS;
 use kernel::cap::rights::ALL;
 use kernel::cap::{ObjectType, RawCap};
 use kernel::csr::{interrupt_bits, sie, sstatus, sstatus_bits};
@@ -59,14 +60,7 @@ fn aligned_region(bits: u8) -> RawCap {
     for _ in 1..(size / PAGE_SIZE) {
         mm::alloc_frame().expect("no frames");
     }
-    RawCap {
-        kind: ObjectType::Untyped,
-        rights: ALL,
-        size_bits: bits,
-        paddr: first,
-        watermark: 0,
-        badge: 0,
-    }
+    RawCap::untyped(first, bits, ALL)
 }
 
 fn user_space(words: &[u32]) -> AddressSpace {
@@ -85,7 +79,7 @@ fn user_space(words: &[u32]) -> AddressSpace {
 
 /// A CSpace holding the same endpoint capability in slot 8.
 fn cspace_with(endpoint: RawCap, badge: u64) -> CSpace {
-    let mut cs = bootstrap(aligned_region(18), D + 6).expect("bootstrap");
+    let mut cs = bootstrap(aligned_region(18), D + SLOT_BITS).expect("bootstrap");
     cs.insert(EP_SLOT, D, RawCap { badge, ..endpoint }, None).expect("insert endpoint");
     cs
 }
@@ -104,7 +98,7 @@ fn spawn(words: &[u32], cs: &CSpace) -> AddressSpace {
 
 /// An endpoint object, carved from its own region.
 fn endpoint() -> RawCap {
-    let mut cs = bootstrap(aligned_region(18), D + 6).expect("bootstrap");
+    let mut cs = bootstrap(aligned_region(18), D + SLOT_BITS).expect("bootstrap");
     let mut made = [RawCap::NULL; 1];
     cs.retype((0, D), ObjectType::Endpoint, 0, (16, D), &mut made).expect("retype endpoint");
     core::mem::forget(cs);
@@ -335,5 +329,124 @@ fn an_endpoint_capability_is_required_to_receive() {
     sched::run();
     assert_eq!(sched::killed(), killed);
     assert_eq!(sched::exited(), exited + 1, "recv on an empty slot did not return");
+    sched::kill_all();
+}
+
+// --- Capability transfer (D-036) ---
+
+/// The slot a sender takes a capability from, and the one a receiver puts it in.
+const SRC_SLOT: u64 = 20;
+const DST_SLOT: u64 = 21;
+
+/// `a6 = SRC_SLOT; call(ep, carrying a capability); exit()`.
+fn cap_sender() -> Prog<24> {
+    Prog::new()
+        .li(A0, EP_SLOT as u32)
+        .li(A0 + 1, MessageInfo::new(1, 0, true).bits() as u32)
+        .li(A0 + 6, SRC_SLOT as u32)
+        .syscall(sched::syscall::CALL)
+        .exit()
+}
+
+/// `a6 = DST_SLOT; recv(ep); reply(); exit()`.
+fn cap_receiver() -> Prog<24> {
+    Prog::new()
+        .li(A0, EP_SLOT as u32)
+        .li(A0 + 6, DST_SLOT as u32)
+        .syscall(sched::syscall::RECV)
+        .li(A0 + 1, MessageInfo::new(0, 0, false).bits() as u32)
+        .syscall(sched::syscall::REPLY)
+        .exit()
+}
+
+#[test_case]
+fn a_message_can_carry_a_capability() {
+    let ep = endpoint();
+    let recv_cs = cspace_with(ep, 0);
+    let mut send_cs = cspace_with(ep, 0);
+
+    // Something recognisable to hand over: a second endpoint.
+    let gift = endpoint();
+    send_cs.insert(SRC_SLOT, D, gift, None).expect("insert gift");
+    assert!(recv_cs.read(DST_SLOT, D).unwrap().is_null(), "the destination is not empty");
+
+    let _s = spawn(cap_receiver().as_slice(), &recv_cs);
+    let _c = spawn(cap_sender().as_slice(), &send_cs);
+
+    let (exited, killed) = (sched::exited(), sched::killed());
+    sched::run();
+    assert_eq!(sched::killed(), killed);
+    assert_eq!(sched::exited(), exited + 2);
+
+    let arrived = recv_cs.read(DST_SLOT, D).unwrap();
+    assert_eq!(arrived.kind, ObjectType::Endpoint, "no capability arrived");
+    assert_eq!(arrived.paddr, gift.paddr, "a different object arrived");
+    assert_eq!(arrived.badge, 0, "the copy kept the sender's badge");
+
+    // It is a derivative, so revoking the original takes it away again.
+    assert_eq!(send_cs.descendants(SRC_SLOT, D).unwrap(), 1);
+    send_cs.revoke(SRC_SLOT, D).expect("revoke");
+    assert!(recv_cs.read(DST_SLOT, D).unwrap().is_null(), "revoking did not reclaim the copy");
+
+    sched::kill_all();
+}
+
+#[test_case]
+fn a_capability_without_grant_is_not_transferred() {
+    let ep = endpoint();
+    let recv_cs = cspace_with(ep, 0);
+    let mut send_cs = cspace_with(ep, 0);
+
+    // No GRANT, so the sender may hold it but not hand it on.
+    let gift = RawCap { rights: kernel::cap::rights::READ, ..endpoint() };
+    send_cs.insert(SRC_SLOT, D, gift, None).expect("insert gift");
+
+    let _s = spawn(cap_receiver().as_slice(), &recv_cs);
+    let _c = spawn(cap_sender().as_slice(), &send_cs);
+
+    let killed = sched::killed();
+    sched::run();
+
+    assert_eq!(sched::killed(), killed, "the send should be refused, not fatal");
+    assert!(
+        recv_cs.read(DST_SLOT, D).unwrap().is_null(),
+        "a capability without GRANT was transferred anyway"
+    );
+    sched::kill_all();
+}
+
+#[test_case]
+fn queued_senders_are_served_in_the_order_they_arrived() {
+    // Three clients queue on an endpoint before any server exists, each holding
+    // a differently badged copy of it. A `reply_recv` server then serves them.
+    // The order the badges arrive in is the order they queued, or the endpoint
+    // is not a FIFO -- which is what a dequeue-and-reinsert would have made it.
+    let ep = endpoint();
+    let server_cs = cspace_with(ep, 0);
+    let clients: [CSpace; 3] =
+        [cspace_with(ep, 0x11), cspace_with(ep, 0x22), cspace_with(ep, 0x33)];
+
+    let _c0 = spawn(client(1, 0).as_slice(), &clients[0]);
+    let _c1 = spawn(client(1, 0).as_slice(), &clients[1]);
+    let _c2 = spawn(client(1, 0).as_slice(), &clients[2]);
+    // The server goes last, so all three are queued before it receives.
+    let _s = spawn(server_loop().as_slice(), &server_cs);
+
+    sched::reset_badge_log();
+    let (exited, killed) = (sched::exited(), sched::killed());
+    run_with_timer();
+
+    assert_eq!(sched::killed(), killed);
+    assert_eq!(sched::exited(), exited + 3, "not every client was served");
+
+    let mut seen = [0u64; 8];
+    let n = sched::badge_log(&mut seen);
+    assert_eq!(n, 3, "expected three deliveries, saw {n}");
+    assert_eq!(
+        &seen[..3],
+        &[0x11, 0x22, 0x33],
+        "senders were served out of order: {:?}",
+        &seen[..3]
+    );
     sched::kill_all();
 }

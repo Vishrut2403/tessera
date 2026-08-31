@@ -6,6 +6,7 @@
 #![test_runner(kernel::test::runner)]
 #![reexport_test_harness_main = "test_main"]
 
+use kernel::cap::object::SLOT_BITS;
 use kernel::cap::rights::{ALL, GRANT, READ, WRITE};
 use kernel::cap::untyped::carve;
 use kernel::cap::{Cap, CapError, ObjectType, RawCap, kind};
@@ -36,14 +37,7 @@ fn untyped(bits: u8) -> RawCap {
     for _ in 1..count {
         mm::alloc_frame().expect("no frames");
     }
-    RawCap {
-        kind: ObjectType::Untyped,
-        rights: ALL,
-        size_bits: bits,
-        paddr: first,
-        watermark: 0,
-        badge: 0,
-    }
+    RawCap::untyped(first, bits, ALL)
 }
 
 // --- Rights, at runtime ---
@@ -200,9 +194,17 @@ fn a_cnode_must_be_big_enough_to_hold_a_slot() {
     let cap = Cap::<kind::Untyped, ALL>::from_raw(untyped(14)).unwrap();
     let mut out = [RawCap::NULL; 1];
 
+    // Smaller than one slot, and exactly one slot, are both refused: a CNode
+    // must consume at least one address bit or resolution would not terminate.
     assert_eq!(cap.retype(ObjectType::CNode, 4, &mut out), Err(CapError::BadSize));
+    assert_eq!(cap.retype(ObjectType::CNode, SLOT_BITS, &mut out), Err(CapError::BadSize));
+
     assert!(cap.retype(ObjectType::CNode, 12, &mut out).is_ok());
-    assert_eq!(out[0].kind.slots(out[0].size_bits), Some(64), "a 4 KiB CNode holds 64 slots");
+    assert_eq!(
+        out[0].kind.slots(out[0].size_bits),
+        Some(1 << (12 - SLOT_BITS)),
+        "a 4 KiB CNode holds one slot per 2^SLOT_BITS bytes"
+    );
 }
 
 #[test_case]

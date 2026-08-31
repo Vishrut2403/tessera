@@ -13,10 +13,13 @@ pub type SlotRef = Option<NonNull<Slot>>;
 
 /// One capability, plus its position in the derivation tree.
 ///
+/// Padded to exactly `1 << SLOT_BITS` so a CNode of 2^n slots occupies
+/// 2^(n + SLOT_BITS) bytes and indexing is a shift.
+///
 /// The tree is explicit rather than seL4's ordered doubly-linked list (D-028):
 /// `revoke` is then a depth-first walk anyone can read, instead of a forward
 /// scan that depends on an ordering invariant maintained everywhere else.
-#[repr(C)]
+#[repr(C, align(128))]
 pub struct Slot {
     pub cap: RawCap,
     parent: SlotRef,
@@ -25,8 +28,11 @@ pub struct Slot {
     prev_sib: SlotRef,
 }
 
-const _: () = assert!(size_of::<Slot>() == 1 << SLOT_BITS, "a slot must be exactly 64 bytes");
-const _: () = assert!(align_of::<Slot>() <= 1 << SLOT_BITS);
+// A slot must fit its stride exactly, or CNode indexing is wrong. The padding
+// between the fields and 2^SLOT_BITS is deliberate headroom.
+const _: () = assert!(size_of::<Slot>() <= 1 << SLOT_BITS, "a slot no longer fits its stride");
+// The `align(128)` above must track SLOT_BITS; this is what catches it if not.
+const _: () = assert!(align_of::<Slot>() == 1 << SLOT_BITS, "Slot's align attribute is stale");
 
 impl Slot {
     pub const EMPTY: Slot = Slot {
@@ -175,6 +181,9 @@ pub unsafe fn revoke(root: NonNull<Slot>) -> usize {
             };
 
             unlink(cursor);
+            // Destroying a capability that is still mapped would leave the
+            // holder reading memory it no longer has any right to (D-034).
+            let _ = super::vspace::unmap(&mut cursor.as_mut().cap);
             cursor.as_mut().cap = RawCap::NULL;
             removed += 1;
 
@@ -205,6 +214,7 @@ pub unsafe fn delete(mut slot: NonNull<Slot>) -> usize {
     unsafe {
         let removed = revoke(slot);
         unlink(slot);
+        let _ = super::vspace::unmap(&mut slot.as_mut().cap);
         slot.as_mut().cap = RawCap::NULL;
         removed + 1
     }

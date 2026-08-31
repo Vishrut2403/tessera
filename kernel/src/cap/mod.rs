@@ -6,6 +6,7 @@ pub mod object;
 pub mod rights;
 pub mod slot;
 pub mod untyped;
+pub mod vspace;
 
 use core::marker::PhantomData;
 
@@ -31,6 +32,10 @@ pub enum CapError {
     Resolve(cspace::ResolveError),
     /// The destination slot already holds a capability.
     SlotOccupied,
+    /// The capability already records a mapping; unmap it first.
+    AlreadyMapped,
+    /// The page table refused the mapping.
+    Map(crate::mm::page_table::MapError),
     /// An untyped region not aligned to its own size. Objects are placed at
     /// aligned offsets, so an unaligned region would yield unaligned objects --
     /// and a page table that is not 4 KiB aligned is not a page table.
@@ -54,6 +59,11 @@ pub struct RawCap {
     pub watermark: usize,
     /// Set when a capability is minted, to identify the holder to a server (M5).
     pub badge: u64,
+    /// Frames and page tables: the root of the address space this is mapped
+    /// into, or zero. Recorded so revocation can find the mapping (D-034).
+    pub mapped_root: PhysAddr,
+    /// Where in that address space, valid only when `mapped_root` is non-zero.
+    pub mapped_vaddr: usize,
 }
 
 impl RawCap {
@@ -64,10 +74,30 @@ impl RawCap {
         paddr: PhysAddr::new(0),
         watermark: 0,
         badge: 0,
+        mapped_root: PhysAddr::new(0),
+        mapped_vaddr: 0,
     };
 
     pub const fn is_null(&self) -> bool {
         matches!(self.kind, ObjectType::Null)
+    }
+
+    /// An untyped capability over a region. The one shape callers build by hand.
+    pub const fn untyped(paddr: PhysAddr, size_bits: u8, rights: u8) -> RawCap {
+        RawCap { kind: ObjectType::Untyped, rights, size_bits, paddr, ..RawCap::NULL }
+    }
+
+    /// Where this capability is mapped, if anywhere.
+    pub const fn mapping(&self) -> Option<(PhysAddr, usize)> {
+        match self.mapped_root.as_usize() {
+            0 => None,
+            root => Some((PhysAddr::new(root), self.mapped_vaddr)),
+        }
+    }
+
+    pub const fn clear_mapping(&mut self) {
+        self.mapped_root = PhysAddr::new(0);
+        self.mapped_vaddr = 0;
     }
 
     /// Size of the object in bytes.

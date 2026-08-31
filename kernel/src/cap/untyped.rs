@@ -101,6 +101,8 @@ where
                 paddr: carved.paddr,
                 watermark: 0,
                 badge: 0,
+                mapped_root: crate::mm::PhysAddr::new(0),
+                mapped_vaddr: 0,
             };
         }
 
