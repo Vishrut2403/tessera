@@ -178,6 +178,16 @@ pub fn unmap(obj: u64) -> Result {
     invoke(obj, label::UNMAP, [0; MSG_REGS], 4)
 }
 
+/// Where a frame physically is, for a device that does not walk page tables.
+///
+/// Needs `WRITE` on the frame: a physical address is what lets a holder aim a
+/// bus master at memory it has no capability for, and there is no IOMMU here.
+pub fn get_address(frame: u64) -> core::result::Result<usize, Error> {
+    let info = MessageInfo::new(label::GET_ADDRESS, 0, false);
+    let a0 = ecall(syscall::CALL, frame, info, [0; MSG_REGS], 0).status();
+    if result::is_err(a0) { Err(Error(a0)) } else { Ok(a0) }
+}
+
 // --- Invocations on threads ---
 
 pub fn tcb_configure(tcb: u64, cspace: u64, vspace: u64, fault_ep: u64) -> Result {

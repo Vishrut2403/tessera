@@ -106,6 +106,11 @@ impl RawCap {
         RawCap { kind: ObjectType::Untyped, rights, size_bits, paddr, ..RawCap::NULL }
     }
 
+    /// Untyped memory over device registers rather than RAM (D-040).
+    pub const fn device_untyped(paddr: PhysAddr, size_bits: u8, rights: u8) -> RawCap {
+        RawCap { kind: ObjectType::DeviceUntyped, rights, size_bits, paddr, ..RawCap::NULL }
+    }
+
     /// Where this capability is mapped, if anywhere.
     pub const fn mapping(&self) -> Option<(PhysAddr, usize)> {
         match self.mapped_root.as_usize() {

@@ -38,6 +38,20 @@ impl Region {
     }
 
     /// Shrink to whole pages: start rounds up, end rounds down.
+    /// The smallest page-aligned region that contains this one.
+    ///
+    /// Device registers are described to the byte -- QEMU's UART is 0x100 long
+    /// -- but a capability hands out whole pages, so the region has to grow
+    /// outward rather than be trimmed away to nothing (D-040).
+    pub const fn page_aligned_out(&self) -> Self {
+        Self {
+            start: PhysAddr::new(self.start.as_usize() & !(super::PAGE_SIZE - 1)),
+            end: PhysAddr::new(
+                (self.end.as_usize() + super::PAGE_SIZE - 1) & !(super::PAGE_SIZE - 1),
+            ),
+        }
+    }
+
     pub const fn page_aligned(&self) -> Self {
         Self { start: self.start.align_up(PAGE_SIZE), end: self.end.align_down(PAGE_SIZE) }
     }
@@ -132,7 +146,8 @@ impl<const N: usize> RegionList<N> {
     }
 
     /// Sort by start address and merge every overlapping or touching pair.
-    pub fn normalize(&mut self) {
+    /// Sort by start address, without merging anything.
+    pub fn sort(&mut self) {
         let s = &mut self.regions[..self.len];
         for i in 1..s.len() {
             let mut j = i;
@@ -141,6 +156,10 @@ impl<const N: usize> RegionList<N> {
                 j -= 1;
             }
         }
+    }
+
+    pub fn normalize(&mut self) {
+        self.sort();
 
         let mut write = 0;
         for read in 1..self.len {

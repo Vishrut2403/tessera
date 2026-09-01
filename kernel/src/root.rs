@@ -15,7 +15,7 @@ use crate::cap::vspace::vspace_cap;
 use crate::cap::{CapError, ObjectType, RawCap};
 use crate::elf::{Elf, ElfError, Segment};
 use crate::mm::{
-    AddressSpace, Mapper, PAGE_SHIFT, PAGE_SIZE, PhysAddr, PteFlags, Region, VirtAddr,
+    AddressSpace, Mapper, MemoryMap, PAGE_SHIFT, PAGE_SIZE, PhysAddr, PteFlags, Region, VirtAddr,
     phys_to_virt,
 };
 use crate::thread::{Tcb, ThreadId};
@@ -77,11 +77,13 @@ pub struct RootTask {
     pub cnode: RawCap,
     pub untypeds: usize,
     pub untyped_bytes: u64,
+    /// How many of `untypeds` are device regions rather than RAM (D-040).
+    pub devices: usize,
 }
 
 /// Build the root task's address space, capability space and thread, and put it
 /// on the run queue.
-pub fn load(kernel: &Mapper) -> Result<RootTask, RootError> {
+pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
     let elf = Elf::parse(IMAGE)?;
     let (image_start, image_end) = elf.image_range()?;
 
@@ -174,23 +176,35 @@ pub fn load(kernel: &Mapper) -> Result<RootTask, RootError> {
         ..BootInfo::EMPTY
     };
 
+    // RAM first, then devices, so the boot log reads in the order the root task
+    // will care about them. Both are the same kind of capability to the CSpace;
+    // only the object type and the `is_device` flag differ (D-040).
     let mut count = 0usize;
     let mut bytes = 0u64;
-    for region in free.iter() {
-        for desc in split(*region) {
-            if count == bootinfo::MAX_UNTYPED || info.first_untyped + count as u64 >= info.cnode_slots
-            {
-                break;
+    let mut devices = 0usize;
+    for (regions, is_device) in [(&free, false), (&map.devices, true)] {
+        for region in regions.iter() {
+            for desc in split(*region, is_device) {
+                if count == bootinfo::MAX_UNTYPED
+                    || info.first_untyped + count as u64 >= info.cnode_slots
+                {
+                    break;
+                }
+                let paddr = PhysAddr::new(desc.paddr as usize);
+                let cap = if is_device {
+                    RawCap::device_untyped(paddr, desc.size_bits, ALL)
+                } else {
+                    RawCap::untyped(paddr, desc.size_bits, ALL)
+                };
+                cs.insert(info.first_untyped + count as u64, depth, cap, None)?;
+                info.untyped[count] = desc;
+                if is_device {
+                    devices += 1;
+                } else {
+                    bytes += desc.bytes();
+                }
+                count += 1;
             }
-            cs.insert(
-                info.first_untyped + count as u64,
-                depth,
-                RawCap::untyped(PhysAddr::new(desc.paddr as usize), desc.size_bits, ALL),
-                None,
-            )?;
-            info.untyped[count] = desc;
-            bytes += desc.bytes();
-            count += 1;
         }
     }
     info.untyped_count = count as u32;
@@ -218,6 +232,7 @@ pub fn load(kernel: &Mapper) -> Result<RootTask, RootError> {
         cnode,
         untypeds: count,
         untyped_bytes: bytes,
+        devices,
     })
 }
 
@@ -306,7 +321,7 @@ fn alloc_aligned(bits: u8) -> Option<PhysAddr> {
 ///
 /// An untyped capability is a naturally aligned power of two, because retyping
 /// splits it in half and every object inside it must be aligned to its own size.
-pub fn split(region: Region) -> impl Iterator<Item = UntypedDesc> {
+pub fn split(region: Region, is_device: bool) -> impl Iterator<Item = UntypedDesc> {
     let mut start = region.start.as_usize();
     let end = region.end.as_usize();
     core::iter::from_fn(move || {
@@ -319,7 +334,7 @@ pub fn split(region: Region) -> impl Iterator<Item = UntypedDesc> {
         if bits < PAGE_SHIFT as u32 {
             return None;
         }
-        let desc = UntypedDesc::new(start as u64, bits as u8, false);
+        let desc = UntypedDesc::new(start as u64, bits as u8, is_device);
         start += 1usize << bits;
         Some(desc)
     })

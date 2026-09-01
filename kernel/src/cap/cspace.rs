@@ -200,8 +200,6 @@ impl CSpace {
         // SAFETY: a live slot we hold exclusively via `&mut self`.
         let untyped = unsafe { source.as_ref().cap };
 
-        let cap = Cap::<super::kind::Untyped, { super::rights::WRITE }>::from_raw(untyped)?;
-
         // Every destination slot must be free before the region is touched.
         for i in 0..out.len() {
             let s = self.resolve(dst.0 + i as u64, dst.1)?;
@@ -211,7 +209,16 @@ impl CSpace {
             }
         }
 
-        let watermark = cap.retype(target, size_bits, out)?;
+        // Which retype runs is decided by the source's kind, and the two have
+        // different rules about what they may become and whether the bytes are
+        // zeroed (D-040).
+        let watermark = if untyped.kind == ObjectType::DeviceUntyped {
+            Cap::<super::kind::DeviceUntyped, { super::rights::WRITE }>::from_raw(untyped)?
+                .retype(target, size_bits, out)?
+        } else {
+            Cap::<super::kind::Untyped, { super::rights::WRITE }>::from_raw(untyped)?
+                .retype(target, size_bits, out)?
+        };
 
         for (i, made) in out.iter().enumerate() {
             if made.kind == ObjectType::Endpoint {

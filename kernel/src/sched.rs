@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::cap::cspace::CSpace;
-use crate::cap::{CapError, ObjectType, RawCap};
+use crate::cap::{Cap, CapError, ObjectType, RawCap, kind, rights};
 use crate::ipc::{self, EndpointState, MessageInfo};
 use crate::mm::{AddressSpace, VirtAddr};
 use crate::sync::SpinLock;
@@ -492,7 +492,7 @@ fn invoke(tcb: &mut Tcb, is_call: bool) -> ! {
 
     match cap.kind {
         ObjectType::Endpoint => ipc_send(tcb, cap, info, is_call),
-        ObjectType::Untyped => invoke_untyped(tcb, cs, cptr, info),
+        ObjectType::Untyped | ObjectType::DeviceUntyped => invoke_untyped(tcb, cs, cptr, info),
         ObjectType::CNode => invoke_cnode(tcb, cs, cptr, info),
         ObjectType::Frame | ObjectType::PageTable => invoke_mapping(tcb, cs, cptr, info),
         ObjectType::Tcb => invoke_tcb(tcb, cs, cap, info),
@@ -790,6 +790,21 @@ fn invoke_mapping(tcb: &mut Tcb, cs: CSpace, cptr: u64, info: MessageInfo) -> ! 
             let cap = unsafe { &mut target.clone().as_mut().cap };
             finish(tcb, crate::cap::vspace::unmap(cap).map_or(result::ERR_MAP, |()| result::OK))
         }
+        label::GET_ADDRESS => {
+            // SAFETY: as above.
+            let cap = unsafe { target.clone().as_ref().cap };
+            // `WRITE`, not `READ`: a physical address is the one piece of
+            // information that lets a holder aim a bus master at memory it has
+            // no capability for, and this platform has no IOMMU (D-040). A
+            // read-only frame handed to a client stays unlocatable.
+            match Cap::<kind::Frame, { rights::WRITE }>::from_raw(cap) {
+                // The address is the return value. No physical address can
+                // collide with an error code, which lives at the top of the
+                // range.
+                Ok(frame) => finish(tcb, frame.paddr().as_usize()),
+                Err(e) => finish(tcb, cap_result(e)),
+            }
+        }
         label::ASSIGN => {
             // SAFETY: as above.
             let cap = unsafe { &mut target.clone().as_mut().cap };
@@ -918,16 +933,16 @@ fn deliver_fault(tcb: &mut Tcb, cause: Cause) -> ! {
     ipc_send(tcb, ep, MessageInfo::new(label::FAULT_VM, 3, false), true)
 }
 
+/// What userspace may name as a retype target.
+///
+/// `Null` is not an object and `Reply` is minted by the kernel on `call`. The
+/// finer rule -- device untyped becomes only frames and smaller device
+/// untypeds -- belongs to the retype itself, where the type says it (D-040).
 fn object_type_from(n: usize) -> Option<ObjectType> {
-    Some(match n {
-        1 => ObjectType::Untyped,
-        2 => ObjectType::CNode,
-        3 => ObjectType::Frame,
-        4 => ObjectType::PageTable,
-        5 => ObjectType::Tcb,
-        6 => ObjectType::Endpoint,
-        _ => return None,
-    })
+    match ObjectType::from_u8(u8::try_from(n).ok()?)? {
+        ObjectType::Null | ObjectType::Reply => None,
+        other => Some(other),
+    }
 }
 
 /// Save the calling kernel context into `ctx`, then resume `frame` in U-mode.

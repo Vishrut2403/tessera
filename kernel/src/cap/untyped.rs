@@ -55,6 +55,57 @@ unsafe fn zero(paddr: PhysAddr, size_bits: u8) {
     unsafe { core::ptr::write_bytes(ptr, 0, 1usize << size_bits) };
 }
 
+/// The shared body of both retypes: plan the whole batch, then commit.
+///
+/// `zeroing` is a parameter rather than a constant because that is the entire
+/// difference between RAM and device memory here (D-040).
+fn retype_into(
+    raw: &RawCap,
+    target: ObjectType,
+    size_bits: u8,
+    out: &mut [RawCap],
+    zeroing: bool,
+) -> Result<usize, CapError> {
+    let bits = match target.size_bits(size_bits) {
+        Some(b) => b,
+        None => return Err(CapError::BadObjectType),
+    };
+    // A CNode must consume at least one address bit, so it needs at least
+    // two slots. A one-slot CNode would have radix 0, and a walk through it
+    // would never shorten the remaining depth -- resolution would not
+    // terminate. Refusing it here is what lets `CSpace::resolve` have no
+    // iteration limit (D-029).
+    if matches!(target, ObjectType::CNode) && bits <= super::object::SLOT_BITS {
+        return Err(CapError::BadSize);
+    }
+
+    // Plan the whole batch before touching anything.
+    let mut watermark = raw.watermark;
+    for slot in out.iter_mut() {
+        let carved = carve(raw.paddr, raw.size_bits, watermark, bits)?;
+        watermark = carved.watermark;
+        *slot = RawCap {
+            kind: target,
+            // A fresh object is held with every right; reduction is the
+            // holder's business from here on.
+            rights: super::rights::ALL,
+            size_bits: bits,
+            paddr: carved.paddr,
+            ..RawCap::NULL
+        };
+    }
+
+    if zeroing {
+        for slot in out.iter() {
+            // SAFETY: `carve` placed each object inside a region this
+            // capability owns, and nothing else refers to it yet.
+            unsafe { zero(slot.paddr, slot.size_bits) };
+        }
+    }
+
+    Ok(watermark)
+}
+
 /// Retyping needs [`super::rights::WRITE`] on the untyped capability.
 impl<const R: u8> Cap<kind::Untyped, R>
 where
@@ -71,48 +122,42 @@ where
         size_bits: u8,
         out: &mut [RawCap],
     ) -> Result<usize, CapError> {
-        if matches!(target, ObjectType::Null) {
+        // `Null` is not an object, `Reply` is minted by the kernel on `call`
+        // and never carved, and `DeviceUntyped` would be a claim that this RAM
+        // is device registers -- which is exactly the lie the whole
+        // distinction exists to prevent.
+        if matches!(target, ObjectType::Null | ObjectType::Reply | ObjectType::DeviceUntyped) {
             return Err(CapError::BadObjectType);
         }
-        let bits = match target.size_bits(size_bits) {
-            Some(b) => b,
-            None => return Err(CapError::BadObjectType),
-        };
-        // A CNode must consume at least one address bit, so it needs at least
-        // two slots. A one-slot CNode would have radix 0, and a walk through it
-        // would never shorten the remaining depth -- resolution would not
-        // terminate. Refusing it here is what lets `CSpace::resolve` have no
-        // iteration limit (D-029).
-        if matches!(target, ObjectType::CNode) && bits <= super::object::SLOT_BITS {
-            return Err(CapError::BadSize);
-        }
-
-        // Plan the whole batch before touching anything.
-        let mut watermark = self.raw.watermark;
-        for slot in out.iter_mut() {
-            let carved = carve(self.raw.paddr, self.raw.size_bits, watermark, bits)?;
-            watermark = carved.watermark;
-            *slot = RawCap {
-                kind: target,
-                // A fresh object is held with every right; reduction is the
-                // holder's business from here on.
-                rights: super::rights::ALL,
-                size_bits: bits,
-                paddr: carved.paddr,
-                ..RawCap::NULL
-            };
-        }
-
-        for slot in out.iter() {
-            // SAFETY: `carve` placed each object inside a region this
-            // capability owns, and nothing else refers to it yet.
-            unsafe { zero(slot.paddr, slot.size_bits) };
-        }
-
-        Ok(watermark)
+        retype_into(&self.raw, target, size_bits, out, true)
     }
 
     /// Bytes of this region not yet handed out.
+    pub const fn free_bytes(&self) -> usize {
+        self.raw.size() - self.raw.watermark
+    }
+}
+
+/// Device untyped retypes into frames and into smaller device untypeds, and
+/// into nothing else (D-040).
+impl<const R: u8> Cap<kind::DeviceUntyped, R>
+where
+    Mask<R>: HasWrite,
+{
+    pub fn retype(
+        &self,
+        target: ObjectType,
+        size_bits: u8,
+        out: &mut [RawCap],
+    ) -> Result<usize, CapError> {
+        if !matches!(target, ObjectType::Frame | ObjectType::DeviceUntyped) {
+            return Err(CapError::BadObjectType);
+        }
+        // Never zeroed: these bytes are device registers, and writing them is
+        // an operation on hardware, not on memory.
+        retype_into(&self.raw, target, size_bits, out, false)
+    }
+
     pub const fn free_bytes(&self) -> usize {
         self.raw.size() - self.raw.watermark
     }

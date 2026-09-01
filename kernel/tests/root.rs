@@ -35,9 +35,13 @@ extern "C" fn test_main_entry(_hartid: usize, dtb_pa: usize) -> ! {
     qemu::exit_success()
 }
 
-fn kernel_mapper() -> mm::Mapper {
+fn memory_map() -> mm::MemoryMap {
     // SAFETY: written once during boot, read-only thereafter.
-    let map = unsafe { (&raw const MAP).read() }.expect("no memory map");
+    unsafe { (&raw const MAP).read() }.expect("no memory map")
+}
+
+fn kernel_mapper() -> mm::Mapper {
+    let map = memory_map();
     let mut alloc = mm::FRAMES.lock();
     mm::kernel_space::build(&map, &mut *alloc).expect("kernel space")
 }
@@ -142,7 +146,7 @@ fn a_split_tiles_its_region_exactly() {
     let start = 0x8080_0000;
     let region = Region::new(PhysAddr::new(start), PhysAddr::new(start + 0x1_5000));
     let mut at = start;
-    for desc in root::split(region) {
+    for desc in root::split(region, false) {
         let size = 1usize << desc.size_bits;
         assert_eq!(desc.paddr as usize, at, "a gap at {at:#x}");
         assert_eq!(at & (size - 1), 0, "block at {at:#x} is not {size}-aligned");
@@ -157,7 +161,7 @@ fn a_split_starts_with_what_alignment_allows_not_what_size_allows() {
     // bounded by the address, not by how much memory is left.
     let start = 0x8000_1000;
     let region = Region::new(PhysAddr::new(start), PhysAddr::new(start + 0x40_0000));
-    let first = root::split(region).next().expect("no blocks");
+    let first = root::split(region, false).next().expect("no blocks");
     assert_eq!(first.size_bits, 12);
     assert_eq!(first.paddr as usize, start);
 }
@@ -165,7 +169,7 @@ fn a_split_starts_with_what_alignment_allows_not_what_size_allows() {
 #[test_case]
 fn a_sub_page_region_yields_nothing() {
     let region = Region::new(PhysAddr::new(0x8000_0000), PhysAddr::new(0x8000_0800));
-    assert_eq!(root::split(region).count(), 0);
+    assert_eq!(root::split(region, false).count(), 0);
 }
 
 // --- The whole path ---
@@ -173,10 +177,12 @@ fn a_sub_page_region_yields_nothing() {
 #[test_case]
 fn the_root_task_runs_and_starts_a_thread_of_its_own() {
     let kspace = kernel_mapper();
-    let rt = root::load(&kspace).expect("the root task did not load");
+    let rt = root::load(&kspace, &memory_map()).expect("the root task did not load");
 
     assert_eq!(rt.entry, Elf::parse(root::IMAGE).unwrap().entry());
     assert!(rt.untypeds > 0, "no untyped memory was handed over");
+    assert!(rt.devices > 0, "no device regions were handed over");
+    assert!(rt.untypeds > rt.devices, "nothing but devices was handed over");
     assert!(rt.space.asid().as_u16() != 0, "the root task's space has no ASID");
 
     // Nothing maps the scratch region yet: the root task builds the two
@@ -203,6 +209,15 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
     assert_eq!(probe, 0x7e55e7a, "the root task's own write is missing");
     assert_eq!(done >> 48, 0xd02e, "the root task did not reach the end: {done:#x}");
     assert!(done & 0xffff != 0, "no child thread id was recorded");
+
+    // The root task wrote the physical address `GetAddress` gave it for a
+    // device frame; it must be a region the device tree called a device.
+    // SAFETY: the same scratch page, one word further on.
+    let device_pa = unsafe { p.add(2).read_volatile() } as usize;
+    assert!(
+        memory_map().devices.iter().any(|d| d.contains(PhysAddr::new(device_pa))),
+        "{device_pa:#x} is not a device region the kernel discovered"
+    );
 
     // The root task and the thread it made, both off the end of `main`.
     assert_eq!(sched::exited() - before, 2);

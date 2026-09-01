@@ -94,6 +94,13 @@ pub struct MemoryMap {
     pub reserved: Regions,
     /// `ram - reserved`, trimmed to whole pages. What the allocator may use.
     pub free: Regions,
+    /// Physical regions that are devices rather than memory, one per `reg`
+    /// entry in the device tree, grown outward to whole pages (D-040).
+    ///
+    /// Deliberately *not* coalesced: adjacent devices stay separate
+    /// capabilities, so retyping the untyped for one transport hands you that
+    /// transport's page and not its neighbour's.
+    pub devices: Regions,
 }
 
 /// Read the memory map out of the device tree.
@@ -103,6 +110,7 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
 
     let mut ram = Regions::new();
     let mut reserved = Regions::new();
+    let mut devices = Regions::new();
 
     // Cell counts come from the root node.
     let mut address_cells = 2usize;
@@ -139,7 +147,16 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
         // `/memory*` at depth 1 is RAM; anything under `/reserved-memory` is a carve-out.
         let is_ram = p.depth == 1 && (p.node == "memory" || p.node.starts_with("memory@"));
         let is_reserved = p.depth == 2 && p.parent == "reserved-memory";
-        if !is_ram && !is_reserved {
+        // A device is a `reg` on a child of `/soc`, or a top-level node with a
+        // unit address that is not memory -- `flash@...`, `fw-cfg@...`. Nodes
+        // deeper than that are behind a bus with its own cell counts (a PCI
+        // child's `reg` is not a physical address), and `/cpus/cpu@0`'s `reg`
+        // is a hart id, so neither is read with the root's cells.
+        let is_device = !is_ram
+            && !is_reserved
+            && ((p.depth == 2 && p.parent == "soc")
+                || (p.depth == 1 && p.node.contains('@')));
+        if !is_ram && !is_reserved && !is_device {
             return;
         }
 
@@ -155,7 +172,14 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
                 continue;
             }
             let region = Region::from_start_len(PhysAddr::new(base as usize), size as usize);
-            let target = if is_ram { &mut ram } else { &mut reserved };
+            let target = if is_ram {
+                &mut ram
+            } else if is_reserved {
+                &mut reserved
+            } else {
+                &mut devices
+            };
+            let region = if is_device { region.page_aligned_out() } else { region };
             if target.push(region).is_err() {
                 overflow = true;
             }
@@ -188,5 +212,22 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
     }
     free.drop_empty();
 
-    Ok(MemoryMap { ram, reserved, free })
+    // A device region overlapping RAM is a device tree we do not understand, and
+    // one overlapping a device the kernel drives is the console or the shutdown
+    // register: handing either to userspace would put the kernel's own hardware
+    // in someone else's address space.
+    let mut kept = Regions::new();
+    for d in devices.iter() {
+        let clashes_with_ram = ram.iter().any(|r| r.overlaps(d));
+        let clashes_with_kernel = kernel_space::DEVICES
+            .iter()
+            .any(|(_, pa)| d.contains(PhysAddr::new(*pa)));
+        if !clashes_with_ram && !clashes_with_kernel {
+            kept.push(*d)?;
+        }
+    }
+    kept.sort();
+    let devices = kept;
+
+    Ok(MemoryMap { ram, reserved, free, devices })
 }

@@ -10,7 +10,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use rt::abi::{BootInfo, ObjectType, bootinfo, rights};
-use rt::{entry, println, sys, thread_entry};
+use rt::{entry, print, println, sys, thread_entry};
 
 entry!(main);
 
@@ -53,11 +53,14 @@ fn main() {
         );
     }
 
-    // The biggest region; everything below comes out of it.
+    // The biggest region that is actually memory. The PCI ECAM window is a
+    // 256 MiB device untyped and would win on size, and retyping it into a page
+    // table is exactly what `DeviceUntyped` refuses.
     let (best, _) = bi
         .untypeds()
         .iter()
         .enumerate()
+        .filter(|(_, u)| u.is_device == 0)
         .max_by_key(|(_, u)| u.size_bits)
         .expect("no untyped memory");
     let ut = bi.untyped_slot(best);
@@ -87,6 +90,8 @@ fn main() {
         assert_eq!(p.read_volatile(), 0x7e55e7a);
     }
     println!("  mapped        : {base:#x} rw, wrote and read back a word");
+    let phys = sys::get_address(scratch).expect("get_address");
+    println!("  physically at : {phys:#x}  (what a virtqueue descriptor needs)");
 
     // A second thread in this address space: its own stack, our CSpace, our
     // page tables, and an entry point in the text we are running out of.
@@ -119,8 +124,69 @@ fn main() {
     // SAFETY: the scratch frame is still mapped read-write at `base`.
     unsafe { (base as *mut u64).add(1).write_volatile(DONE | child_id as u64) };
 
+    check_device_untyped(bi, vspace, f + 8, base + 0x10000, ut);
+
     println!();
     println!("root task: done.");
+}
+
+/// Check what a device untyped is and is not allowed to become, from the
+/// outside — the same checks the kernel's tests make, made by a user program
+/// holding nothing but capabilities (D-040).
+///
+/// Deliberately no MMIO *reads*: identifying a device by reading it is not
+/// safe. QEMU's CLINT and fw-cfg both raise a load access fault on a plain
+/// 32-bit read of offset 0, and with no fault endpoint attached that kills the
+/// root task outright. Knowing which region is a virtio transport is the device
+/// tree's job, not a scan's.
+fn check_device_untyped(bi: &BootInfo, vspace: u64, first_slot: u64, at: usize, ram: u64) {
+    println!();
+    println!("  device untyped:");
+
+    let (i, u) = bi
+        .untypeds()
+        .iter()
+        .enumerate()
+        .find(|(_, u)| u.is_device != 0)
+        .expect("no device regions");
+    let dev = bi.untyped_slot(i);
+    let (frame, spare, weak) = (first_slot, first_slot + 1, first_slot + 2);
+
+    // A device region becomes a frame, and nothing else. A page table there
+    // would put the kernel's own bookkeeping in device registers.
+    sys::retype(dev, ObjectType::Frame, 0, frame, 1).expect("device untyped -> frame");
+    assert!(
+        sys::retype(dev, ObjectType::PageTable, 0, spare, 1).is_err(),
+        "a page table was carved out of device registers"
+    );
+    assert!(
+        sys::retype(dev, ObjectType::Tcb, 0, spare, 1).is_err(),
+        "a thread was carved out of device registers"
+    );
+    // And RAM cannot claim to be a device: that is the lie the type prevents.
+    assert!(
+        sys::retype(ram, ObjectType::DeviceUntyped, 12, spare, 1).is_err(),
+        "ordinary memory was relabelled as device registers"
+    );
+    println!("    slot {dev:<3}      : {:#012x}, 2^{}", u.paddr, u.size_bits);
+    println!("    retype        : frame yes; page table, thread, and RAM->device all refused");
+
+    // The capability says where the frame is; the boot info said where the
+    // region is. Both have to agree, or one of them is lying.
+    sys::map_frame(frame, vspace, at, rights::READ | rights::WRITE, false).expect("map device");
+    let phys = sys::get_address(frame).expect("get_address");
+    assert_eq!(phys as u64, u.paddr, "a device frame is not where its untyped said");
+    println!("    mapped at     : {at:#x} -> {phys:#012x}, which the boot info agrees with");
+
+    // `GetAddress` needs WRITE. A read-only copy of the same frame is a
+    // capability you can map and read, but not locate — which is the point,
+    // because locating is most of the way to aiming a bus master at it.
+    sys::mint(bootinfo::slot::CNODE, frame, weak, rights::READ, 0).expect("mint");
+    assert!(sys::get_address(weak).is_err(), "a read-only frame gave up its address");
+    println!("    read-only copy: refused GetAddress, as it must");
+
+    // SAFETY: the scratch frame is mapped read-write at `at - 0x10000`.
+    unsafe { ((at - 0x10000) as *mut u64).add(2).write_volatile(u.paddr) };
 }
 
 thread_entry!(child_start => child);

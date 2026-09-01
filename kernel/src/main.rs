@@ -88,6 +88,10 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     for r in map.reserved.iter() {
         println!("    {:?}", r);
     }
+    println!("  devices (not RAM, handed out as device untyped):");
+    for r in map.devices.iter() {
+        println!("    {:?}", r);
+    }
     println!("  free:");
     for r in map.free.iter() {
         println!("    {:?}  = {} frames", r, r.frame_count());
@@ -312,12 +316,17 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     // and objects are made by userspace out of the untypeds handed over below.
     println!();
     println!("root task:");
-    let rt = kernel::root::load(&kspace).expect("could not load the root task");
+    let rt = kernel::root::load(&kspace, &map).expect("could not load the root task");
     println!("  image         : {} KiB of ELF embedded in .rodata", kernel::root::IMAGE.len() / 1024);
     println!("  entry         : {:#x}  (image {:#x}..{:#x})", rt.entry, rt.image.0, rt.image.1);
     println!("  address space : root {} (asid {})", rt.space.root(), rt.space.asid().as_u16());
     println!("  cspace        : {} slots at {}", 1usize << rt.cnode.size_bits.saturating_sub(7), rt.cnode.paddr);
-    println!("  untyped       : {} regions, {} KiB handed over", rt.untypeds, rt.untyped_bytes / 1024);
+    println!(
+        "  untyped       : {} regions, {} KiB of RAM handed over",
+        rt.untypeds - rt.devices,
+        rt.untyped_bytes / 1024
+    );
+    println!("  device untyped: {} regions, one per device tree `reg`", rt.devices);
     println!("  thread        : {}", rt.id);
 
     let before = sched::exited();

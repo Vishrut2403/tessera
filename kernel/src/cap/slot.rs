@@ -3,7 +3,7 @@
 use core::ptr::NonNull;
 
 use super::object::SLOT_BITS;
-use super::{ObjectType, RawCap};
+use super::RawCap;
 
 /// A reference to another slot. Slots live inside CNode objects, which live in
 /// untyped memory, so this is a pointer through the direct map rather than an
@@ -196,7 +196,7 @@ pub unsafe fn revoke(root: NonNull<Slot>) -> usize {
         // With every derivative gone, an untyped region can be handed out
         // again. This is what makes revocation the kernel's memory reuse
         // story, and why there is no free list anywhere (D-027).
-        if matches!(root.as_ref().cap.kind, ObjectType::Untyped) {
+        if root.as_ref().cap.kind.is_untyped() {
             let mut r = root;
             r.as_mut().cap.watermark = 0;
         }

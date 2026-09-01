@@ -23,7 +23,8 @@ pub fn write_fmt(args: fmt::Arguments) -> fmt::Result {
 
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => { let _ = $crate::io::write_fmt(format_args!($($arg)*)); };
+    // A block, so the macro is an expression and can sit in a match arm.
+    ($($arg:tt)*) => {{ let _ = $crate::io::write_fmt(format_args!($($arg)*)); }};
 }
 
 #[macro_export]

@@ -17,6 +17,7 @@ pub mod kind {
 
     kinds! {
         Untyped => Untyped,
+        DeviceUntyped => DeviceUntyped,
         CNode => CNode,
         Frame => Frame,
         PageTable => PageTable,

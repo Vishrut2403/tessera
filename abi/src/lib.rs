@@ -71,6 +71,10 @@ pub mod label {
     pub const SUSPEND: u64 = 11;
     /// PageTable: install the kernel half and bind an ASID (D-037).
     pub const ASSIGN: u64 = 12;
+    /// Frame: where it physically is, for a device that does not walk page
+    /// tables. Needs `WRITE`, because a physical address is what lets a holder
+    /// aim a bus master at memory it has no capability for (D-040).
+    pub const GET_ADDRESS: u64 = 13;
 
     /// What the kernel sends a pager when a thread faults (D-034).
     pub const FAULT_VM: u64 = 0x100;
