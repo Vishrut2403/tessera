@@ -10,7 +10,7 @@ pub mod region;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub use addr::{KERNEL_VMA, PAGE_SHIFT, PAGE_SIZE, PhysAddr, VirtAddr};
-pub use address_space::{AddressSpace, AddressSpaceError, Asid};
+pub use address_space::{AddressSpace, AddressSpaceError, Asid, install_kernel_half, satp_for};
 pub use frame::BumpAllocator;
 pub use page_table::{
     FrameAllocator, MapError, Mapper, PageTable, Pte, PteFlags, flush_tlb_all, flush_tlb_page,

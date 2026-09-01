@@ -2,8 +2,7 @@
 
 use core::fmt;
 
-pub const PAGE_SIZE: usize = 4096;
-pub const PAGE_SHIFT: usize = 12;
+pub use abi::{PAGE_SHIFT, PAGE_SIZE};
 
 /// Virtual offset of the kernel and, from M2c, of all physical memory.
 pub const KERNEL_VMA: usize = 0xFFFF_FFC0_0000_0000;

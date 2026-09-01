@@ -9,10 +9,12 @@
 pub mod boot;
 pub mod cap;
 pub mod csr;
+pub mod elf;
 pub mod fdt;
 pub mod ipc;
 pub mod mm;
 pub mod qemu;
+pub mod root;
 pub mod sbi;
 pub mod sched;
 pub mod sync;

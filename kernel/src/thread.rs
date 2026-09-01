@@ -2,6 +2,8 @@
 
 use core::ptr::NonNull;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::csr::sstatus_bits;
 use crate::cap::RawCap;
 use crate::mm::{AddressSpace, PAGE_SIZE, PhysAddr, VirtAddr, phys_to_virt};
@@ -9,8 +11,18 @@ use crate::trap::{TrapFrame, reg};
 
 pub type ThreadId = usize;
 
+static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// The next thread id. Ids are for diagnostics: authority is the capability.
+pub fn next_id() -> ThreadId {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
+    /// Retyped but never started: no address space, no CSpace, no entry point.
+    /// On no queue anywhere, which is what makes it safe to configure (D-037).
+    Inactive,
     /// On the run queue, waiting for a hart.
     Ready,
     /// Currently on a hart.
@@ -141,6 +153,55 @@ impl Tcb {
             });
             NonNull::new_unchecked(ptr)
         }
+    }
+
+    /// Lay out a TCB that exists but cannot run.
+    ///
+    /// This is what `retype` produces. Everything a thread needs to run --
+    /// address space, CSpace, entry point -- arrives later through invocations
+    /// on the capability, which is the whole point of making a thread an object
+    /// (D-037). `satp` of zero is the marker: `Resume` refuses it.
+    ///
+    /// # Safety
+    /// `paddr` must be a TCB object we own exclusively and nothing refers to.
+    pub unsafe fn init_inactive(paddr: PhysAddr) -> NonNull<Tcb> {
+        let ptr = phys_to_virt(paddr).as_mut_ptr::<Tcb>();
+
+        let mut frame = TrapFrame::default();
+        frame.sstatus = sstatus_bits::SPIE | fs::OFF;
+
+        // SAFETY: the caller promised an exclusively owned, untouched object.
+        unsafe {
+            ptr.write(Tcb {
+                frame,
+                fp: [0; 32],
+                fp_valid: false,
+                state: ThreadState::Inactive,
+                id: next_id(),
+                satp: 0,
+                next: None,
+                ipc_next: None,
+                reply: RawCap::NULL,
+                cspace: RawCap::NULL,
+                badge: 0,
+                call_pending: false,
+                fault_ep: RawCap::NULL,
+                faulted: false,
+                self_paddr: paddr,
+            });
+            NonNull::new_unchecked(ptr)
+        }
+    }
+
+    /// Whether this thread has everything it needs to be put on the run queue.
+    pub const fn is_configured(&self) -> bool {
+        self.satp != 0
+    }
+
+    /// Set where the thread starts and what stack it starts on.
+    pub fn set_registers(&mut self, entry: VirtAddr, stack_top: VirtAddr) {
+        self.frame.sepc = entry.as_usize();
+        self.frame.x[reg::SP] = stack_top.as_usize();
     }
 
     pub fn frame_ptr(&mut self) -> *mut TrapFrame {

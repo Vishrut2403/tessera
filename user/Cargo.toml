@@ -1,0 +1,39 @@
+# Its own workspace on purpose: the kernel's build script builds this tree into
+# a separate target directory and embeds the result, so it must not be a member
+# of the root workspace (D-039).
+[workspace]
+
+[package]
+name    = "tessera-user"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name    = "rt"
+path    = "src/lib.rs"
+test    = false
+doctest = false
+
+[[bin]]
+name = "root"
+path = "src/bin/root.rs"
+test = false
+
+[dependencies]
+tessera-abi = { path = "../abi" }
+
+# The whole ELF is embedded in the kernel image, so DWARF here is a megabyte of
+# kernel .rodata that nothing reads: the loader only walks PT_LOAD headers.
+# The symbol table stays, so `nm` and a backtrace still work.
+[profile.dev]
+opt-level = 0
+debug     = false
+strip     = "debuginfo"
+
+[profile.release]
+opt-level     = "s"
+debug         = false
+strip         = "debuginfo"
+lto           = true
+codegen-units = 1

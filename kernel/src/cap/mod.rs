@@ -5,6 +5,7 @@ pub mod cspace;
 pub mod object;
 pub mod rights;
 pub mod slot;
+pub mod tcb;
 pub mod untyped;
 pub mod vspace;
 
@@ -36,6 +37,19 @@ pub enum CapError {
     AlreadyMapped,
     /// The page table refused the mapping.
     Map(crate::mm::page_table::MapError),
+    /// The page table already has an ASID; assigning twice would strand one.
+    AlreadyAssigned,
+    /// The ASID pool refused.
+    Asid(asid::AsidError),
+    /// The kernel's own root table is not published yet, so there is no kernel
+    /// half to copy. Only reachable before `kernel_space::build` has run.
+    NoKernelSpace,
+    /// A thread invoked its own TCB capability.
+    SelfInvocation,
+    /// The thread is not in a state where this invocation is allowed.
+    NotInactive,
+    /// The root page table has no ASID, so it is not an address space yet.
+    NotAssigned,
     /// An untyped region not aligned to its own size. Objects are placed at
     /// aligned offsets, so an unaligned region would yield unaligned objects --
     /// and a page table that is not 4 KiB aligned is not a page table.
@@ -44,8 +58,8 @@ pub enum CapError {
 
 /// A capability as it is stored: rights and identity known only at runtime.
 ///
-/// `repr(C)` because [`slot::Slot`] must come out at exactly 64 bytes, which is
-/// what makes a CNode of 2^n slots occupy 2^(n+6) bytes.
+/// `repr(C)` because [`slot::Slot`] must come out at exactly 128 bytes, which is
+/// what makes a CNode of 2^n slots occupy 2^(n+7) bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct RawCap {
@@ -53,6 +67,10 @@ pub struct RawCap {
     pub rights: u8,
     /// Log2 of the object's size in bytes.
     pub size_bits: u8,
+    /// Root page tables only: the ASID `Assign` bound to this address space,
+    /// or zero. It lives here rather than in the object because a page table
+    /// object is 512 PTEs with no room for metadata (D-037).
+    pub asid: u16,
     /// The object itself. Physical, because a capability outlives any mapping.
     pub paddr: PhysAddr,
     /// Untyped only: how much of the region has already been handed out.
@@ -71,6 +89,7 @@ impl RawCap {
         kind: ObjectType::Null,
         rights: 0,
         size_bits: 0,
+        asid: 0,
         paddr: PhysAddr::new(0),
         watermark: 0,
         badge: 0,
@@ -93,6 +112,12 @@ impl RawCap {
             0 => None,
             root => Some((PhysAddr::new(root), self.mapped_vaddr)),
         }
+    }
+
+    /// Whether an ASID has been bound, which is what makes a root page table
+    /// usable as an address space.
+    pub const fn is_assigned(&self) -> bool {
+        self.asid != 0
     }
 
     pub const fn clear_mapping(&mut self) {

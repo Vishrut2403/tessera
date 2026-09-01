@@ -3,12 +3,12 @@
 version = 4
 
 [[package]]
-name = "kernel"
+name = "tessera-abi"
+version = "0.1.0"
+
+[[package]]
+name = "tessera-user"
 version = "0.1.0"
 dependencies = [
  "tessera-abi",
 ]
-
-[[package]]
-name = "tessera-abi"
-version = "0.1.0"

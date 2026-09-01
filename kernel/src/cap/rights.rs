@@ -10,18 +10,7 @@
 //! contain it once, and hands back a value whose type carries the proof. Every
 //! operation after that point is checked by the compiler.
 
-/// Read the object, or receive from an endpoint.
-pub const READ: u8 = 1 << 0;
-/// Write the object, retype untyped memory, or send to an endpoint.
-pub const WRITE: u8 = 1 << 1;
-/// Delegate this capability, and carry capabilities in a message.
-pub const GRANT: u8 = 1 << 2;
-
-/// Every right. What the initial task holds over its own untyped memory.
-pub const ALL: u8 = READ | WRITE | GRANT;
-
-/// The number of distinct masks, and the bound the tables below enumerate.
-pub const MASKS: usize = (ALL as usize) + 1;
+pub use abi::rights::{ALL, GRANT, MASKS, READ, WRITE, name};
 
 /// Marker for masks containing [`READ`].
 pub trait HasRead {}
@@ -46,21 +35,6 @@ macro_rules! has {
 
 macro_rules! subsets {
     ($from:literal => $($to:literal)*) => { $( impl Subset<$from, $to> for Mask<$from> {} )* };
-}
-
-/// Human-readable mask, for dumps.
-pub const fn name(mask: u8) -> &'static str {
-    match mask & ALL {
-        0 => "none",
-        1 => "READ",
-        2 => "WRITE",
-        3 => "READ|WRITE",
-        4 => "GRANT",
-        5 => "READ|GRANT",
-        6 => "WRITE|GRANT",
-        7 => "READ|WRITE|GRANT",
-        _ => "?",
-    }
 }
 
 // Masks containing READ.

@@ -23,7 +23,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     kernel::init();
 
     println!();
-    println!("tessera :: M6 -- faults as IPC, a userspace pager");
+    println!("tessera :: M7 -- a real userspace, loaded from ELF");
     println!("  hart          : {}", hartid);
     println!("  device tree   : {:#x}", dtb_pa);
     println!("  sp            : {:#018x}", kernel::stack_pointer());
@@ -307,8 +307,33 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!("  cleaned up    : {left} thread(s) left over from the scheduling demo");
     demand_paging_demo(&kspace);
 
+    // --- M7b: the root task ---
+    // The last thing the kernel creates. From here on, threads, address spaces
+    // and objects are made by userspace out of the untypeds handed over below.
     println!();
-    println!("M6 complete. Parking. (Ctrl-A x to exit QEMU)");
+    println!("root task:");
+    let rt = kernel::root::load(&kspace).expect("could not load the root task");
+    println!("  image         : {} KiB of ELF embedded in .rodata", kernel::root::IMAGE.len() / 1024);
+    println!("  entry         : {:#x}  (image {:#x}..{:#x})", rt.entry, rt.image.0, rt.image.1);
+    println!("  address space : root {} (asid {})", rt.space.root(), rt.space.asid().as_u16());
+    println!("  cspace        : {} slots at {}", 1usize << rt.cnode.size_bits.saturating_sub(7), rt.cnode.paddr);
+    println!("  untyped       : {} regions, {} KiB handed over", rt.untypeds, rt.untyped_bytes / 1024);
+    println!("  thread        : {}", rt.id);
+
+    let before = sched::exited();
+    time::enable();
+    time::arm_next_tick();
+    // SAFETY: the trap path is installed and the dispatcher handles timers.
+    unsafe { sstatus::set(sstatus_bits::SIE) };
+    sched::run();
+    // SAFETY: masking again before the summary is printed.
+    unsafe { sstatus::clear(sstatus_bits::SIE) };
+    time::disarm();
+
+    println!();
+    println!("  threads exited: {}", sched::exited() - before);
+    println!();
+    println!("M7b complete. Parking. (Ctrl-A x to exit QEMU)");
     qemu::park()
 }
 

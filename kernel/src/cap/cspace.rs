@@ -221,6 +221,12 @@ impl CSpace {
                 // load-bearing.
                 unsafe { crate::ipc::init_endpoint(made.paddr) };
             }
+            if made.kind == ObjectType::Tcb {
+                // SAFETY: just carved out of the untyped, so nothing refers to
+                // it yet. It comes out inactive: no address space, no CSpace,
+                // no entry point, and `Resume` refuses it until it has them.
+                unsafe { crate::thread::Tcb::init_inactive(made.paddr) };
+            }
             if made.kind == ObjectType::CNode {
                 // SAFETY: just carved out of the untyped, so nothing refers to
                 // it yet. `zero` already made every slot empty -- an all-zero

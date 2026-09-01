@@ -51,6 +51,8 @@ impl PteFlags {
     /// User code.
     pub const USER_RX: Self =
         Self(Self::V.0 | Self::R.0 | Self::X.0 | Self::U.0 | Self::A.0);
+    /// User read-only data, such as the boot info page.
+    pub const USER_RO: Self = Self(Self::V.0 | Self::R.0 | Self::U.0 | Self::A.0);
 
     pub const fn bits(self) -> u64 {
         self.0

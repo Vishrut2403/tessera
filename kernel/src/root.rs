@@ -1,0 +1,326 @@
+//! Loading the root task: the last thing the kernel creates by itself (D-039).
+//!
+//! Everything here happens once, at boot, before any user code runs. The frame
+//! allocator is used freely — invariant 1 is about the kernel not allocating
+//! *for userspace on demand*, and this is the bootstrap that makes demand
+//! possible. After this function returns, every object in the system comes from
+//! an untyped the root task holds a capability to.
+
+use abi::bootinfo::{self, BootInfo, UntypedDesc};
+
+use crate::cap::cspace::{CSpace, init_cnode};
+use crate::cap::object::SLOT_BITS;
+use crate::cap::rights::{ALL, READ};
+use crate::cap::vspace::vspace_cap;
+use crate::cap::{CapError, ObjectType, RawCap};
+use crate::elf::{Elf, ElfError, Segment};
+use crate::mm::{
+    AddressSpace, Mapper, PAGE_SHIFT, PAGE_SIZE, PhysAddr, PteFlags, Region, VirtAddr,
+    phys_to_virt,
+};
+use crate::thread::{Tcb, ThreadId};
+
+/// The root task's ELF, built by `build.rs` and embedded in `.rodata`.
+pub static IMAGE: &[u8] = include_bytes!(env!("ROOT_TASK_ELF"));
+
+/// Top of the root task's stack. Its image is linked well below this.
+pub const STACK_TOP: usize = 0x2000_0000;
+pub const STACK_PAGES: usize = 4;
+
+/// The lowest address the kernel maps nothing at, and the root task's to use.
+/// Deliberately in a gigabyte with no page tables, so the root task has to
+/// build them (D-035) rather than inheriting a convenient hole.
+pub const FREE_VADDR: usize = 0x4000_0000;
+
+/// 2^8 slots of 2^7 bytes: a 32 KiB root CNode. Room for the fixed slots, every
+/// untyped, and a few hundred objects before the root task needs a second level.
+const CNODE_BITS: u8 = 8 + SLOT_BITS;
+
+/// The largest untyped the kernel will hand over, so one region cannot swallow
+/// all of RAM into a single capability that is awkward to subdivide.
+const MAX_UNTYPED_BITS: u32 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootError {
+    Elf(ElfError),
+    /// A segment asks to be both writable and executable.
+    WriteExecute,
+    /// Two segments share a page, so mapping one would overwrite the other.
+    OverlappingSegments,
+    /// A segment lands in the kernel half, or above the boot info page.
+    BadAddress,
+    OutOfMemory,
+    Cap(CapError),
+    Asid,
+}
+
+impl From<ElfError> for RootError {
+    fn from(e: ElfError) -> Self {
+        RootError::Elf(e)
+    }
+}
+
+impl From<CapError> for RootError {
+    fn from(e: CapError) -> Self {
+        RootError::Cap(e)
+    }
+}
+
+/// What was built, for the boot log to print.
+pub struct RootTask {
+    pub id: ThreadId,
+    pub entry: usize,
+    pub image: (usize, usize),
+    /// Kept rather than forgotten: `AddressSpace` has no `Drop`, and holding it
+    /// lets the boot log -- and the tests -- look at what the root task built.
+    pub space: AddressSpace,
+    pub cnode: RawCap,
+    pub untypeds: usize,
+    pub untyped_bytes: u64,
+}
+
+/// Build the root task's address space, capability space and thread, and put it
+/// on the run queue.
+pub fn load(kernel: &Mapper) -> Result<RootTask, RootError> {
+    let elf = Elf::parse(IMAGE)?;
+    let (image_start, image_end) = elf.image_range()?;
+
+    let mut space = {
+        let mut alloc = crate::mm::FRAMES.lock();
+        AddressSpace::new(kernel, &mut *alloc).map_err(|_| RootError::OutOfMemory)?
+    };
+    // Without an ASID the space is not an address space: a `Configure` naming
+    // it would be refused, and the root task could never make a thread (D-037).
+    space.set_asid(crate::cap::asid::assign_global().map_err(|_| RootError::Asid)?);
+
+    for segment in elf.segments() {
+        map_segment(&mut space, &segment?)?;
+    }
+
+    for i in 0..STACK_PAGES {
+        let va = STACK_TOP - (i + 1) * PAGE_SIZE;
+        let frame = crate::mm::alloc_frame().ok_or(RootError::OutOfMemory)?;
+        map_one(&mut space, va, frame, PteFlags::USER_RW)?;
+    }
+
+    let info_frame = crate::mm::alloc_frame().ok_or(RootError::OutOfMemory)?;
+    map_one(&mut space, bootinfo::VADDR, info_frame, PteFlags::USER_RO)?;
+
+    let cnode_pa = alloc_aligned(CNODE_BITS).ok_or(RootError::OutOfMemory)?;
+    let tcb_pa = crate::mm::alloc_frame().ok_or(RootError::OutOfMemory)?;
+
+    // Every allocation the kernel makes for the root task is now behind us, so
+    // what is left is exactly what the root task gets.
+    let free = crate::mm::FRAMES.lock().remaining();
+
+    // SAFETY: `cnode_pa` is 2^CNODE_BITS bytes of memory we just took from the
+    // allocator, so nothing else refers to it.
+    unsafe { init_cnode(cnode_pa, CNODE_BITS) };
+    let cnode = RawCap {
+        kind: ObjectType::CNode,
+        rights: ALL,
+        size_bits: CNODE_BITS,
+        paddr: cnode_pa,
+        ..RawCap::NULL
+    };
+    let mut cs = CSpace::new(cnode)?;
+    let depth = cs.root_depth();
+
+    // The root CNode is not derived from any untyped the root task holds, so
+    // revoking one of them can no longer destroy the space it is stored in --
+    // the trap D-029 describes for a CSpace bootstrapped out of its own region.
+    cs.insert(bootinfo::slot::CNODE, depth, cnode, None)?;
+    cs.insert(
+        bootinfo::slot::VSPACE,
+        depth,
+        RawCap { asid: space.asid().as_u16(), ..vspace_cap(space.root()) },
+        None,
+    )?;
+    cs.insert(
+        bootinfo::slot::TCB,
+        depth,
+        RawCap {
+            kind: ObjectType::Tcb,
+            rights: ALL,
+            size_bits: PAGE_SHIFT as u8,
+            paddr: tcb_pa,
+            ..RawCap::NULL
+        },
+        None,
+    )?;
+    cs.insert(
+        bootinfo::slot::BOOTINFO,
+        depth,
+        RawCap {
+            kind: ObjectType::Frame,
+            rights: READ,
+            size_bits: PAGE_SHIFT as u8,
+            paddr: info_frame,
+            mapped_root: space.root(),
+            mapped_vaddr: bootinfo::VADDR,
+            ..RawCap::NULL
+        },
+        None,
+    )?;
+
+    let mut info = BootInfo {
+        cnode_radix: depth as u64,
+        cnode_slots: cs.root_slots() as u64,
+        image_start: image_start as u64,
+        image_end: image_end as u64,
+        stack_bottom: (STACK_TOP - STACK_PAGES * PAGE_SIZE) as u64,
+        stack_top: STACK_TOP as u64,
+        free_vaddr: FREE_VADDR as u64,
+        ..BootInfo::EMPTY
+    };
+
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for region in free.iter() {
+        for desc in split(*region) {
+            if count == bootinfo::MAX_UNTYPED || info.first_untyped + count as u64 >= info.cnode_slots
+            {
+                break;
+            }
+            cs.insert(
+                info.first_untyped + count as u64,
+                depth,
+                RawCap::untyped(PhysAddr::new(desc.paddr as usize), desc.size_bits, ALL),
+                None,
+            )?;
+            info.untyped[count] = desc;
+            bytes += desc.bytes();
+            count += 1;
+        }
+    }
+    info.untyped_count = count as u32;
+    info.first_free_slot = info.first_untyped + count as u64;
+
+    // SAFETY: `info_frame` is a frame we own, reachable through the direct map,
+    // and `BootInfo` fits in a page by construction.
+    unsafe { phys_to_virt(info_frame).as_mut_ptr::<BootInfo>().write(info) };
+
+    let id = crate::thread::next_id();
+    // SAFETY: `tcb_pa` came from the allocator, so nothing else has a TCB in it.
+    let mut tcb = unsafe {
+        Tcb::create(tcb_pa, id, &space, VirtAddr::new(elf.entry()), VirtAddr::new(STACK_TOP))
+    };
+    // SAFETY: we just made it; it is on no queue and nothing else refers to it.
+    unsafe { tcb.as_mut().cspace = cnode };
+    // SAFETY: a fully configured thread that is on no queue yet.
+    unsafe { crate::sched::admit(tcb) };
+
+    Ok(RootTask {
+        id,
+        entry: elf.entry(),
+        image: (image_start, image_end),
+        space,
+        cnode,
+        untypeds: count,
+        untyped_bytes: bytes,
+    })
+}
+
+/// Copy one `PT_LOAD` segment into fresh frames and map them.
+///
+/// Frames come out of the allocator zeroed, so the `.bss` tail — every byte
+/// between `p_filesz` and `p_memsz` — is already what it should be and nothing
+/// here has to zero anything.
+fn map_segment(space: &mut AddressSpace, seg: &Segment) -> Result<(), RootError> {
+    if seg.writable() && seg.executable() {
+        return Err(RootError::WriteExecute);
+    }
+    if seg.vaddr == 0 || seg.vaddr + seg.mem_size > bootinfo::VADDR {
+        return Err(RootError::BadAddress);
+    }
+
+    let mut flags = PteFlags::V | PteFlags::U | PteFlags::A;
+    if seg.readable() {
+        flags = flags | PteFlags::R;
+    }
+    if seg.writable() {
+        flags = flags | PteFlags::W | PteFlags::D;
+    }
+    if seg.executable() {
+        flags = flags | PteFlags::X;
+    }
+
+    let first = seg.vaddr & !(PAGE_SIZE - 1);
+    let last = seg.vaddr + seg.mem_size;
+    let mut va = first;
+    while va < last {
+        let frame = crate::mm::alloc_frame().ok_or(RootError::OutOfMemory)?;
+
+        // The part of this page the file has bytes for; the rest stays zero.
+        let from = va.max(seg.vaddr);
+        let to = (va + PAGE_SIZE).min(seg.vaddr + seg.data.len());
+        if to > from {
+            let src = &seg.data[from - seg.vaddr..to - seg.vaddr];
+            let dst = phys_to_virt(frame).as_mut_ptr::<u8>();
+            // SAFETY: `frame` is a page we own, reachable through the direct
+            // map, and `from - va` plus the length stays inside it.
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst.add(from - va), src.len()) };
+        }
+
+        map_one(space, va, frame, flags)?;
+        va += PAGE_SIZE;
+    }
+    Ok(())
+}
+
+fn map_one(
+    space: &mut AddressSpace,
+    va: usize,
+    frame: PhysAddr,
+    flags: PteFlags,
+) -> Result<(), RootError> {
+    if space.translate(VirtAddr::new(va)).is_some() {
+        return Err(RootError::OverlappingSegments);
+    }
+    let mut alloc = crate::mm::FRAMES.lock();
+    space
+        .map(VirtAddr::new(va), frame, 0, flags, &mut *alloc)
+        .map_err(|_| RootError::OutOfMemory)
+}
+
+/// Take 2^`bits` bytes of aligned, contiguous physical memory.
+///
+/// The bump allocator only hands out single frames, so this walks it forward
+/// until the cursor is aligned and then takes the run. Up to one object's worth
+/// of memory is skipped; at boot, once, that is cheaper than a real allocator.
+fn alloc_aligned(bits: u8) -> Option<PhysAddr> {
+    let size = 1usize << bits;
+    let mut first = crate::mm::alloc_frame()?;
+    while first.as_usize() & (size - 1) != 0 {
+        first = crate::mm::alloc_frame()?;
+    }
+    for _ in 1..(size / PAGE_SIZE) {
+        crate::mm::alloc_frame()?;
+    }
+    Some(first)
+}
+
+/// Cut a free region into the largest aligned power-of-two blocks that fit.
+///
+/// Public so a test can check the blocks tile the region exactly.
+///
+/// An untyped capability is a naturally aligned power of two, because retyping
+/// splits it in half and every object inside it must be aligned to its own size.
+pub fn split(region: Region) -> impl Iterator<Item = UntypedDesc> {
+    let mut start = region.start.as_usize();
+    let end = region.end.as_usize();
+    core::iter::from_fn(move || {
+        if start >= end {
+            return None;
+        }
+        let alignment = if start == 0 { MAX_UNTYPED_BITS } else { start.trailing_zeros() };
+        let remaining = usize::BITS - 1 - (end - start).leading_zeros();
+        let bits = alignment.min(remaining).min(MAX_UNTYPED_BITS);
+        if bits < PAGE_SHIFT as u32 {
+            return None;
+        }
+        let desc = UntypedDesc::new(start as u64, bits as u8, false);
+        start += 1usize << bits;
+        Some(desc)
+    })
+}

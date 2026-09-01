@@ -83,7 +83,7 @@ impl AddressSpace {
 
     /// The `satp` value that makes this space current.
     pub const fn satp(&self) -> usize {
-        SATP_SV39 | ((self.asid.as_u16() as usize) << SATP_ASID_SHIFT) | self.root().page_number()
+        satp_for(self.root(), self.asid)
     }
 
     /// Switch this hart onto this space.
@@ -166,4 +166,32 @@ pub fn kernel_half_fingerprint(kernel: &Mapper) -> u64 {
         acc = acc.rotate_left(7) ^ entry.bits();
     }
     acc
+}
+
+/// The `satp` that installs `root` under `asid`.
+///
+/// Separate from [`AddressSpace`] because a userspace-built address space is a
+/// retyped page table and a capability, not an `AddressSpace` value (D-037).
+pub const fn satp_for(root: PhysAddr, asid: Asid) -> usize {
+    SATP_SV39 | ((asid.as_u16() as usize) << SATP_ASID_SHIFT) | root.page_number()
+}
+
+/// Copy the kernel's root entries into a page table that is about to become an
+/// address space root.
+///
+/// Every user root table needs these: RISC-V does not switch `satp` on a trap,
+/// so the trap handler runs with the faulting thread's table installed and must
+/// be mapped in it (D-021).
+///
+/// # Safety
+/// `root` must be a page table object we own exclusively and that is not
+/// currently installed in `satp` on any hart.
+pub unsafe fn install_kernel_half(root: PhysAddr, kernel_root: PhysAddr) {
+    // SAFETY: both are live root tables reachable through the direct map, and
+    // the caller promised exclusive access to the destination.
+    unsafe {
+        let dst = &mut *super::phys_to_virt(root).as_mut_ptr::<super::page_table::PageTable>();
+        let src = &*super::phys_to_virt(kernel_root).as_ptr::<super::page_table::PageTable>();
+        dst.entries[KERNEL_ROOT_FIRST..].copy_from_slice(&src.entries[KERNEL_ROOT_FIRST..]);
+    }
 }

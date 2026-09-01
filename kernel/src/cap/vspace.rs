@@ -1,8 +1,8 @@
 //! Mapping invocations: what a userspace pager uses to install a page (D-035).
 
-use super::{CapError, ObjectType, RawCap, rights};
+use super::{CapError, ObjectType, RawCap, asid, rights};
 use crate::mm::page_table::{MapError, Mapper, PteFlags};
-use crate::mm::{PhysAddr, VirtAddr, flush_tlb_page};
+use crate::mm::{PhysAddr, VirtAddr, flush_tlb_page, install_kernel_half};
 
 /// Turn capability rights into page table permissions.
 ///
@@ -131,4 +131,39 @@ pub fn vspace_cap(root: PhysAddr) -> RawCap {
         paddr: root,
         ..RawCap::NULL
     }
+}
+
+/// Turn a retyped page table into an address space root (D-037).
+///
+/// Two things happen together, and neither is optional. The kernel's root
+/// entries are copied in, because RISC-V leaves `satp` alone on a trap and the
+/// handler must be mapped in whatever table faulted; and an ASID is bound, so
+/// switching to the space stops costing a full TLB flush (D-022, D-030).
+///
+/// seL4 fuses the same two steps into `ASIDPool_Assign`, and this is why: a
+/// table with an ASID but no kernel half would fault unrecoverably on its first
+/// trap, so making them separately invocable would be an invitation to a bug.
+pub fn assign(table: &mut RawCap) -> Result<(), CapError> {
+    if table.kind != ObjectType::PageTable {
+        return Err(CapError::WrongType {
+            wanted: ObjectType::PageTable,
+            found: table.kind,
+        });
+    }
+    if table.is_assigned() {
+        return Err(CapError::AlreadyAssigned);
+    }
+    // A table already installed somewhere is an intermediate level, not a root.
+    if table.mapping().is_some() {
+        return Err(CapError::AlreadyMapped);
+    }
+    let kernel_root = crate::mm::kernel_space::root().ok_or(CapError::NoKernelSpace)?;
+
+    // SAFETY: `table` names a page table object from the caller's CSpace that
+    // is mapped nowhere, so no hart has it installed in `satp`.
+    unsafe { install_kernel_half(table.paddr, kernel_root) };
+
+    let assigned = asid::assign_global().map_err(CapError::Asid)?;
+    table.asid = assigned.as_u16();
+    Ok(())
 }

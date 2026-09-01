@@ -11,65 +11,7 @@ use crate::sync::SpinLock;
 use crate::thread::{Tcb, ThreadId, ThreadState};
 use crate::trap::{Cause, TrapFrame, reg, return_to_user};
 
-/// The system call numbers.
-///
-/// Everything a thread can ask of a *kernel object* goes through `CALL` on a
-/// capability, with a label selecting the operation (D-032). These few numbers
-/// are the whole ambient surface; `PUTC` and `GET_ID` are M3 scaffolding that a
-/// console capability replaces in M7.
-pub mod syscall {
-    pub const YIELD: usize = 0;
-    pub const EXIT: usize = 1;
-    pub const PUTC: usize = 2;
-    pub const GET_ID: usize = 3;
-    /// Send and block until taken; no reply expected.
-    pub const SEND: usize = 4;
-    /// Block until a message arrives.
-    pub const RECV: usize = 5;
-    /// Send and block until replied to. The fast path.
-    pub const CALL: usize = 6;
-    /// Answer the caller whose reply capability we hold.
-    pub const REPLY: usize = 7;
-    /// Reply, then wait for the next message. What a server loop runs.
-    pub const REPLY_RECV: usize = 8;
-}
-
-/// Labels selecting an operation on a kernel object (D-032).
-///
-/// An endpoint never has its label read by the kernel: everything at or above
-/// [`label::APP_BASE`] is the application's own business.
-pub mod label {
-    /// Untyped: carve objects out of a region.
-    pub const RETYPE: u64 = 1;
-    /// CNode: copy a capability with reduced rights.
-    pub const MINT: u64 = 2;
-    /// CNode: destroy everything derived from a capability.
-    pub const REVOKE: u64 = 3;
-    /// CNode: destroy a capability and its derivatives.
-    pub const DELETE: u64 = 4;
-    /// Frame or PageTable: install into an address space.
-    pub const MAP: u64 = 5;
-    /// Frame or PageTable: remove whatever mapping it records.
-    pub const UNMAP: u64 = 6;
-    /// TCB: attach a fault endpoint.
-    pub const SET_FAULT_EP: u64 = 7;
-
-    /// What the kernel sends a pager when a thread faults (D-034).
-    pub const FAULT_VM: u64 = 0x100;
-
-    /// The first label the kernel does not interpret.
-    pub const APP_BASE: u64 = 0x1000;
-}
-
-/// What a syscall returns in `a0`.
-pub mod result {
-    pub const OK: usize = 0;
-    pub const ERR_BAD_CAP: usize = usize::MAX;
-    pub const ERR_BAD_LABEL: usize = usize::MAX - 1;
-    pub const ERR_NO_REPLY: usize = usize::MAX - 2;
-    pub const ERR_NO_CSPACE: usize = usize::MAX - 3;
-    pub const ERR_MAP: usize = usize::MAX - 4;
-}
+pub use abi::{label, result, syscall};
 
 /// Callee-saved state of the kernel context that called [`run`].
 #[repr(C)]
@@ -106,6 +48,34 @@ impl RunQueue {
         self.ready += 1;
     }
 
+    /// Take `tcb` off the queue wherever it sits. `Suspend` is the only caller:
+    /// everything else leaves through `pop`.
+    fn remove(&mut self, tcb: NonNull<Tcb>) -> bool {
+        let mut prev: Option<NonNull<Tcb>> = None;
+        let mut cursor = self.head;
+        while let Some(mut cur) = cursor {
+            // SAFETY: a live TCB, and the lock makes this the only writer.
+            let next = unsafe { cur.as_ref().next };
+            if cur == tcb {
+                match prev {
+                    // SAFETY: as above.
+                    Some(mut p) => unsafe { p.as_mut().next = next },
+                    None => self.head = next,
+                }
+                if self.tail == Some(cur) {
+                    self.tail = prev;
+                }
+                // SAFETY: as above.
+                unsafe { cur.as_mut().next = None };
+                self.ready -= 1;
+                return true;
+            }
+            prev = Some(cur);
+            cursor = next;
+        }
+        false
+    }
+
     fn pop(&mut self) -> Option<NonNull<Tcb>> {
         let mut head = self.head?;
         // Counted, not for statistics: invariant 4 says a call/reply pair must
@@ -123,7 +93,6 @@ impl RunQueue {
 }
 
 static QUEUE: SpinLock<RunQueue> = SpinLock::new(RunQueue::new());
-static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 static KERNEL_CTX: SpinLock<KernelContext> = SpinLock::new(KernelContext::new_const());
 static SPAWNED: AtomicUsize = AtomicUsize::new(0);
 static EXITED: AtomicUsize = AtomicUsize::new(0);
@@ -211,7 +180,7 @@ pub fn spawn_full(
     fault_ep: RawCap,
 ) -> Result<ThreadId, SpawnError> {
     let frame = crate::mm::alloc_frame().ok_or(SpawnError::OutOfFrames)?;
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let id = crate::thread::next_id();
 
     // SAFETY: `frame` came from the allocator, so we own it and nothing else
     // has a TCB in it.
@@ -225,6 +194,18 @@ pub fn spawn_full(
     QUEUE.lock().push(tcb);
     SPAWNED.fetch_add(1, Ordering::Relaxed);
     Ok(id)
+}
+
+/// Put a thread on the run queue directly.
+///
+/// The root task's thread arrives this way, because at boot there is no CSpace
+/// to invoke `Resume` through. Everything after it is started by its parent.
+///
+/// # Safety
+/// `tcb` must be a live, fully configured thread that is on no queue.
+pub unsafe fn admit(tcb: NonNull<Tcb>) {
+    QUEUE.lock().push(tcb);
+    SPAWNED.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn ready_count() -> usize {
@@ -514,6 +495,7 @@ fn invoke(tcb: &mut Tcb, is_call: bool) -> ! {
         ObjectType::Untyped => invoke_untyped(tcb, cs, cptr, info),
         ObjectType::CNode => invoke_cnode(tcb, cs, cptr, info),
         ObjectType::Frame | ObjectType::PageTable => invoke_mapping(tcb, cs, cptr, info),
+        ObjectType::Tcb => invoke_tcb(tcb, cs, cap, info),
         _ => finish(tcb, result::ERR_BAD_CAP),
     }
 }
@@ -808,7 +790,103 @@ fn invoke_mapping(tcb: &mut Tcb, cs: CSpace, cptr: u64, info: MessageInfo) -> ! 
             let cap = unsafe { &mut target.clone().as_mut().cap };
             finish(tcb, crate::cap::vspace::unmap(cap).map_or(result::ERR_MAP, |()| result::OK))
         }
+        label::ASSIGN => {
+            // SAFETY: as above.
+            let cap = unsafe { &mut target.clone().as_mut().cap };
+            let outcome = crate::cap::vspace::assign(cap);
+            finish(tcb, outcome.map_or_else(cap_result, |()| result::OK))
+        }
         _ => finish(tcb, result::ERR_BAD_LABEL),
+    }
+}
+
+/// Turn a capability-layer error into the number userspace sees in `a0`.
+fn cap_result(e: CapError) -> usize {
+    match e {
+        CapError::SelfInvocation | CapError::NotInactive => result::ERR_STATE,
+        CapError::NotAssigned | CapError::AlreadyAssigned | CapError::Asid(_) => result::ERR_ASID,
+        CapError::AlreadyMapped | CapError::Map(_) => result::ERR_MAP,
+        _ => result::ERR_BAD_CAP,
+    }
+}
+
+/// The thread invocations: `Configure`, `SetFaultEP`, `WriteRegisters`,
+/// `Resume` and `Suspend` (D-037).
+///
+/// This is what replaces `sched::spawn` for anything userspace builds. The
+/// kernel no longer decides who may create a thread; holding untyped memory and
+/// a free slot is the whole qualification.
+fn invoke_tcb(tcb: &mut Tcb, cs: CSpace, cap: RawCap, info: MessageInfo) -> ! {
+    let depth = cs.root_depth();
+    let typed = match crate::cap::tcb::check(cap, tcb) {
+        Ok(t) => t,
+        Err(e) => finish(tcb, cap_result(e)),
+    };
+    // SAFETY: `check` proved this is a live TCB capability naming a thread
+    // other than the caller, so this is the only live reference to it -- the
+    // single-hart invariant does the rest.
+    let target = unsafe { crate::cap::tcb::tcb_at(typed.raw()) };
+
+    let outcome = match info.label() {
+        label::CONFIGURE => {
+            let cspace = cs.read(tcb.frame.x[reg::A0 + 2] as u64, depth);
+            let vspace = cs.read(tcb.frame.x[reg::A0 + 3] as u64, depth);
+            let fault_ep = cs.read(tcb.frame.x[reg::A0 + 4] as u64, depth);
+            match (cspace, vspace, fault_ep) {
+                (Ok(c), Ok(v), Ok(f)) => crate::cap::tcb::configure(target, c, v, f),
+                _ => Err(CapError::Null),
+            }
+        }
+        label::SET_FAULT_EP => match cs.read(tcb.frame.x[reg::A0 + 2] as u64, depth) {
+            Ok(ep) => crate::cap::tcb::set_fault_ep(target, ep),
+            Err(e) => Err(e),
+        },
+        label::WRITE_REGISTERS => crate::cap::tcb::write_registers(
+            target,
+            VirtAddr::new(tcb.frame.x[reg::A0 + 2]),
+            VirtAddr::new(tcb.frame.x[reg::A0 + 3]),
+        ),
+        label::RESUME => resume(target, typed.raw()),
+        label::SUSPEND => suspend(target, typed.raw()),
+        _ => finish(tcb, result::ERR_BAD_LABEL),
+    };
+    finish(tcb, outcome.map_or_else(cap_result, |()| result::OK))
+}
+
+/// Put a configured thread on the run queue.
+fn resume(target: &mut Tcb, cap: &RawCap) -> Result<(), CapError> {
+    if !target.is_configured() {
+        return Err(CapError::NotAssigned);
+    }
+    if target.state != ThreadState::Inactive {
+        return Err(CapError::NotInactive);
+    }
+    target.state = ThreadState::Ready;
+    // SAFETY: the thread was inactive, so it is on no queue and no hart.
+    let ptr = unsafe { crate::cap::tcb::tcb_ptr(cap) };
+    QUEUE.lock().push(ptr);
+    SPAWNED.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Take a runnable thread off the run queue.
+///
+/// `Running` cannot appear here: with one hart the only running thread is the
+/// caller, and a thread invoking its own capability was already refused. A
+/// thread blocked on an endpoint is refused outright, because a TCB does not
+/// record *which* endpoint it is queued on and half-suspending it would leave a
+/// dangling entry on that queue.
+fn suspend(target: &mut Tcb, cap: &RawCap) -> Result<(), CapError> {
+    match target.state {
+        ThreadState::Inactive => Ok(()),
+        ThreadState::Ready => {
+            // SAFETY: a live TCB from a capability; the lock serialises the queue.
+            let ptr = unsafe { crate::cap::tcb::tcb_ptr(cap) };
+            QUEUE.lock().remove(ptr);
+            target.state = ThreadState::Inactive;
+            Ok(())
+        }
+        _ => Err(CapError::NotInactive),
     }
 }
 

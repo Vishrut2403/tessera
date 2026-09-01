@@ -2,11 +2,9 @@
 target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
+# Nothing here may be crate-specific: it applies to the kernel, the ABI crate
+# and every user program alike. Linker scripts live in each crate's build.rs.
 rustflags = [
-    # Path is relative to the workspace root: run cargo from there.
-    "-C", "link-arg=-Tkernel/link.ld",
-    # Link map next to the ELF.
-    "-C", "link-arg=-Map=target/kernel.map",
     # Frame pointers keep gdb backtraces working through naked/asm frames.
     "-C", "force-frame-pointers=yes",
 ]

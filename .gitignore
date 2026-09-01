@@ -1,5 +1,8 @@
-# Build output. `-Map=target/kernel.map` from .cargo/config.toml lands here too.
+# Build output. `-Map=target/kernel.map` from kernel/build.rs lands here too.
 /target
+# `user/` is its own workspace, so it has its own build directory. The nested
+# build from kernel/build.rs writes into OUT_DIR; this is for building it by hand.
+/user/target
 
 # Device tree dumps from `qemu-system-riscv64 -machine dumpdtb=virt.dtb`.
 # Regenerated on demand, never edited by hand.

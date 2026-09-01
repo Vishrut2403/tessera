@@ -8,24 +8,26 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-SRC="${1:-$ROOT/kernel/src}"
+# The TCB is the kernel plus the ABI crate it links. `user/` is deliberately
+# absent: it is unprivileged, and counting it would flatter the number.
+SRC="${1:-$ROOT/kernel/src $ROOT/abi/src}"
 
 # One awk process, so the running totals in END are correct.
 # shellcheck disable=SC2046
-awk '
+awk -v root="$ROOT/" '
 function report(file, total, unsafe_lines, regions) {
-    printf "  %-28s %6d %8d %7d %8.1f%%\n", file, total, unsafe_lines, regions,
+    printf "  %-30s %6d %8d %7d %8.1f%%\n", file, total, unsafe_lines, regions,
            (total ? unsafe_lines * 100.0 / total : 0)
 }
 BEGIN {
-    printf "\n  %-28s %6s %8s %7s %9s\n", "file", "lines", "unsafe", "regions", "share"
-    printf "  %-28s %6s %8s %7s %9s\n", \
-        "----------------------------", "------", "--------", "-------", "---------"
+    printf "\n  %-30s %6s %8s %7s %9s\n", "file", "lines", "unsafe", "regions", "share"
+    printf "  %-30s %6s %8s %7s %9s\n", \
+        "------------------------------", "------", "--------", "-------", "---------"
 }
 FNR == 1 {
     if (NR > 1) report(shortname, f_total, f_unsafe, f_regions)
     shortname = FILENAME
-    sub(/^.*\/kernel\//, "", shortname)
+    sub(root, "", shortname)
     f_total = 0; f_unsafe = 0; f_regions = 0
     in_unsafe = 0; depth = 0; opened = 0
 }
@@ -57,10 +59,14 @@ FNR == 1 {
 }
 END {
     report(shortname, f_total, f_unsafe, f_regions)
-    printf "  %-28s %6s %8s %7s %9s\n", \
-        "----------------------------", "------", "--------", "-------", "---------"
+    printf "  %-30s %6s %8s %7s %9s\n", \
+        "------------------------------", "------", "--------", "-------", "---------"
     report("TOTAL", total, unsafe_total, regions)
     printf "\n  TCB: %d lines, %d of them unsafe (%.1f%%), in %d regions.\n\n", \
         total, unsafe_total, (total ? unsafe_total * 100.0 / total : 0), regions
 }
-' $(find "$SRC" -name '*.rs' | sort)
+' $(find $SRC -name '*.rs' | sort)
+
+# Userspace, for contrast: outside the TCB, and not counted above.
+USER=$(find "$ROOT/user/src" -name '*.rs' -exec cat {} + | grep -cve '^[[:space:]]*$' -e '^[[:space:]]*//')
+printf "  Userspace (outside the TCB): %d lines in user/src.\n\n" "$USER" 

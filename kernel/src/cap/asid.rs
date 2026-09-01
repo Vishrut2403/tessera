@@ -1,8 +1,9 @@
 //! The ASID pool: what D-022 deferred until there was an object model.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::mm::address_space::{AddressSpace, Asid};
+use crate::sync::SpinLock;
 
 /// ASIDs the pool hands out. `satp.ASID` is 16 bits on RV64, but a hart need
 /// not implement all of them, so the width is probed rather than assumed.
@@ -24,9 +25,9 @@ pub enum AsidError {
 /// A pool of address space identifiers.
 ///
 /// In seL4 this is a capability object, and an address space with no ASID
-/// assigned cannot be activated at all. Here it is the kernel object M4 makes
-/// it; wiring it to a capability slot is the same `retype` path as anything
-/// else once there is a syscall to invoke it (M5).
+/// assigned cannot be activated at all. Here the second half holds -- M7a's
+/// `Configure` refuses an unassigned space -- but the pool itself is still a
+/// kernel-global, drawn from through [`assign_global`] (D-037).
 pub struct AsidPool {
     /// One bit per ASID; bit `n` set means `FIRST_ASID + n` is in use.
     used: u64,
@@ -58,6 +59,13 @@ impl AsidPool {
         crate::mm::flush_tlb_all();
 
         (((readback & ASID_MASK) >> 44) as u16).count_ones() as u8
+    }
+
+    /// Re-open the pool at the hart's real ASID width, forgetting every
+    /// assignment. Only the boot path calls this.
+    pub fn reset(&mut self, bits: u8) {
+        self.used = 0;
+        self.bits = bits;
     }
 
     pub const fn capacity(&self) -> usize {
@@ -141,4 +149,46 @@ pub fn bits() -> u8 {
         u64::MAX => 0,
         n => n as u8,
     }
+}
+
+/// The kernel-global pool userspace draws from.
+///
+/// **This is ambient authority**, and deliberately so for now: in seL4 an ASID
+/// pool is an object and a task can only assign as many address spaces as its
+/// pool capability covers, which is what stops one task exhausting a shared
+/// resource. Here any holder of a root page table can take an ASID. With three
+/// tasks that buys nothing, and it is tracked with `PUTC`/`GET_ID` as the
+/// remaining ambient authority to remove (D-037).
+static POOL: SpinLock<AsidPool> = SpinLock::new(AsidPool::new(0));
+
+static POOL_READY: AtomicBool = AtomicBool::new(false);
+
+/// Probe the hart's ASID width and open the global pool.
+///
+/// Called on first use rather than from a boot sequence: an `Assign` that
+/// silently handed out ASID 0 because nobody had initialised the pool would be
+/// a boot-ordering bug with no symptom until two address spaces aliased in the
+/// TLB.
+pub fn init_pool() -> u8 {
+    let bits = init();
+    if !POOL_READY.swap(true, Ordering::Relaxed) {
+        POOL.lock().reset(bits);
+    }
+    bits
+}
+
+/// Take an ASID from the global pool.
+pub fn assign_global() -> Result<Asid, AsidError> {
+    init_pool();
+    POOL.lock().allocate()
+}
+
+/// Give one back.
+pub fn release_global(asid: Asid) {
+    POOL.lock().release(asid);
+}
+
+/// How many ASIDs the global pool has handed out.
+pub fn global_in_use() -> u32 {
+    POOL.lock().in_use()
 }

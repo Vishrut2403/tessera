@@ -1,0 +1,17 @@
+[package]
+name    = "tessera-abi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "abi"
+path = "src/lib.rs"
+# No host test harness: this crate only builds for the bare-metal target, and
+# what it defines is exercised by the kernel's own bootable tests.
+test    = false
+doctest = false
+
+# Deliberately empty, and it must stay that way: this crate is the only thing
+# both the kernel and userspace link, so anything it depends on is in the TCB.
+[dependencies]
