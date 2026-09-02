@@ -93,7 +93,6 @@ fn user_space(words: &[u32]) -> AddressSpace {
     space.map(VirtAddr::new(TEXT), text, 0, PteFlags::USER_RX, &mut *alloc).expect("text");
     space.map(VirtAddr::new(STACK), stack, 0, PteFlags::USER_RW, &mut *alloc).expect("stack");
     // The kernel-built spaces the older tests use are still born on ASID 0.
-    // `configure` refuses those, and rightly so, so give this one a real ASID.
     space.set_asid(kernel::cap::asid::assign_global().expect("asid"));
     space
 }
@@ -280,8 +279,7 @@ fn child_program() -> Prog<16> {
 }
 
 /// The parent: configure the child's TCB, give it an entry point and a stack,
-/// and resume it. Every step is a `CALL` on a capability -- the kernel is never
-/// asked to create a thread, only to act on one that already exists.
+/// and resume it.
 fn parent_program() -> Prog<64> {
     let configure = MessageInfo::new(sched::label::CONFIGURE, 3, false).bits() as u32;
     let write_regs = MessageInfo::new(sched::label::WRITE_REGISTERS, 2, false).bits() as u32;
@@ -317,8 +315,7 @@ fn a_thread_created_by_retyping_and_started_by_invocation_runs() {
 
     // The child's address space is still built kernel-side: retyping page
     // tables and mapping a program into them from userspace is M7b's job, once
-    // there is a real program to load. What is under test here is that the
-    // *thread* comes from a capability, not from `sched::spawn`.
+    // there is a real program to load.
     let child_space = user_space(child_program().as_slice());
     let mut vspace = vspace_cap(child_space.root());
     vspace.asid = child_space.asid().as_u16();

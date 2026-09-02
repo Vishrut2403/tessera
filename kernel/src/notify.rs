@@ -1,15 +1,4 @@
 //! Notifications: the asynchronous half of IPC (D-041).
-//!
-//! An endpoint is a rendezvous — both ends block until the other arrives. That
-//! is exactly wrong for an interrupt, which has no thread behind it and cannot
-//! wait for anyone. A notification is the other shape: signalling never blocks,
-//! and what it leaves behind is a word of badges rather than a message.
-//!
-//! Signals between two waits collapse into one wake, because the word is OR'd
-//! rather than counted. A device that interrupts faster than its driver runs
-//! therefore accumulates nothing in the kernel — and for a level-triggered
-//! device "how many" was never the question anyway: the driver re-reads the
-//! status register to find out what happened.
 
 use core::ptr::NonNull;
 
@@ -21,9 +10,7 @@ use crate::thread::Tcb;
 pub struct Notification {
     /// Badges of every signal since the last wait, OR'd together.
     pub word: u64,
-    /// Whether anything has been signalled at all. Separate from `word` so an
-    /// unbadged signal still wakes a later waiter: testing `word != 0` would
-    /// silently lose every signal carrying a badge of zero.
+    /// Whether anything has been signalled at all.
     pub pending: bool,
     head: Option<NonNull<Tcb>>,
     tail: Option<NonNull<Tcb>>,
@@ -40,9 +27,6 @@ impl Notification {
     }
 
     /// Record a signal that nobody was waiting for.
-    ///
-    /// OR'd rather than counted, so signals between two waits collapse into one
-    /// wake and the kernel accumulates nothing unbounded.
     pub const fn post(&mut self, badge: u64) {
         self.word |= badge;
         self.pending = true;

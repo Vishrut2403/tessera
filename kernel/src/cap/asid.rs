@@ -5,13 +5,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::mm::address_space::{AddressSpace, Asid};
 use crate::sync::SpinLock;
 
-/// ASIDs the pool hands out. `satp.ASID` is 16 bits on RV64, but a hart need
-/// not implement all of them, so the width is probed rather than assumed.
+/// ASIDs the pool hands out.
 pub const MAX_ASIDS: usize = 64;
 
 /// ASID 0 is what every address space uses before it is assigned one, so the
-/// pool never hands it out: two spaces sharing it would be indistinguishable
-/// to the TLB, which is the exact bug ASIDs exist to prevent.
+/// pool never hands it out: two spaces sharing it would be indistinguishable to
+/// the TLB, which is the exact bug ASIDs exist to prevent.
 const FIRST_ASID: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,11 +22,6 @@ pub enum AsidError {
 }
 
 /// A pool of address space identifiers.
-///
-/// In seL4 this is a capability object, and an address space with no ASID
-/// assigned cannot be activated at all. Here the second half holds -- M7a's
-/// `Configure` refuses an unassigned space -- but the pool itself is still a
-/// kernel-global, drawn from through [`assign_global`] (D-037).
 pub struct AsidPool {
     /// One bit per ASID; bit `n` set means `FIRST_ASID + n` is in use.
     used: u64,
@@ -40,9 +34,6 @@ impl AsidPool {
     }
 
     /// How many ASID bits this hart actually implements.
-    ///
-    /// The spec lets an implementation hardwire any of them to zero, so the way
-    /// to find out is to write all ones and read back what stuck.
     pub fn probe_bits() -> u8 {
         let original = crate::csr::satp::read();
         const ASID_MASK: usize = 0xffff << 44;
@@ -62,7 +53,7 @@ impl AsidPool {
     }
 
     /// Re-open the pool at the hart's real ASID width, forgetting every
-    /// assignment. Only the boot path calls this.
+    /// assignment.
     pub fn reset(&mut self, bits: u8) {
         self.used = 0;
         self.bits = bits;
@@ -95,9 +86,7 @@ impl AsidPool {
     }
 
     /// Give an ASID back.
-    ///
-    /// The TLB may still hold translations tagged with it, and the next holder
-    /// must not see them, so the entries go before the number is reusable.
+    /// Stale TLB entries go first: the next holder must not see them.
     pub fn release(&mut self, asid: Asid) {
         let Some(index) = asid.as_u16().checked_sub(FIRST_ASID) else { return };
         if (index as usize) < self.capacity() {
@@ -117,10 +106,6 @@ impl AsidPool {
 }
 
 /// Invalidate every translation tagged with `asid`, on this hart.
-///
-/// The kernel's own mappings carry `G`, and a global entry is not tied to an
-/// ASID, so this leaves them in place — which is the whole reason the kernel
-/// half is marked global.
 pub fn flush_asid(asid: Asid) {
     // SAFETY: `sfence.vma zero, rs2` invalidates the entries for one ASID and
     // has no effect beyond the TLB.
@@ -152,23 +137,11 @@ pub fn bits() -> u8 {
 }
 
 /// The kernel-global pool userspace draws from.
-///
-/// **This is ambient authority**, and deliberately so for now: in seL4 an ASID
-/// pool is an object and a task can only assign as many address spaces as its
-/// pool capability covers, which is what stops one task exhausting a shared
-/// resource. Here any holder of a root page table can take an ASID. With three
-/// tasks that buys nothing, and it is tracked with `PUTC`/`GET_ID` as the
-/// remaining ambient authority to remove (D-037).
 static POOL: SpinLock<AsidPool> = SpinLock::new(AsidPool::new(0));
 
 static POOL_READY: AtomicBool = AtomicBool::new(false);
 
 /// Probe the hart's ASID width and open the global pool.
-///
-/// Called on first use rather than from a boot sequence: an `Assign` that
-/// silently handed out ASID 0 because nobody had initialised the pool would be
-/// a boot-ordering bug with no symptom until two address spaces aliased in the
-/// TLB.
 pub fn init_pool() -> u8 {
     let bits = init();
     if !POOL_READY.swap(true, Ordering::Relaxed) {

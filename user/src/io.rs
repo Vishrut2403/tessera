@@ -1,8 +1,4 @@
 //! Printing, over the ambient `PUTC` syscall.
-//!
-//! `PUTC` names no capability, which makes it the last piece of ambient
-//! authority a user program has. A console capability replaces it, and then
-//! this file changes and nothing else does (D-032).
 
 use core::fmt::{self, Write};
 

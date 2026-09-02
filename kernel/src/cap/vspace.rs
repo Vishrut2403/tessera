@@ -5,11 +5,7 @@ use crate::mm::page_table::{MapError, Mapper, PteFlags};
 use crate::mm::{PhysAddr, VirtAddr, flush_tlb_page, install_kernel_half};
 
 /// Turn capability rights into page table permissions.
-///
-/// `U` is unconditional: these are mappings a pager installs into a *user*
-/// address space, and one without it would be a page the owner cannot touch.
-/// `G` is never set — a global user mapping would survive an ASID switch and
-/// leak into another process (D-025).
+/// `U` always, `G` never: a global user mapping would outlive an ASID (D-025).
 pub fn flags_for(rights: u8, executable: bool) -> PteFlags {
     let mut flags = PteFlags::V.union(PteFlags::U).union(PteFlags::A);
     if rights & rights::READ != 0 {
@@ -35,11 +31,6 @@ pub unsafe fn mapper_for(cap: &RawCap) -> Mapper {
 }
 
 /// Install `frame` into the address space `vspace` names, at `vaddr`.
-///
-/// The mapping is recorded **in the frame capability**, which is the whole
-/// reason `Map` is invoked on the frame rather than on the address space
-/// (D-034): revocation walks the derivation tree and needs to find, from a
-/// capability alone, what to tear down.
 pub fn map_frame(
     frame: &mut RawCap,
     vspace: &RawCap,
@@ -98,10 +89,6 @@ pub fn map_table(
 }
 
 /// Remove whatever mapping a capability records, if any.
-///
-/// Used by `Unmap` and, more importantly, by revocation: a capability that is
-/// destroyed while still mapped would leave the holder with access to memory it
-/// no longer has a capability for (D-034).
 pub fn unmap(cap: &mut RawCap) -> Result<(), CapError> {
     let Some((root, vaddr)) = cap.mapping() else {
         return Ok(());
@@ -134,15 +121,6 @@ pub fn vspace_cap(root: PhysAddr) -> RawCap {
 }
 
 /// Turn a retyped page table into an address space root (D-037).
-///
-/// Two things happen together, and neither is optional. The kernel's root
-/// entries are copied in, because RISC-V leaves `satp` alone on a trap and the
-/// handler must be mapped in whatever table faulted; and an ASID is bound, so
-/// switching to the space stops costing a full TLB flush (D-022, D-030).
-///
-/// seL4 fuses the same two steps into `ASIDPool_Assign`, and this is why: a
-/// table with an ASID but no kernel half would fault unrecoverably on its first
-/// trap, so making them separately invocable would be an invitation to a bug.
 pub fn assign(table: &mut RawCap) -> Result<(), CapError> {
     if table.kind != ObjectType::PageTable {
         return Err(CapError::WrongType {

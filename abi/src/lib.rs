@@ -1,9 +1,5 @@
 //! The tessera system-call interface: everything the kernel and userspace must
 //! agree on, and nothing else (D-038).
-//!
-//! Both sides link this crate, so a label or a rights bit has exactly one
-//! definition. It has no dependencies and never will: whatever it links, the
-//! kernel links, and the trusted computing base is a number we quote.
 
 #![no_std]
 
@@ -20,11 +16,6 @@ pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SHIFT: usize = 12;
 
 /// The system call numbers.
-///
-/// Everything a thread can ask of a *kernel object* goes through `CALL` on a
-/// capability, with a label selecting the operation (D-032). These few numbers
-/// are the whole ambient surface; `PUTC` and `GET_ID` are M3 scaffolding that a
-/// console capability replaces.
 pub mod syscall {
     pub const YIELD: usize = 0;
     pub const EXIT: usize = 1;
@@ -43,9 +34,6 @@ pub mod syscall {
 }
 
 /// Labels selecting an operation on a kernel object (D-032).
-///
-/// An endpoint never has its label read by the kernel: everything at or above
-/// [`label::APP_BASE`] is the application's own business.
 pub mod label {
     /// Untyped: carve objects out of a region.
     pub const RETYPE: u64 = 1;
@@ -79,8 +67,8 @@ pub mod label {
     pub const IRQ_ACK: u64 = 16;
 
     /// Frame: where it physically is, for a device that does not walk page
-    /// tables. Needs `WRITE`, because a physical address is what lets a holder
-    /// aim a bus master at memory it has no capability for (D-040).
+    /// tables.
+    /// Needs `WRITE`: a physical address aims a bus master (D-040).
     pub const GET_ADDRESS: u64 = 13;
 
     /// What the kernel sends a pager when a thread faults (D-034).
@@ -105,9 +93,6 @@ pub mod result {
     pub const ERR_ASID: usize = usize::MAX - 6;
 
     /// Whether `a0` came back as one of the error codes above.
-    ///
-    /// Errors are the top few values, so anything at or below this is a real
-    /// return value -- a thread id, a byte count, a message length.
     pub const fn is_err(a0: usize) -> bool {
         a0 >= ERR_ASID
     }

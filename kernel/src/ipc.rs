@@ -12,8 +12,7 @@ pub use abi::msg::{MSG_REGS, MessageInfo};
 /// Registers `a2..a5` carry the message; `a0` and `a1` carry the header.
 const MR_BASE: usize = reg::A0 + 2;
 
-/// What an endpoint is doing. It never has senders and receivers queued at the
-/// same time: whichever arrives second is matched immediately.
+/// What an endpoint is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EndpointState {
@@ -77,16 +76,11 @@ impl Endpoint {
     }
 
     /// Whether anyone is queued for `wanted`, without disturbing the order.
-    ///
-    /// `reply_recv` needs to know whether a sender is already waiting before it
-    /// decides who gets the hart. Answering that by dequeuing and re-enqueuing
-    /// would move the head to the tail and quietly break FIFO delivery.
     pub fn has_waiting(&self, wanted: EndpointState) -> bool {
         self.state == wanted && self.head.is_some()
     }
 
-    /// Remove `tcb` from this queue wherever it is. Needed when a blocked
-    /// thread is destroyed rather than woken.
+    /// Remove `tcb` from this queue wherever it is.
     ///
     /// # Safety
     /// As [`dequeue`].
@@ -140,10 +134,6 @@ pub unsafe fn init_endpoint(paddr: PhysAddr) {
 }
 
 /// Copy the message registers from one thread's frame to another's.
-///
-/// This is the whole of the fast path's data movement: four words, register to
-/// register, with no buffer to bound-check and no memory the sender can change
-/// after the header has been read.
 #[inline(always)]
 pub fn transfer(from: &Tcb, to: &mut Tcb, info: MessageInfo, badge: u64) {
     for i in 0..info.length() {
@@ -161,10 +151,6 @@ pub fn message_of(tcb: &Tcb) -> MessageInfo {
 }
 
 /// A one-shot capability naming the thread waiting for a reply.
-///
-/// The `paddr` is the caller's TCB, which is how `reply` finds it without a
-/// lookup. Rights are READ only: a reply is used, not delegated onward with
-/// more authority than it arrived with.
 pub fn reply_cap(caller: PhysAddr) -> RawCap {
     RawCap {
         kind: ObjectType::Reply,

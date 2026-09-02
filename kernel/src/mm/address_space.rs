@@ -44,10 +44,8 @@ impl From<MapError> for AddressSpaceError {
     }
 }
 
-/// A user address space: an empty lower half over a shared copy of the kernel's.
-///
-/// There is no `Drop`. Reclaiming the page table frames needs an allocator that
-/// can free, which arrives in M4 with untyped memory and revocation (D-014).
+/// A user address space: an empty lower half over a shared copy of the
+/// kernel's.
 pub struct AddressSpace {
     mapper: Mapper,
     asid: Asid,
@@ -169,19 +167,12 @@ pub fn kernel_half_fingerprint(kernel: &Mapper) -> u64 {
 }
 
 /// The `satp` that installs `root` under `asid`.
-///
-/// Separate from [`AddressSpace`] because a userspace-built address space is a
-/// retyped page table and a capability, not an `AddressSpace` value (D-037).
 pub const fn satp_for(root: PhysAddr, asid: Asid) -> usize {
     SATP_SV39 | ((asid.as_u16() as usize) << SATP_ASID_SHIFT) | root.page_number()
 }
 
 /// Copy the kernel's root entries into a page table that is about to become an
 /// address space root.
-///
-/// Every user root table needs these: RISC-V does not switch `satp` on a trap,
-/// so the trap handler runs with the faulting thread's table installed and must
-/// be mapped in it (D-021).
 ///
 /// # Safety
 /// `root` must be a page table object we own exclusively and that is not

@@ -1,12 +1,5 @@
 //! Thread invocations: what makes a thread an object rather than a kernel
 //! privilege (D-037).
-//!
-//! A TCB comes out of `retype` inactive — no address space, no CSpace, no entry
-//! point — and the three of those arrive through invocations on the capability.
-//! Until M7 the kernel built threads itself in `sched::spawn`, which meant the
-//! kernel decided who could make one. Now the answer is "whoever holds untyped
-//! memory and a slot to put the capability in", which is the answer the whole
-//! architecture wanted.
 
 use core::ptr::NonNull;
 
@@ -40,12 +33,6 @@ pub unsafe fn tcb_ptr(cap: &RawCap) -> NonNull<Tcb> {
 
 /// The one runtime check every invocation shares: right kind, right rights, and
 /// not the caller's own thread.
-///
-/// Self-invocation is refused rather than special-cased. The caller is already
-/// borrowed as `&mut Tcb` by the trap path, so reaching it a second time
-/// through its own capability would be two live mutable references to one
-/// thread. Suspending yourself is a reasonable thing to want and is simply not
-/// offered yet.
 pub fn check(cap: RawCap, caller: &Tcb) -> Result<TcbCap, CapError> {
     let typed = TcbCap::from_raw(cap)?;
     if cap.paddr == caller.self_paddr {
@@ -55,11 +42,6 @@ pub fn check(cap: RawCap, caller: &Tcb) -> Result<TcbCap, CapError> {
 }
 
 /// Give a thread an address space, a capability space, and a pager.
-///
-/// Only an inactive thread can be configured. That is not caution: an inactive
-/// thread is on no run queue and no endpoint queue and is not current on any
-/// hart, so it is the one state in which rewriting its `satp` cannot pull the
-/// ground out from under a thread that is running or about to be resumed.
 pub fn configure(
     target: &mut Tcb,
     cspace: RawCap,
@@ -100,10 +82,6 @@ pub fn set_fault_ep(target: &mut Tcb, fault_ep: RawCap) -> Result<(), CapError> 
 }
 
 /// Set where the thread starts and what stack it starts on.
-///
-/// Refused while the thread is blocked: its registers are the message it is
-/// waiting to send or the reply it is waiting to receive, and rewriting them
-/// would corrupt an IPC in flight.
 pub fn write_registers(
     target: &mut Tcb,
     entry: VirtAddr,

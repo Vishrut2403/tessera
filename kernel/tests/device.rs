@@ -79,8 +79,7 @@ fn no_device_region_overlaps_ram() {
 
 #[test_case]
 fn the_kernels_own_devices_are_not_handed_out() {
-    // The console and the shutdown register. Handing either to userspace would
-    // put the kernel's own hardware in someone else's address space.
+    // The console and the shutdown register.
     let m = map();
     for (name, pa) in mm::kernel_space::DEVICES {
         assert!(
@@ -93,8 +92,7 @@ fn the_kernels_own_devices_are_not_handed_out() {
 #[test_case]
 fn the_virtio_transports_are_each_their_own_region() {
     // QEMU virt puts eight virtio-mmio transports at 0x1000_1000 upward, one
-    // page each. They must stay eight capabilities, not one coalesced block:
-    // retyping the untyped for a transport has to hand you *that* transport.
+    // page each.
     let m = map();
     for i in 0..8 {
         let base = 0x1000_1000 + i * PAGE_SIZE;
@@ -110,8 +108,8 @@ fn the_virtio_transports_are_each_their_own_region() {
 #[test_case]
 fn the_uart_is_grown_to_a_page_but_still_excluded() {
     // Its `reg` is 0x100 long, which page-aligns outward onto the UART page --
-    // and that page is the kernel's, so the region must be gone entirely
-    // rather than trimmed to nothing and silently kept.
+    // and that page is the kernel's, so the region must be gone entirely rather
+    // than trimmed to nothing and silently kept.
     assert!(
         !map().devices.iter().any(|d| d.contains(PhysAddr::new(kernel::uart::UART0_PHYS))),
         "the console page survived into the device list"
@@ -148,8 +146,7 @@ fn a_device_untyped_becomes_a_smaller_device_untyped() {
 #[test_case]
 fn a_device_untyped_becomes_nothing_the_kernel_writes() {
     // A CNode, a TCB, an endpoint and a page table are all memory the *kernel*
-    // reads and writes. Over MMIO they would make its bookkeeping a sequence
-    // of device accesses.
+    // reads and writes.
     let pa = poisoned_region(0);
     for kind in [
         ObjectType::CNode,
@@ -202,7 +199,6 @@ fn retyping_ordinary_memory_still_zeroes_it() {
 #[test_case]
 fn get_address_needs_write_on_the_frame() {
     // The right check itself, at the seam where a runtime mask becomes a type.
-    // The invocation is exercised end to end by the root task.
     let pa = poisoned_region(0);
     let writable = RawCap { kind: ObjectType::Frame, rights: ALL, size_bits: 12, paddr: pa, ..RawCap::NULL };
     let read_only = RawCap { rights: READ, ..writable };
@@ -218,8 +214,7 @@ fn get_address_needs_write_on_the_frame() {
 
 #[test_case]
 fn every_object_type_survives_the_wire() {
-    // `retype` carries the kind as a number. If a variant is inserted and the
-    // decoder is not updated, userspace asks for one object and gets another.
+    // `retype` carries the kind as a number.
     for (n, expected) in [
         (0u8, ObjectType::Null),
         (1, ObjectType::Untyped),

@@ -150,7 +150,8 @@ pub fn build(map: &MemoryMap, alloc: &mut impl FrameAllocator) -> Result<Mapper,
 /// Switch the hart onto `mapper`.
 ///
 /// # Safety
-/// `mapper` must map the running code, the stack and `gp` at the addresses they already have.
+/// `mapper` must map the running code, the stack and `gp` at the addresses they
+/// already have.
 pub unsafe fn activate(mapper: &Mapper) {
     let satp = crate::boot::satp_value(mapper.root().as_usize());
     KERNEL_ROOT.store(mapper.root().as_usize(), Ordering::Relaxed);

@@ -267,10 +267,7 @@ fn deleting_takes_the_capability_itself_too() {
 fn revoking_an_untyped_lets_its_memory_be_used_again() {
     let mut cs = space();
 
-    // A *second*, independent region, put in slot 4 with no parent. Revoking
-    // the region the CSpace itself was carved from would destroy the CNode we
-    // are standing on -- correct behaviour, and the reason a real init task
-    // does not keep that original untyped inside the space it roots.
+    // A *second*, independent region, put in slot 4 with no parent.
     cs.insert(4, D, region(20), None).expect("insert spare region");
 
     let mut made = [RawCap::NULL; 4];
@@ -284,8 +281,8 @@ fn revoking_an_untyped_lets_its_memory_be_used_again() {
         assert!(cs.read(i, D).unwrap().is_null(), "slot {i} survived");
     }
 
-    // The same addresses come back, which is the whole point: revocation is
-    // the only way memory is ever reused, because there is no free list.
+    // The same addresses come back, which is the whole point: revocation is the
+    // only way memory is ever reused, because there is no free list.
     let mut again = [RawCap::NULL; 4];
     cs.retype((4, D), ObjectType::Frame, 0, (8, D), &mut again).expect("retype");
     for i in 0..4 {

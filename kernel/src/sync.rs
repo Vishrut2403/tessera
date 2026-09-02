@@ -39,7 +39,8 @@ impl<T> SpinLock<T> {
     /// Reach inside without locking.
     ///
     /// # Safety
-    /// The caller must know no one else holds the lock; only the panic handler qualifies (D-009).
+    /// The caller must know no one else holds the lock; only the panic handler
+    /// qualifies (D-009).
     pub unsafe fn force_get(&self) -> &mut T {
         unsafe { &mut *self.data.get() }
     }

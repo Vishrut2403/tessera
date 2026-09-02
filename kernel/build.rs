@@ -6,9 +6,6 @@ fn main() {
 
     // Per-crate, not in the workspace's rustflags: those apply to every crate
     // built for this target, and userspace has its own linker script (D-039).
-    // Absolute, so linking does not depend on where cargo was invoked.
-    // Not `-bins`: every integration test is its own bootable kernel (D-010)
-    // and so is the library's own unit-test image, and both need the script.
     println!("cargo::rustc-link-arg=-T{}/link.ld", dir.display());
     println!("cargo::rustc-link-arg-bins=-Map={}/kernel.map", dir.join("../target").display());
 
@@ -19,9 +16,6 @@ fn main() {
 }
 
 /// Build `user/root` and hand its ELF to the kernel to embed (D-039).
-///
-/// A nested cargo, into a target directory of its own: sharing one would
-/// deadlock on the build lock, since the outer build is still holding it.
 fn build_root_task(kernel_dir: &PathBuf) {
     let user = kernel_dir.join("..").join("user");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("user");

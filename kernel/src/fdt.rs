@@ -61,7 +61,8 @@ impl<'a> Fdt<'a> {
     /// Interpret `ptr` as a flattened device tree.
     ///
     /// # Safety
-    /// `ptr` must point at a DTB whose `totalsize` bytes stay readable and unmutated for `'a`.
+    /// `ptr` must point at a DTB whose `totalsize` bytes stay readable and
+    /// unmutated for `'a`.
     pub unsafe fn from_ptr(ptr: *const u8) -> Result<Self, FdtError> {
         // Bounded header read first: totalsize is untrustworthy until the magic checks out.
         let head = unsafe { core::slice::from_raw_parts(ptr, HEADER_SIZE) };

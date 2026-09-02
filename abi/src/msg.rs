@@ -1,14 +1,10 @@
 //! Message headers.
 
-/// Message words carried in registers. Four is what the fast path can move
-/// without touching memory, and what seL4 settled on for the same reason.
+/// Message words carried in registers.
 pub const MSG_REGS: usize = 4;
 
 /// The header of a message: what it means, how long it is, and whether a
 /// capability rides along.
-///
-/// Packed into one register so the fast path never has to read memory to find
-/// out how much to copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct MessageInfo(u64);
@@ -31,8 +27,7 @@ impl MessageInfo {
         self.0
     }
 
-    /// What the message means. The kernel reads this for its own objects; for
-    /// an endpoint it is untouched application data.
+    /// What the message means.
     pub const fn label(self) -> u64 {
         self.0 >> Self::LABEL_SHIFT
     }

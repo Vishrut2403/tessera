@@ -146,7 +146,8 @@ unsafe fn build_early_table() -> usize {
 /// Turn on Sv39 and jump to the high half.
 ///
 /// # Safety
-/// `satp` must map both the current PC and `next`; `offset` is what `sp` and `gp` need added.
+/// `satp` must map both the current PC and `next`; `offset` is what `sp` and
+/// `gp` need added.
 #[unsafe(naked)]
 unsafe extern "C" fn enter_high_half(satp: usize, next: usize, offset: usize) -> ! {
     core::arch::naked_asm!(

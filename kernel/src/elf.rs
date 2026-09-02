@@ -1,13 +1,5 @@
-//! A PT_LOAD-only ELF64 reader, for the one image the kernel ever loads (D-039).
-//!
-//! This is boot code operating on a binary compiled alongside the kernel and
-//! embedded in it, so it is not parsing hostile input. It is still written to
-//! refuse anything it does not understand rather than to trust the header:
-//! every field is bounds-checked against the slice it came from, and there is
-//! no `unsafe` in this file at all.
-//!
-//! Everything after the root task is loaded by the root task, in userspace,
-//! which is why this reader never has to grow (Fuchsia's `userboot` split).
+//! A PT_LOAD-only ELF64 reader, for the one image the kernel ever loads
+//! (D-039).
 
 /// Why an image was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,10 +112,6 @@ impl<'a> Elf<'a> {
     }
 
     /// The `PT_LOAD` segments, in the order the file lists them.
-    ///
-    /// Every other program header kind -- `GNU_STACK`, `GNU_RELRO`,
-    /// `RISCV_ATTRIBUTES` -- is skipped rather than rejected: they carry no
-    /// instruction to a loader that maps exactly what `PT_LOAD` describes.
     pub fn segments(&self) -> impl Iterator<Item = Result<Segment<'a>, ElfError>> + '_ {
         (0..self.ph_count).filter_map(move |i| {
             let off = self.ph_off + i * self.ph_entry_size;

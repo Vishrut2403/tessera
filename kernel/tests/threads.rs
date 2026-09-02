@@ -195,9 +195,7 @@ fn yielding_puts_a_thread_at_the_back_and_it_comes_round_again() {
 
 #[test_case]
 fn the_timer_preempts_a_thread_that_never_yields() {
-    // A thread that branches to itself, and one that exits immediately. The
-    // spinner is scheduled first, so the second one runs only if the timer
-    // takes the hart away from it.
+    // A thread that branches to itself, and one that exits immediately.
     let _spinner = spawn(&[SPIN]);
     let _exiter = spawn(&uprog::syscall(sched::syscall::EXIT));
 
@@ -228,8 +226,7 @@ fn the_timer_preempts_a_thread_that_never_yields() {
 
 #[test_case]
 fn a_float_traps_once_and_then_the_thread_keeps_the_fpu() {
-    // Two floats, then exit. The first traps (D-025); the second must not,
-    // or the thread never reaches exit.
+    // Two floats, then exit.
     let mut words = [0u32; 4];
     words[0] = USE_FP;
     words[1] = USE_FP;
@@ -263,9 +260,7 @@ fn a_thread_that_reads_unmapped_memory_is_killed() {
 
 #[test_case]
 fn a_thread_reading_a_privileged_csr_is_killed_not_given_the_fpu() {
-    // `csrr a0, satp` is an illegal instruction in U-mode. The FP-disabled trap
-    // is *also* illegal instruction, so this is the test that the handler looks
-    // at stval instead of assuming every one of them is a float.
+    // `csrr a0, satp` is an illegal instruction in U-mode.
     let mut words = [0u32; 3];
     words[0] = 0x1800_2573;
     words[1] = li(A7, sched::syscall::EXIT as u32);

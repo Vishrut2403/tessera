@@ -133,9 +133,6 @@ fn exit_prog() -> Prog<4> {
 }
 
 /// `a6 = n; loop { call(ep) } while --a6; exit()`.
-///
-/// `a6` is deliberately not one of a0, a1 or the message registers a2..a5, so
-/// the loop counter survives every transfer.
 fn client_loop(n: u32) -> Prog<32> {
     const COUNTER: usize = 16;
     let head = Prog::<32>::new().li(COUNTER, n);
@@ -149,8 +146,7 @@ fn client_loop(n: u32) -> Prog<32> {
         .exit()
 }
 
-/// `recv(ep); loop { reply_recv(ep) }` — a server that never stops. What a real
-/// service looks like, and the shape the fast path is optimised for.
+/// `recv(ep); loop { reply_recv(ep) }` — a server that never stops.
 fn server_loop() -> Prog<32> {
     let head = Prog::<32>::new().li(A0, EP_SLOT as u32).syscall(sched::syscall::RECV);
     let top = head.here();
@@ -272,8 +268,7 @@ fn the_badge_of_the_invoked_capability_reaches_the_receiver() {
 fn round_trips_do_not_consult_the_run_queue() {
     // Invariant 4, measured rather than asserted: run the same client/server
     // pair with two round trips and with sixteen, and compare how often a
-    // thread was taken off the run queue. If the scheduler were on the path,
-    // the count would grow with the number of round trips.
+    // thread was taken off the run queue.
     let pops = |trips: u32| {
         let ep = endpoint();
         let server_cs = cspace_with(ep, 0);
@@ -418,9 +413,7 @@ fn a_capability_without_grant_is_not_transferred() {
 #[test_case]
 fn queued_senders_are_served_in_the_order_they_arrived() {
     // Three clients queue on an endpoint before any server exists, each holding
-    // a differently badged copy of it. A `reply_recv` server then serves them.
-    // The order the badges arrive in is the order they queued, or the endpoint
-    // is not a FIFO -- which is what a dequeue-and-reinsert would have made it.
+    // a differently badged copy of it.
     let ep = endpoint();
     let server_cs = cspace_with(ep, 0);
     let clients: [CSpace; 3] =

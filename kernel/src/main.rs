@@ -199,8 +199,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!("  timeslice     : {} ms", time::TIMESLICE_MS);
 
     // A thread that branches to itself, queued *first*, then three that each
-    // print a letter and exit. Nothing after the spinner runs unless the timer
-    // takes the hart away from it.
+    // print a letter and exit.
     let spinner = user_space(&kspace, &[uprog::SPIN]);
     sched::spawn(&spinner, VirtAddr::new(USER_TEXT), VirtAddr::new(USER_STACK + PAGE_SIZE))
         .expect("spawn failed");
@@ -236,7 +235,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
 
     // --- M4: capabilities ---
     // One 2 MiB region of untyped memory, and a capability space rooted in a
-    // CNode carved out of it. Everything below comes from that one region.
+    // CNode carved out of it.
     let region = {
         let mut alloc = mm::FRAMES.lock();
         let mut first = alloc.alloc_frame().expect("no frames");
@@ -312,8 +311,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     demand_paging_demo(&kspace);
 
     // --- M7b: the root task ---
-    // The last thing the kernel creates. From here on, threads, address spaces
-    // and objects are made by userspace out of the untypeds handed over below.
+    // The last thing the kernel creates.
     println!();
     println!("root task:");
         if let Some(plic) = map.plic {
@@ -390,9 +388,6 @@ fn user_space(kernel: &mm::Mapper, words: &[u32]) -> AddressSpace {
 const LAZY: usize = 0x4000_0000;
 
 /// Spawn a client that stores to an unmapped page and a pager that maps it.
-///
-/// The kernel's whole contribution is delivering the fault and doing the map it
-/// is asked for. Which frame, and where it comes from, it never sees.
 fn demand_paging_demo(kernel: &mm::Mapper) {
     const FAULT_EP: u64 = 8;
     const VSPACE: u64 = 9;

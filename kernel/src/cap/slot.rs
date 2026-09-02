@@ -5,20 +5,10 @@ use core::ptr::NonNull;
 use super::object::SLOT_BITS;
 use super::RawCap;
 
-/// A reference to another slot. Slots live inside CNode objects, which live in
-/// untyped memory, so this is a pointer through the direct map rather than an
-/// index: a slot's neighbours in the derivation tree are usually in a different
-/// CNode entirely.
+/// A reference to another slot.
 pub type SlotRef = Option<NonNull<Slot>>;
 
 /// One capability, plus its position in the derivation tree.
-///
-/// Padded to exactly `1 << SLOT_BITS` so a CNode of 2^n slots occupies
-/// 2^(n + SLOT_BITS) bytes and indexing is a shift.
-///
-/// The tree is explicit rather than seL4's ordered doubly-linked list (D-028):
-/// `revoke` is then a depth-first walk anyone can read, instead of a forward
-/// scan that depends on an ordering invariant maintained everywhere else.
 #[repr(C, align(128))]
 pub struct Slot {
     pub cap: RawCap,
@@ -28,8 +18,7 @@ pub struct Slot {
     prev_sib: SlotRef,
 }
 
-// A slot must fit its stride exactly, or CNode indexing is wrong. The padding
-// between the fields and 2^SLOT_BITS is deliberate headroom.
+// A slot must fit its stride exactly, or CNode indexing is wrong.
 const _: () = assert!(size_of::<Slot>() <= 1 << SLOT_BITS, "a slot no longer fits its stride");
 // The `align(128)` above must track SLOT_BITS; this is what catches it if not.
 const _: () = assert!(align_of::<Slot>() == 1 << SLOT_BITS, "Slot's align attribute is stale");
@@ -115,7 +104,7 @@ pub unsafe fn link(mut parent: NonNull<Slot>, mut child: NonNull<Slot>) {
     }
 }
 
-/// Take `slot` out of its parent's child list. Its own children are untouched.
+/// Take `slot` out of its parent's child list.
 ///
 /// # Safety
 /// As [`link`].
@@ -146,11 +135,6 @@ pub unsafe fn unlink(mut slot: NonNull<Slot>) {
 
 /// Destroy every capability derived from `root`, leaving `root` itself alone.
 ///
-/// Returns how many slots were emptied. The walk dives to the deepest-leftmost
-/// descendant, clears it, and uses the links of the slot it just cleared to
-/// decide where to go next — so it needs no stack, which is what makes this
-/// possible in a kernel with no allocator at all.
-///
 /// # Safety
 /// `root` must be a live slot and the caller must hold exclusive access to
 /// every CNode its descendants live in.
@@ -163,8 +147,7 @@ pub unsafe fn revoke(root: NonNull<Slot>) -> usize {
         let mut cursor = start;
 
         loop {
-            // Descend to a leaf. Clearing leaves first means a slot is only
-            // ever destroyed once nothing points at it as a parent.
+            // Descend to a leaf.
             while let Some(child) = cursor.as_ref().first_child {
                 cursor = child;
             }
@@ -194,8 +177,7 @@ pub unsafe fn revoke(root: NonNull<Slot>) -> usize {
         }
 
         // With every derivative gone, an untyped region can be handed out
-        // again. This is what makes revocation the kernel's memory reuse
-        // story, and why there is no free list anywhere (D-027).
+        // again.
         if root.as_ref().cap.kind.is_untyped() {
             let mut r = root;
             r.as_mut().cap.watermark = 0;

@@ -49,11 +49,7 @@ pub fn init() {
     unsafe { stvec::write(base | stvec_mode::DIRECT) };
 }
 
-/// The trap vector. Never called from Rust; `stvec` points here.
-///
-/// `sscratch` is the whole protocol: it holds the current thread's `TrapFrame`
-/// pointer while in U-mode and zero while in the kernel, so one swap classifies
-/// the trap and lands `sp` somewhere usable in the same instruction (D-024).
+/// The trap vector.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.trap")]
@@ -188,8 +184,7 @@ pub unsafe extern "C" fn trap_entry() -> ! {
         "csrw sscratch, zero",
         "mv   a0, sp",
 
-        // Onto the hart's one kernel stack. Whatever was on it is dead: the
-        // kernel runs each trap to completion and never resumes an old frame.
+        // Onto the hart's one kernel stack.
         "lla  t0, {kernel_sp}",
         "ld   sp, 0(t0)",
         "tail {user_trap}",
@@ -201,8 +196,7 @@ pub unsafe extern "C" fn trap_entry() -> ! {
     )
 }
 
-/// This hart's kernel stack. One per hart, not one per thread (D-024): the
-/// kernel runs every trap to completion, so there is never a frame to preserve.
+/// This hart's kernel stack.
 #[repr(C, align(16))]
 struct KernelStack([u8; KERNEL_STACK_SIZE]);
 
@@ -232,8 +226,8 @@ pub fn kernel_stack() -> usize {
 /// Resume a thread: `sret` into U-mode with `frame` restored.
 ///
 /// # Safety
-/// `frame` must be a live `TrapFrame` whose `sstatus` returns to U-mode, and the
-/// address space that thread expects must already be installed in `satp`.
+/// `frame` must be a live `TrapFrame` whose `sstatus` returns to U-mode, and
+/// the address space that thread expects must already be installed in `satp`.
 #[unsafe(naked)]
 #[unsafe(link_section = ".text.trap")]
 pub unsafe extern "C" fn return_to_user(frame: *mut TrapFrame) -> ! {
@@ -340,9 +334,6 @@ pub extern "C" fn dispatch(frame: &mut TrapFrame) {
 }
 
 /// Advance past the instruction that trapped.
-///
-/// This edits the *frame*, not the CSR: the entry reloads `sepc` from the frame
-/// on the way out, so a write to the CSR here would be thrown away.
 fn skip_faulting_instruction(frame: &mut TrapFrame) {
     let pc = frame.sepc;
     // SAFETY: `sepc` points at an instruction we just executed, so it is mapped.

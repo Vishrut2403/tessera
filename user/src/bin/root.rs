@@ -1,8 +1,4 @@
 //! The root task: the first program, and the last thing the kernel creates.
-//!
-//! Everything it has arrived in its CSpace before it ran. It has no ambient
-//! authority beyond `PUTC`, no allocator, and no way to ask the kernel for
-//! memory: what it can build is bounded by the untypeds the boot info names.
 
 #![no_std]
 #![no_main]
@@ -15,9 +11,7 @@ use rt::{entry, print, println, sys, thread_entry};
 
 entry!(main);
 
-/// Written by the child thread, read by the root task. In `.bss`, which the
-/// kernel's loader zeroed, and shared because both threads run in one address
-/// space.
+/// Written by the child thread, read by the root task.
 static CHILD_RAN: AtomicUsize = AtomicUsize::new(0);
 
 /// Written to the scratch page when the root task has finished successfully.
@@ -54,9 +48,7 @@ fn main() {
         );
     }
 
-    // The biggest region that is actually memory. The PCI ECAM window is a
-    // 256 MiB device untyped and would win on size, and retyping it into a page
-    // table is exactly what `DeviceUntyped` refuses.
+    // The biggest region that is actually memory.
     let (best, _) = bi
         .untypeds()
         .iter()
@@ -105,8 +97,7 @@ fn main() {
     sys::tcb_resume(child_tcb).expect("resume");
     println!("  spawned       : a thread at {:#x} on a stack at {:#x}", child_start as *const () as usize, stack);
 
-    // Bounded: a child that never runs must fail the run, not hang it. One
-    // hung test hangs the whole suite, because a test file is one QEMU boot.
+    // Bounded: a child that never runs must fail the run, not hang it.
     let mut spins = 0;
     while CHILD_RAN.load(Ordering::Acquire) == 0 && spins < 1000 {
         sys::yield_now();
@@ -135,12 +126,6 @@ fn main() {
 /// Check what a device untyped is and is not allowed to become, from the
 /// outside — the same checks the kernel's tests make, made by a user program
 /// holding nothing but capabilities (D-040).
-///
-/// Deliberately no MMIO *reads*: identifying a device by reading it is not
-/// safe. QEMU's CLINT and fw-cfg both raise a load access fault on a plain
-/// 32-bit read of offset 0, and with no fault endpoint attached that kills the
-/// root task outright. Knowing which region is a virtio transport is the device
-/// tree's job, not a scan's.
 fn check_device_untyped(bi: &BootInfo, vspace: u64, first_slot: u64, at: usize, ram: u64) {
     println!();
     println!("  device untyped:");
@@ -157,8 +142,7 @@ fn check_device_untyped(bi: &BootInfo, vspace: u64, first_slot: u64, at: usize, 
     let dev = bi.untyped_slot(i);
     let (frame, spare, weak) = (first_slot, first_slot + 1, first_slot + 2);
 
-    // A device region becomes a frame, and nothing else. A page table there
-    // would put the kernel's own bookkeeping in device registers.
+    // A device region becomes a frame, and nothing else.
     sys::retype(dev, ObjectType::Frame, 0, frame, 1).expect("device untyped -> frame");
     assert!(
         sys::retype(dev, ObjectType::PageTable, 0, spare, 1).is_err(),
@@ -177,15 +161,13 @@ fn check_device_untyped(bi: &BootInfo, vspace: u64, first_slot: u64, at: usize, 
     println!("    retype        : frame yes; page table, thread, and RAM->device all refused");
 
     // The capability says where the frame is; the boot info said where the
-    // region is. Both have to agree, or one of them is lying.
+    // region is.
     sys::map_frame(frame, vspace, at, rights::READ | rights::WRITE, false).expect("map device");
     let phys = sys::get_address(frame).expect("get_address");
     assert_eq!(phys as u64, u.paddr, "a device frame is not where its untyped said");
     println!("    mapped at     : {at:#x} -> {phys:#012x}, which the boot info agrees with");
 
-    // `GetAddress` needs WRITE. A read-only copy of the same frame is a
-    // capability you can map and read, but not locate — which is the point,
-    // because locating is most of the way to aiming a bus master at it.
+    // `GetAddress` needs WRITE.
     sys::mint(bootinfo::slot::CNODE, frame, weak, rights::READ, 0).expect("mint");
     assert!(sys::get_address(weak).is_err(), "a read-only frame gave up its address");
     println!("    read-only copy: refused GetAddress, as it must");
@@ -195,7 +177,6 @@ fn check_device_untyped(bi: &BootInfo, vspace: u64, first_slot: u64, at: usize, 
 }
 
 /// Goldfish RTC registers, from the device tree's `google,goldfish-rtc`.
-/// Time is nanoseconds; the alarm fires once when the clock passes it.
 mod rtc {
     pub const TIME_LOW: usize = 0x00;
     pub const TIME_HIGH: usize = 0x04;
@@ -219,11 +200,6 @@ unsafe fn mmio_write(at: usize, off: usize, value: u32) {
 }
 
 /// Take a real interrupt, in userspace, as a notification (D-041).
-///
-/// The device tree says which node is a real-time clock, where its registers
-/// are and which source it raises; the boot info says which untyped covers
-/// those registers; `IrqControl` turns the source number into a capability.
-/// Nothing here is hardcoded and nothing here is privileged.
 fn wait_for_an_interrupt(bi: &BootInfo, vspace: u64, ram: u64, first_slot: u64, at: usize) {
     println!();
     println!("  interrupts:");

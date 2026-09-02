@@ -193,7 +193,8 @@ impl PageTable {
 /// Borrow the table at `pa` through the current physical-memory mapping.
 ///
 /// # Safety
-/// `pa` must address a live page table frame, with no aliasing `&mut` for it while this lives.
+/// `pa` must address a live page table frame, with no aliasing `&mut` for it
+/// while this lives.
 unsafe fn table_ref<'a>(pa: PhysAddr) -> &'a PageTable {
     unsafe { &*phys_to_virt(pa).as_ptr::<PageTable>() }
 }
@@ -201,7 +202,8 @@ unsafe fn table_ref<'a>(pa: PhysAddr) -> &'a PageTable {
 /// Mutably borrow the table at `pa`.
 ///
 /// # Safety
-/// As [`table_ref`], plus exclusive access to the tree -- in practice via a `&mut Mapper`.
+/// As [`table_ref`], plus exclusive access to the tree -- in practice via a
+/// `&mut Mapper`.
 unsafe fn table_mut<'a>(pa: PhysAddr) -> &'a mut PageTable {
     unsafe { &mut *phys_to_virt(pa).as_mut_ptr::<PageTable>() }
 }
@@ -228,8 +230,7 @@ pub enum MapError {
     CoveredBySuperpage,
     /// The frame allocator is empty.
     OutOfFrames,
-    /// An intermediate page table is missing. Userspace supplies them, so this
-    /// is a request for one rather than something the kernel fixes (D-035).
+    /// An intermediate page table is missing.
     MissingTable,
 }
 
@@ -253,7 +254,8 @@ impl Mapper {
     /// Wrap an existing root table.
     ///
     /// # Safety
-    /// `root` must point at a zeroed or well-formed table frame no other `Mapper` is using.
+    /// `root` must point at a zeroed or well-formed table frame no other
+    /// `Mapper` is using.
     pub const unsafe fn from_root(root: PhysAddr) -> Self {
         Self { root }
     }
@@ -338,11 +340,6 @@ impl Mapper {
     }
 
     /// Install a leaf without an allocator, failing if a branch is missing.
-    ///
-    /// Userspace supplies its own page table objects (D-035), so the kernel has
-    /// nothing to allocate from here: a missing intermediate table is a
-    /// [`MapError::MissingTable`] for the pager to fix, not a frame the kernel
-    /// quietly takes. That is what keeps invariant 1 true on this path.
     pub fn map_leaf(
         &mut self,
         va: VirtAddr,

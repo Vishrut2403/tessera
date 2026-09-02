@@ -48,8 +48,7 @@ impl RunQueue {
         self.ready += 1;
     }
 
-    /// Take `tcb` off the queue wherever it sits. `Suspend` is the only caller:
-    /// everything else leaves through `pop`.
+    /// Take `tcb` off the queue wherever it sits.
     fn remove(&mut self, tcb: NonNull<Tcb>) -> bool {
         let mut prev: Option<NonNull<Tcb>> = None;
         let mut cursor = self.head;
@@ -97,25 +96,17 @@ static KERNEL_CTX: SpinLock<KernelContext> = SpinLock::new(KernelContext::new_co
 static SPAWNED: AtomicUsize = AtomicUsize::new(0);
 static EXITED: AtomicUsize = AtomicUsize::new(0);
 static KILLED: AtomicUsize = AtomicUsize::new(0);
-/// Threads that exist and have not finished. Not `spawned - exited - killed`:
-/// `kill_all` destroys threads without either counter moving, and the idle loop
-/// has to know when there is genuinely nobody left to wake (D-041).
+/// Threads that exist and have not finished.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static STOP_ON_EXIT: AtomicBool = AtomicBool::new(false);
 static POPS: AtomicUsize = AtomicUsize::new(0);
 
 /// The thread on this hart, outside the run queue's lock.
-///
-/// Which thread is current is per-hart state that no other hart reads, so
-/// putting it behind the queue lock cost a compare-exchange and an interrupt
-/// mask/unmask every time the fast path asked "who am I?" (D-033). With more
-/// harts this becomes an array indexed by hartid, not a shared lock.
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static LAST_BADGE: AtomicUsize = AtomicUsize::new(0);
 
 /// The last few badges delivered, so a test can check that messages arrive in
-/// the order they were sent. Counted for the same reason as [`queue_pops`]:
-/// FIFO delivery is a property, not an implementation detail.
+/// the order they were sent.
 static BADGE_LOG: [AtomicUsize; 8] = [const { AtomicUsize::new(usize::MAX) }; 8];
 static BADGE_LOG_LEN: AtomicUsize = AtomicUsize::new(0);
 
@@ -171,11 +162,6 @@ pub fn spawn_with_cspace(
 }
 
 /// As [`spawn_with_cspace`], with a fault endpoint so the thread has a pager.
-///
-/// A TCB is not yet a capability a thread can invoke, so this is set at spawn
-/// time rather than by a `SET_FAULT_EP` invocation. Wiring that up needs threads
-/// to be made by retyping, which is the same deferred item as everything else
-/// about TCB objects.
 pub fn spawn_full(
     space: &AddressSpace,
     entry: VirtAddr,
@@ -202,9 +188,6 @@ pub fn spawn_full(
 }
 
 /// Put a thread on the run queue directly.
-///
-/// The root task's thread arrives this way, because at boot there is no CSpace
-/// to invoke `Resume` through. Everything after it is started by its parent.
 ///
 /// # Safety
 /// `tcb` must be a live, fully configured thread that is on no queue.
@@ -233,10 +216,6 @@ pub fn killed() -> usize {
 }
 
 /// How many times a thread has been taken off the run queue.
-///
-/// The fast path must not move this: a `call`/`reply` pair switches directly
-/// from one thread to the other, so the only pops in a ping-pong are the two
-/// that started the threads (invariant 4, D-031).
 pub fn queue_pops() -> usize {
     POPS.load(Ordering::Relaxed)
 }
@@ -253,9 +232,6 @@ pub fn current_id() -> Option<ThreadId> {
 }
 
 /// Run threads until the run queue empties, then return.
-///
-/// The return path exists for shutdown and for tests. It is not on any hot path:
-/// while threads exist, control leaves here only by `sret` (D-024).
 pub fn run() {
     let mut ctx = KERNEL_CTX.lock();
     let ctx_ptr = &raw mut *ctx;
@@ -269,17 +245,13 @@ pub fn run() {
 }
 
 /// Run threads until one of them exits, or the queue empties.
-///
-/// A thread that never yields cannot be waited for any other way, so this is how
-/// a caller observes that preemption happened at all.
 pub fn run_until_exit() {
     STOP_ON_EXIT.store(true, Ordering::Relaxed);
     run();
     STOP_ON_EXIT.store(false, Ordering::Relaxed);
 }
 
-/// Destroy every thread still on the queue. Teardown, not scheduling: nothing
-/// may be current when it is called.
+/// Destroy every thread still on the queue.
 pub fn kill_all() -> usize {
     let mut n = 0;
     assert!(current_tcb().is_none(), "kill_all with a thread on the hart");
@@ -310,9 +282,7 @@ fn activate(mut tcb: NonNull<Tcb>) -> *mut TrapFrame {
         unsafe { crate::csr::satp::write(t.satp) };
 
         // An unassigned space is ASID 0, which every other unassigned space
-        // also uses, so its entries have to go. Once an ASID pool has given the
-        // space a number of its own, the tag keeps them apart and the flush is
-        // unnecessary -- what D-022 deferred and M4e delivered.
+        // also uses, so its entries have to go.
         if (t.satp >> 44) & 0xffff == 0 {
             crate::mm::flush_tlb_all();
         }
@@ -326,11 +296,8 @@ fn take_next() -> Option<NonNull<Tcb>> {
     if let Some(next) = QUEUE.lock().pop() {
         return Some(next);
     }
-    // The run queue is empty, which up to M7 meant there was nothing left to
-    // do. It no longer does: a thread blocked on a notification can be made
-    // runnable by hardware. Idle only while that is actually possible -- if no
-    // source is bound, nothing outside the queue can wake anybody, and waiting
-    // would be waiting forever (D-041).
+    // An empty queue is idle, not finished: hardware can still wake a thread
+    // blocked on a notification -- but only if some source is bound (D-041).
     while crate::irq::any_bound() && LIVE.load(Ordering::Relaxed) > 0 {
         idle();
         if let Some(next) = QUEUE.lock().pop() {
@@ -341,10 +308,6 @@ fn take_next() -> Option<NonNull<Tcb>> {
 }
 
 /// Wait for an interrupt, with interrupts actually unmasked.
-///
-/// `wfi` resumes as soon as an enabled interrupt is *pending*, whether or not
-/// `sstatus.SIE` allows it to be taken -- so idling with interrupts masked would
-/// spin forever on a pending interrupt it never accepts.
 fn idle() {
     use crate::csr::{sstatus, sstatus_bits};
     let was_enabled = sstatus::read() & sstatus_bits::SIE != 0;
@@ -368,8 +331,7 @@ enum Retire {
     Exited,
     /// Faulted, and the kernel destroyed it.
     Killed,
-    /// Parked on an endpoint. Its state is already set and it is on no queue
-    /// the scheduler owns; the endpoint will make it runnable again.
+    /// Parked on an endpoint.
     Blocked,
 }
 
@@ -425,8 +387,7 @@ fn leave() -> ! {
     unsafe { resume_kernel(ctx_ptr) }
 }
 
-/// The Rust side of a trap taken in U-mode. Never returns: it always resumes
-/// some thread, or leaves the scheduler.
+/// The Rust side of a trap taken in U-mode.
 #[unsafe(no_mangle)]
 pub extern "C" fn user_trap(frame: *mut TrapFrame) -> ! {
     // SAFETY: `frame` is the first field of a live TCB, per `Tcb`'s layout
@@ -448,7 +409,6 @@ pub extern "C" fn user_trap(frame: *mut TrapFrame) -> ! {
         }
         Cause::Exception(8) => syscall(tcb),
         // A float in a thread that has not been given the FPU yet (D-025).
-        // Any other illegal instruction is a genuine fault and falls through.
         Cause::Exception(2)
             if !tcb.uses_fp()
                 && crate::thread::is_fp_instruction(crate::csr::stval::read()) =>
@@ -501,12 +461,9 @@ fn syscall(tcb: &mut Tcb) -> ! {
 }
 
 /// Resume `next` without consulting the run queue.
-///
-/// This is the direct switch invariant 4 is about: a `call`/`reply` pair moves
-/// the hart from one thread to another and the scheduler never runs (D-031).
 fn switch_direct(next: NonNull<Tcb>) -> ! {
     // Whatever is leaving the hart still owns the FP registers if it ever
-    // touched one (D-025). `activate` restores them for the thread arriving.
+    // touched one (D-025).
     if let Some(mut outgoing) = current_tcb() {
         // SAFETY: the outgoing thread is not on any queue we are walking.
         let t = unsafe { outgoing.as_mut() };
@@ -592,7 +549,7 @@ fn ipc_send(tcb: &mut Tcb, ep_cap: RawCap, info: MessageInfo, is_call: bool) -> 
 
         if is_call {
             // The caller is not runnable, so nothing goes on the run queue and
-            // the receiver gets the rest of this timeslice. The whole point.
+            // the receiver gets the rest of this timeslice.
             switch_direct(waiting);
         }
         // A bare `send` stays runnable; the receiver still gets the hart, and
@@ -631,10 +588,6 @@ fn sys_recv(tcb: &mut Tcb) -> ! {
 
 /// OR a badge into a notification and wake whoever is waiting for it.
 ///
-/// Never blocks and never fails, which is exactly what lets the interrupt path
-/// call it: an interrupt has no thread behind it and cannot wait for anyone.
-/// Returns the thread to make runnable, if a signal woke one.
-///
 /// # Safety
 /// `cap` must name a live notification object.
 unsafe fn signal(paddr: crate::mm::PhysAddr, badge: u64) -> Option<NonNull<Tcb>> {
@@ -660,8 +613,7 @@ unsafe fn signal(paddr: crate::mm::PhysAddr, badge: u64) -> Option<NonNull<Tcb>>
     }
 }
 
-/// `send` on a notification. The signaller keeps its timeslice: a signal is
-/// asynchronous, so there is no one to hand the hart to (invariant 4).
+/// `send` on a notification.
 fn notification_signal(tcb: &mut Tcb, cap: RawCap) -> ! {
     if Cap::<kind::Notification, { rights::WRITE }>::from_raw(cap).is_err() {
         finish(tcb, result::ERR_BAD_CAP);
@@ -681,8 +633,6 @@ pub fn on_external_interrupt() {
         let target = crate::irq::target(irq);
         // Completion first: the controller ignores a completion for a source
         // that is not enabled for this context, so masking has to come after.
-        // Interrupts are already off inside a trap, so a source that re-asserts
-        // in between only becomes pending, and pending-but-masked is quiet.
         crate::plic::complete(irq);
         crate::plic::disable(irq);
 
@@ -749,8 +699,7 @@ fn invoke_irq_handler(tcb: &mut Tcb, cs: CSpace, cap: RawCap, info: MessageInfo)
             }
         }
         // The driver has cleared the device's own interrupt status, so the
-        // source can be unmasked. Until this arrives it stays masked, which is
-        // what stops a wedged driver's device from storming the kernel.
+        // source can be unmasked.
         label::IRQ_ACK => {
             crate::plic::enable(irq);
             finish(tcb, result::OK)
@@ -828,9 +777,7 @@ fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
     // and nothing else is writing it.
     let callee = unsafe { caller.as_mut() };
     if callee.faulted {
-        // The reply is permission to carry on, not a return value. Its
-        // registers and `sepc` are untouched, so it re-runs the instruction
-        // that faulted against whatever the pager has now arranged.
+        // The reply is permission to carry on, not a return value.
         callee.faulted = false;
     } else {
         deliver(tcb, callee, info, 0);
@@ -875,10 +822,6 @@ fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
 }
 
 /// Move a capability from the sender's CSpace into the receiver's (D-036).
-///
-/// The sender names the source in `a6` and the receiver names the destination
-/// in `a6`, so both ends state their own half of the transfer. The copy becomes
-/// a derivative of the original, which is what makes it revocable.
 fn transfer_cap(from: &Tcb, to: &mut Tcb) -> Result<(), CapError> {
     let src = from.frame.x[reg::A0 + 6] as u64;
     let dst = to.frame.x[reg::A0 + 6] as u64;
@@ -1009,12 +952,9 @@ fn invoke_mapping(tcb: &mut Tcb, cs: CSpace, cptr: u64, info: MessageInfo) -> ! 
             let cap = unsafe { target.clone().as_ref().cap };
             // `WRITE`, not `READ`: a physical address is the one piece of
             // information that lets a holder aim a bus master at memory it has
-            // no capability for, and this platform has no IOMMU (D-040). A
-            // read-only frame handed to a client stays unlocatable.
+            // no capability for, and this platform has no IOMMU (D-040).
             match Cap::<kind::Frame, { rights::WRITE }>::from_raw(cap) {
-                // The address is the return value. No physical address can
-                // collide with an error code, which lives at the top of the
-                // range.
+                // The address is the return value.
                 Ok(frame) => finish(tcb, frame.paddr().as_usize()),
                 Err(e) => finish(tcb, cap_result(e)),
             }
@@ -1041,10 +981,6 @@ fn cap_result(e: CapError) -> usize {
 
 /// The thread invocations: `Configure`, `SetFaultEP`, `WriteRegisters`,
 /// `Resume` and `Suspend` (D-037).
-///
-/// This is what replaces `sched::spawn` for anything userspace builds. The
-/// kernel no longer decides who may create a thread; holding untyped memory and
-/// a free slot is the whole qualification.
 fn invoke_tcb(tcb: &mut Tcb, cs: CSpace, cap: RawCap, info: MessageInfo) -> ! {
     let depth = cs.root_depth();
     let typed = match crate::cap::tcb::check(cap, tcb) {
@@ -1100,12 +1036,6 @@ fn resume(target: &mut Tcb, cap: &RawCap) -> Result<(), CapError> {
 }
 
 /// Take a runnable thread off the run queue.
-///
-/// `Running` cannot appear here: with one hart the only running thread is the
-/// caller, and a thread invoking its own capability was already refused. A
-/// thread blocked on an endpoint is refused outright, because a TCB does not
-/// record *which* endpoint it is queued on and half-suspending it would leave a
-/// dangling entry on that queue.
 fn suspend(target: &mut Tcb, cap: &RawCap) -> Result<(), CapError> {
     match target.state {
         ThreadState::Inactive => Ok(()),
@@ -1121,10 +1051,6 @@ fn suspend(target: &mut Tcb, cap: &RawCap) -> Result<(), CapError> {
 }
 
 /// Deliver a fault to this thread's pager as if the thread had called it.
-///
-/// The thread blocks in `AwaitingReply` exactly as a caller does, and the reply
-/// resumes it *without* touching its registers or advancing `sepc`, so the
-/// faulting instruction runs again against whatever the pager arranged.
 fn deliver_fault(tcb: &mut Tcb, cause: Cause) -> ! {
     if tcb.fault_ep.kind != ObjectType::Endpoint {
         crate::println!(
@@ -1149,10 +1075,6 @@ fn deliver_fault(tcb: &mut Tcb, cause: Cause) -> ! {
 }
 
 /// What userspace may name as a retype target.
-///
-/// `Null` is not an object and `Reply` is minted by the kernel on `call`. The
-/// finer rule -- device untyped becomes only frames and smaller device
-/// untypeds -- belongs to the retype itself, where the type says it (D-040).
 fn object_type_from(n: usize) -> Option<ObjectType> {
     match ObjectType::from_u8(u8::try_from(n).ok()?)? {
         ObjectType::Null | ObjectType::Reply => None,
@@ -1161,9 +1083,6 @@ fn object_type_from(n: usize) -> Option<ObjectType> {
 }
 
 /// Save the calling kernel context into `ctx`, then resume `frame` in U-mode.
-///
-/// Declared as returning: control comes back here through [`resume_kernel`],
-/// not by falling off the end.
 ///
 /// # Safety
 /// `ctx` must outlive every thread, and `frame` must be resumable.
@@ -1193,7 +1112,8 @@ unsafe extern "C" fn enter_threads(ctx: *mut KernelContext, frame: *mut TrapFram
 /// Restore the context [`enter_threads`] saved and return from its caller.
 ///
 /// # Safety
-/// `ctx` must hold a context saved by [`enter_threads`] whose stack is still live.
+/// `ctx` must hold a context saved by [`enter_threads`] whose stack is still
+/// live.
 #[unsafe(naked)]
 unsafe extern "C" fn resume_kernel(ctx: *const KernelContext) -> ! {
     core::arch::naked_asm!(

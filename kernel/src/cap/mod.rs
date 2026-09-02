@@ -42,7 +42,7 @@ pub enum CapError {
     /// The ASID pool refused.
     Asid(asid::AsidError),
     /// The kernel's own root table is not published yet, so there is no kernel
-    /// half to copy. Only reachable before `kernel_space::build` has run.
+    /// half to copy.
     NoKernelSpace,
     /// A thread invoked its own TCB capability.
     SelfInvocation,
@@ -50,16 +50,12 @@ pub enum CapError {
     NotInactive,
     /// The root page table has no ASID, so it is not an address space yet.
     NotAssigned,
-    /// An untyped region not aligned to its own size. Objects are placed at
-    /// aligned offsets, so an unaligned region would yield unaligned objects --
-    /// and a page table that is not 4 KiB aligned is not a page table.
+    /// An untyped region not aligned to its own size.
     Misaligned,
 }
 
 /// A capability as it is stored: rights and identity known only at runtime.
-///
-/// `repr(C)` because [`slot::Slot`] must come out at exactly 128 bytes, which is
-/// what makes a CNode of 2^n slots occupy 2^(n+7) bytes.
+/// `repr(C)`: [`slot::Slot`] must come out at exactly 128 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct RawCap {
@@ -67,14 +63,10 @@ pub struct RawCap {
     pub rights: u8,
     /// Log2 of the object's size in bytes.
     pub size_bits: u8,
-    /// Root page tables only: the ASID `Assign` bound to this address space,
-    /// or zero. It lives here rather than in the object because a page table
-    /// object is 512 PTEs with no room for metadata (D-037).
+    /// Root page tables only: the ASID `Assign` bound to this address space, or
+    /// zero.
     pub asid: u16,
     /// `IrqHandler` only: the interrupt source this capability speaks for.
-    /// It lives here because there is no object behind an `IrqHandler` at all
-    /// -- the capability *is* the authority -- and deliberately not in `badge`,
-    /// which `mint` lets the holder choose (D-041).
     pub irq: u16,
     /// The object itself. Physical, because a capability outlives any mapping.
     pub paddr: PhysAddr,
@@ -83,7 +75,7 @@ pub struct RawCap {
     /// Set when a capability is minted, to identify the holder to a server (M5).
     pub badge: u64,
     /// Frames and page tables: the root of the address space this is mapped
-    /// into, or zero. Recorded so revocation can find the mapping (D-034).
+    /// into, or zero.
     pub mapped_root: PhysAddr,
     /// Where in that address space, valid only when `mapped_root` is non-zero.
     pub mapped_vaddr: usize,
@@ -146,18 +138,13 @@ impl RawCap {
         self.paddr.as_usize() + self.size()
     }
 
-    /// Whether `other` names memory inside this region. What makes an object a
-    /// descendant of the untyped it was carved from.
+    /// Whether `other` names memory inside this region.
     pub const fn covers(&self, other: &RawCap) -> bool {
         other.paddr.as_usize() >= self.paddr.as_usize() && other.end() <= self.end()
     }
 }
 
 /// A capability whose object kind and rights are both known to the compiler.
-///
-/// `R` is a mask of [`rights`]. An operation needing a right is only defined for
-/// masks that contain it, so calling it without one is a missing method rather
-/// than a check that might be forgotten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cap<T, const R: u8> {
     raw: RawCap,
@@ -166,9 +153,6 @@ pub struct Cap<T, const R: u8> {
 
 impl<T: ObjectKind, const R: u8> Cap<T, R> {
     /// Wrap a raw capability, checking the kind and the rights once.
-    ///
-    /// This is the only way a `Cap` is made, and the single runtime check that
-    /// the rest of the type system is built on.
     pub fn from_raw(raw: RawCap) -> Result<Self, CapError> {
         if raw.is_null() {
             return Err(CapError::Null);
@@ -199,10 +183,6 @@ impl<T: ObjectKind, const R: u8> Cap<T, R> {
     }
 
     /// Weaken this capability to a smaller set of rights.
-    ///
-    /// `Mask<R>: Subset<R, M>` is what makes this a reduction: a target mask
-    /// that is not a subset does not implement it, so escalation does not
-    /// compile. The rights actually stored are narrowed to match.
     pub fn reduce<const M: u8>(self) -> Cap<T, M>
     where
         Mask<R>: Subset<R, M>,
@@ -217,7 +197,7 @@ where
     Mask<R>: HasGrant,
 {
     /// A copy to hand to someone else, carrying `badge` so a server can tell
-    /// holders apart. Requires GRANT, by construction.
+    /// holders apart.
     pub fn delegate(&self, badge: u64) -> RawCap {
         RawCap { badge, ..self.raw }
     }

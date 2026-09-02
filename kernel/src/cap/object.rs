@@ -1,5 +1,5 @@
 //! The kernel side of the object model: the markers that put an object's kind
-//! into a capability's type. The kinds themselves are ABI (D-038).
+//! into a capability's type.
 
 pub use abi::object::{ObjectType, SLOT_BITS};
 

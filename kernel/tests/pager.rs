@@ -44,10 +44,6 @@ extern "C" fn test_main_entry(_hartid: usize, dtb_pa: usize) -> ! {
 const TEXT: usize = 0x1000_0000;
 const STACK: usize = 0x2000_0000;
 /// The page the client touches, which nothing maps up front.
-///
-/// A gigabyte up, so its top-level entry is a different one from text and
-/// stack: the pager then has to install *both* intermediate tables, which is
-/// the case worth exercising.
 const LAZY: usize = 0x4000_0000;
 
 /// Slots, the same in every CSpace this test builds.
@@ -134,13 +130,9 @@ fn pager_cspace(client: &AddressSpace, ep: RawCap) -> CSpace {
 
 /// The pager: receive one fault, install the two page tables and a frame at the
 /// faulting address, then reply so the client retries.
-///
-/// Written out rather than looping, because one fault is all this needs and a
-/// hand-encoded loop would obscure what is being demonstrated.
 fn pager_program() -> Prog<64> {
     let recv = Prog::<64>::new().li(A0, FAULT_EP as u32).syscall(sched::syscall::RECV);
-    // a2 now holds the faulting address. Round it down to a page: the shifts
-    // avoid an `andi` of -4096, which does not fit a 12-bit immediate.
+    // a2 now holds the faulting address.
     let aligned = recv
         .raw(uprog::srli(A0 + 3, A0 + 2, 12))
         .raw(uprog::slli(A0 + 3, A0 + 3, 12))
@@ -180,8 +172,7 @@ fn pager_program() -> Prog<64> {
         .exit()
 }
 
-/// A client that stores to `LAZY` and then exits. Without a pager the store
-/// faults and the thread dies; with one it faults, waits, and succeeds.
+/// A client that stores to `LAZY` and then exits.
 fn client_program() -> Prog<32> {
     Prog::<32>::new()
         .li(9, (LAZY >> 12) as u32)
@@ -193,13 +184,6 @@ fn client_program() -> Prog<32> {
 }
 
 /// A copy-on-write pager, entirely in userspace.
-///
-/// On a write fault it maps the shared frame and a fresh one into *its own*
-/// address space, copies a page between them by hand, unmaps the shared frame
-/// from the client, and maps the copy in its place. The kernel's entire
-/// contribution is delivering the fault and performing the map and unmap it is
-/// asked for; which frame, when to copy and what to do with the original are
-/// decisions it never sees.
 fn cow_pager() -> Prog<128> {
     const SRC_PTR: usize = 18; // s2
     const DST_PTR: usize = 19; // s3
@@ -516,8 +500,7 @@ fn the_map_and_unmap_calls_a_pager_makes_compose_into_copy_on_write() {
 
     // This drives the same invocations the pager program makes, but from the
     // kernel side, so a failure points at the primitives rather than at the
-    // hand-encoded program. The end-to-end version is the one that proves the
-    // pager itself works.
+    // hand-encoded program.
     let mut cs = pager_cspace(&client, ep);
     let vs = cs.read(VSPACE, D).unwrap();
     let va = VirtAddr::new(LAZY);
@@ -589,8 +572,6 @@ fn the_cow_pager_program_assembles_and_fits_a_page() {
 }
 
 /// Wire up a client and a copy-on-write pager, and run them.
-///
-/// Returns (physical page the client ends up with, the original shared page).
 fn run_cow_end_to_end() -> (PhysAddr, PhysAddr) {
     let ep = endpoint();
     let client = client_space(client_program().as_slice());
@@ -611,7 +592,7 @@ fn run_cow_end_to_end() -> (PhysAddr, PhysAddr) {
     cs.retype((0, D), ObjectType::Frame, 0, (NEW_FRAME, D), &mut made).expect("new frame");
 
     // The shared page, and a second capability to it the pager can map for
-    // itself. One capability records one mapping, so it needs both (D-034).
+    // itself.
     cs.insert(
         FRAME,
         D,

@@ -1,10 +1,4 @@
 //! Loading the root task: the last thing the kernel creates by itself (D-039).
-//!
-//! Everything here happens once, at boot, before any user code runs. The frame
-//! allocator is used freely — invariant 1 is about the kernel not allocating
-//! *for userspace on demand*, and this is the bootstrap that makes demand
-//! possible. After this function returns, every object in the system comes from
-//! an untyped the root task holds a capability to.
 
 use abi::bootinfo::{self, BootInfo, UntypedDesc};
 
@@ -28,12 +22,9 @@ pub const STACK_TOP: usize = 0x2000_0000;
 pub const STACK_PAGES: usize = 4;
 
 /// The lowest address the kernel maps nothing at, and the root task's to use.
-/// Deliberately in a gigabyte with no page tables, so the root task has to
-/// build them (D-035) rather than inheriting a convenient hole.
 pub const FREE_VADDR: usize = 0x4000_0000;
 
-/// 2^8 slots of 2^7 bytes: a 32 KiB root CNode. Room for the fixed slots, every
-/// untyped, and a few hundred objects before the root task needs a second level.
+/// 2^8 slots of 2^7 bytes: a 32 KiB root CNode.
 const CNODE_BITS: u8 = 8 + SLOT_BITS;
 
 /// The largest untyped the kernel will hand over, so one region cannot swallow
@@ -108,11 +99,7 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
     let info_frame = crate::mm::alloc_frame().ok_or(RootError::OutOfMemory)?;
     map_one(&mut space, bootinfo::VADDR, info_frame, PteFlags::USER_RO)?;
 
-    // The device tree, read-only, at its own address. Not copied: the blob is
-    // already in `reserved`, so nothing else will ever be handed those pages.
-    // This is what lets the root task find out which region is a virtio
-    // transport and which interrupt it raises, without the kernel having a
-    // vocabulary of device kinds (D-041).
+    // The device tree, read-only, at its own address.
     let fdt = map.fdt.page_aligned_out();
     let fdt_offset = map.fdt.start.as_usize() - fdt.start.as_usize();
     for (i, page) in (fdt.start.as_usize()..fdt.end.as_usize()).step_by(PAGE_SIZE).enumerate() {
@@ -187,8 +174,8 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
         None,
     )?;
 
-    // Every interrupt source starts unclaimed; the root task is the only
-    // holder of the right to claim any of them.
+    // Every interrupt source starts unclaimed; the root task is the only holder
+    // of the right to claim any of them.
     crate::irq::reset();
 
     let mut info = BootInfo {
@@ -206,8 +193,7 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
     };
 
     // RAM first, then devices, so the boot log reads in the order the root task
-    // will care about them. Both are the same kind of capability to the CSpace;
-    // only the object type and the `is_device` flag differ (D-040).
+    // will care about them.
     let mut count = 0usize;
     let mut bytes = 0u64;
     let mut devices = 0usize;
@@ -266,10 +252,6 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
 }
 
 /// Copy one `PT_LOAD` segment into fresh frames and map them.
-///
-/// Frames come out of the allocator zeroed, so the `.bss` tail — every byte
-/// between `p_filesz` and `p_memsz` — is already what it should be and nothing
-/// here has to zero anything.
 fn map_segment(space: &mut AddressSpace, seg: &Segment) -> Result<(), RootError> {
     if seg.writable() && seg.executable() {
         return Err(RootError::WriteExecute);
@@ -328,10 +310,6 @@ fn map_one(
 }
 
 /// Take 2^`bits` bytes of aligned, contiguous physical memory.
-///
-/// The bump allocator only hands out single frames, so this walks it forward
-/// until the cursor is aligned and then takes the run. Up to one object's worth
-/// of memory is skipped; at boot, once, that is cheaper than a real allocator.
 fn alloc_aligned(bits: u8) -> Option<PhysAddr> {
     let size = 1usize << bits;
     let mut first = crate::mm::alloc_frame()?;
@@ -345,11 +323,6 @@ fn alloc_aligned(bits: u8) -> Option<PhysAddr> {
 }
 
 /// Cut a free region into the largest aligned power-of-two blocks that fit.
-///
-/// Public so a test can check the blocks tile the region exactly.
-///
-/// An untyped capability is a naturally aligned power of two, because retyping
-/// splits it in half and every object inside it must be aligned to its own size.
 pub fn split(region: Region, is_device: bool) -> impl Iterator<Item = UntypedDesc> {
     let mut start = region.start.as_usize();
     let end = region.end.as_usize();

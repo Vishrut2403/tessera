@@ -3,12 +3,6 @@
 use crate::PAGE_SHIFT;
 
 /// A capability slot is 128 bytes, so a CNode of 2^n slots is 2^(n+7) bytes.
-///
-/// It grew from 64 in M6: a frame capability has to record *where* it is
-/// mapped, or revoking it cannot remove the mapping and revocation does not
-/// actually revoke (D-034). Overlaying those fields onto ones only other kinds
-/// use would have kept 64 bytes and made the capability a union by convention,
-/// which is what seL4 does and what is hardest to read there.
 pub const SLOT_BITS: u8 = 7;
 
 /// Every kind of object the kernel knows how to make.
@@ -20,12 +14,6 @@ pub enum ObjectType {
     /// Physical memory with no type yet. The only thing that can become anything.
     Untyped,
     /// Untyped memory over a region that is not RAM: device registers (D-040).
-    ///
-    /// It becomes frames, or smaller device untypeds, and nothing else. A CNode
-    /// or a TCB is memory the *kernel* reads and writes, and putting one over
-    /// MMIO would make the kernel's own bookkeeping a sequence of device
-    /// accesses. It is also never zeroed, because zeroing MMIO is a burst of
-    /// stores to live hardware.
     DeviceUntyped,
     /// A table of capability slots. Also a level of a CSpace.
     CNode,
@@ -38,17 +26,13 @@ pub enum ObjectType {
     /// An IPC rendezvous point.
     Endpoint,
     /// An asynchronous wake-up: a word of badges, and whoever is waiting for
-    /// it. What an interrupt becomes on its way to userspace (D-041).
+    /// it.
     Notification,
-    /// A one-shot right to reply to a caller. Only the kernel mints these, on
-    /// `call`, so it is deliberately absent from everything `retype` accepts.
+    /// A one-shot right to reply to a caller.
     Reply,
-    /// The right to claim interrupt sources. One of these exists, and the root
-    /// task starts holding it (D-041).
+    /// The right to claim interrupt sources.
     IrqControl,
-    /// The right to receive, and to acknowledge, one interrupt source. Minted
-    /// by `IrqControl`, never retyped: there is no object behind it, so the
-    /// capability *is* the authority.
+    /// The right to receive, and to acknowledge, one interrupt source.
     IrqHandler,
 }
 
@@ -69,9 +53,6 @@ impl ObjectType {
     }
 
     /// Log2 of the object's size in bytes.
-    ///
-    /// `size_bits` is only consulted for the variable-size kinds; for the rest
-    /// it is the type that decides, which is why passing one is an error.
     pub const fn size_bits(self, requested: u8) -> Option<u8> {
         match self {
             ObjectType::Null => None,
@@ -82,8 +63,7 @@ impl ObjectType {
                 Some(PAGE_SHIFT as u8)
             }
             ObjectType::Endpoint | ObjectType::Notification => Some(SLOT_BITS),
-            // Never retyped into. `Reply` is minted by the kernel on `call`;
-            // the two interrupt kinds have no memory behind them at all.
+            // Never retyped into.
             ObjectType::Reply | ObjectType::IrqControl | ObjectType::IrqHandler => None,
         }
     }
@@ -99,9 +79,6 @@ impl ObjectType {
     }
 
     /// Decode the wire value userspace puts in a `Retype` message.
-    ///
-    /// The one place the discriminants are written down twice, and it sits
-    /// beside the enum so the two cannot drift into separate crates.
     pub const fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             0 => ObjectType::Null,

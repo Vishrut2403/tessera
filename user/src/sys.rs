@@ -1,10 +1,4 @@
 //! The system calls, and the capability invocations built on them.
-//!
-//! Register layout, which is the whole ABI: `a0` is the capability being
-//! invoked, `a1` the message header, `a2..a5` the four message words, `a6` a
-//! capability slot when one rides along, `a7` the syscall number. The kernel
-//! restores every register it did not deliberately write, so nothing here needs
-//! a clobber list.
 
 use core::arch::asm;
 
@@ -77,9 +71,6 @@ impl Message {
 }
 
 /// The one place `ecall` is written with a full message in and out.
-///
-/// `cap` is the slot a capability is taken from or delivered into; it is only
-/// read when the header says one is riding along.
 fn ecall(number: usize, cptr: u64, info: MessageInfo, words: [usize; MSG_REGS], cap: u64)
 -> Message {
     let mut a0 = cptr as usize;
@@ -145,8 +136,7 @@ pub fn retype(untyped: u64, kind: ObjectType, size_bits: u8, dst: u64, count: us
     invoke(untyped, label::RETYPE, [kind as usize, size_bits as usize, dst as usize, count], 4)
 }
 
-/// Copy `src` to `dst` with `rights` and a badge. Both name slots in the
-/// caller's own CSpace; `cnode` only has to be a CNode capability.
+/// Copy `src` to `dst` with `rights` and a badge.
 pub fn mint(cnode: u64, src: u64, dst: u64, rights: u8, badge: u64) -> Result {
     invoke(cnode, label::MINT, [src as usize, dst as usize, rights as usize, badge as usize], 4)
 }
@@ -179,9 +169,7 @@ pub fn unmap(obj: u64) -> Result {
 }
 
 /// Where a frame physically is, for a device that does not walk page tables.
-///
-/// Needs `WRITE` on the frame: a physical address is what lets a holder aim a
-/// bus master at memory it has no capability for, and there is no IOMMU here.
+/// Needs `WRITE` on the frame (D-040).
 pub fn get_address(frame: u64) -> core::result::Result<usize, Error> {
     let info = MessageInfo::new(label::GET_ADDRESS, 0, false);
     let a0 = ecall(syscall::CALL, frame, info, [0; MSG_REGS], 0).status();
@@ -191,23 +179,17 @@ pub fn get_address(frame: u64) -> core::result::Result<usize, Error> {
 // --- Notifications and interrupts (D-041) ---
 
 /// Signal a notification: OR this capability's badge into its word and wake
-/// whoever is waiting. Never blocks, so `send` and not `call`.
+/// whoever is waiting.
 pub fn signal(notification: u64) -> Result {
     send(notification, MessageInfo::default(), [0; MSG_REGS])
 }
 
 /// Wait for a notification, and take the badges that have accumulated.
-///
-/// Returns the whole word: several sources signalling one notification are told
-/// apart by which bits are set, which is how one thread waits in one place.
 pub fn wait(notification: u64) -> u64 {
     ecall(syscall::RECV, notification, MessageInfo::default(), [0; MSG_REGS], 0).badge
 }
 
 /// Claim one interrupt source, minting an `IrqHandler` for it into `dst`.
-///
-/// Refused if anyone already holds a handler for that source: two drivers
-/// servicing one device is a race, not a configuration.
 pub fn irq_get(control: u64, irq: usize, dst: u64) -> Result {
     invoke(control, label::IRQ_GET, [irq, dst as usize, 0, 0], 2)
 }
@@ -217,8 +199,7 @@ pub fn irq_set_notification(handler: u64, notification: u64) -> Result {
     invoke(handler, label::IRQ_SET_NOTIFICATION, [notification as usize, 0, 0, 0], 1)
 }
 
-/// The device is quiet again: unmask the source. Until this arrives it stays
-/// masked, which is what stops a wedged driver's device storming the kernel.
+/// The device is quiet again: unmask the source.
 pub fn irq_ack(handler: u64) -> Result {
     invoke(handler, label::IRQ_ACK, [0; MSG_REGS], 0)
 }

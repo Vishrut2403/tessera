@@ -1,24 +1,17 @@
 //! Which notification an interrupt source wakes, and who is allowed to say so
 //! (D-041).
-//!
-//! A fixed table in `.bss`, one entry per source. It is not an allocation, but
-//! it *is* kernel state that lives outside any object, and the honest reason is
-//! that an interrupt arrives with nothing to look anything up by except its
-//! number. seL4 has the same table for the same reason.
 
 use crate::mm::PhysAddr;
 use crate::sync::SpinLock;
 
-/// Sources the table has room for. QEMU virt reports 95; the platform's real
-/// count comes from the device tree and is checked against this.
+/// Sources the table has room for.
 pub const MAX_IRQ: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrqError {
     /// Source 0 does not exist: the controller uses it to mean "none".
     OutOfRange,
-    /// An `IrqHandler` capability for this source already exists. Two drivers
-    /// servicing one device is not a configuration, it is a race.
+    /// An `IrqHandler` capability for this source already exists.
     AlreadyClaimed,
     /// No `IrqHandler` capability has been minted for this source.
     NotClaimed,
@@ -40,9 +33,6 @@ impl Entry {
 static TABLE: SpinLock<[Entry; MAX_IRQ]> = SpinLock::new([Entry::NONE; MAX_IRQ]);
 
 /// Unmask external interrupts on this hart.
-///
-/// Every source is still individually masked at the controller until somebody
-/// claims it and binds a notification, so this on its own delivers nothing.
 pub fn enable() {
     // SAFETY: `sie.SEIE` only unmasks an interrupt the dispatcher handles.
     unsafe { crate::csr::sie::set(crate::csr::interrupt_bits::SEIE) };
@@ -108,9 +98,6 @@ pub fn target(irq: usize) -> Option<(PhysAddr, u64)> {
 }
 
 /// Whether any source is bound to a notification.
-///
-/// The scheduler asks this when its run queue empties: if hardware can still
-/// make a blocked thread runnable, an empty queue means idle, not finished.
 pub fn any_bound() -> bool {
     TABLE.lock().iter().any(|e| e.notification.as_usize() != 0)
 }

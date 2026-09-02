@@ -20,9 +20,6 @@ pub mod eid {
 }
 
 /// Invoke an SBI function.
-///
-/// The SBI spec makes the implementation preserve everything but `a0` and `a1`,
-/// and OpenSBI runs on its own M-mode stack, so there is nothing to clobber.
 #[inline]
 pub fn call(eid: usize, fid: usize, arg0: usize, arg1: usize) -> SbiRet {
     let (error, value);

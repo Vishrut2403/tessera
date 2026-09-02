@@ -12,15 +12,6 @@ pub struct Carved {
 }
 
 /// Place one object of `size_bits` inside a region starting at `base`.
-///
-/// Objects are aligned to their own size, so the watermark is rounded up first;
-/// the skipped bytes are lost, which is why a caller retyping many objects
-/// should ask for them in one call rather than one at a time.
-///
-/// The alignment is applied to the *offset*, which only yields aligned objects
-/// because a region is required to be aligned to its own size. That requirement
-/// is checked here rather than assumed: an unaligned region would quietly
-/// produce page tables the hardware will not accept.
 pub const fn carve(
     base: PhysAddr,
     region_bits: u8,
@@ -43,9 +34,6 @@ pub const fn carve(
 
 /// Zero a freshly carved object.
 ///
-/// Retyping hands userspace a view of memory that may have held anything,
-/// including another process's secrets, so this is not tidiness.
-///
 /// # Safety
 /// `paddr` must name `1 << size_bits` bytes we own, reachable through the
 /// direct map, with no live reference to them.
@@ -56,9 +44,6 @@ unsafe fn zero(paddr: PhysAddr, size_bits: u8) {
 }
 
 /// The shared body of both retypes: plan the whole batch, then commit.
-///
-/// `zeroing` is a parameter rather than a constant because that is the entire
-/// difference between RAM and device memory here (D-040).
 fn retype_into(
     raw: &RawCap,
     target: ObjectType,
@@ -70,11 +55,8 @@ fn retype_into(
         Some(b) => b,
         None => return Err(CapError::BadObjectType),
     };
-    // A CNode must consume at least one address bit, so it needs at least
-    // two slots. A one-slot CNode would have radix 0, and a walk through it
-    // would never shorten the remaining depth -- resolution would not
-    // terminate. Refusing it here is what lets `CSpace::resolve` have no
-    // iteration limit (D-029).
+    // A CNode must consume at least one address bit, so it needs at least two
+    // slots: a radix-0 walk would never terminate (D-029).
     if matches!(target, ObjectType::CNode) && bits <= super::object::SLOT_BITS {
         return Err(CapError::BadSize);
     }
@@ -112,10 +94,6 @@ where
     Mask<R>: HasWrite,
 {
     /// Carve `out.len()` objects of `kind` out of this region.
-    ///
-    /// Returns the new watermark. The caller owns writing it back to the slot,
-    /// and owns installing the resulting capabilities; nothing is committed to
-    /// the region unless every object fits, so a failure changes nothing.
     pub fn retype(
         &self,
         target: ObjectType,
@@ -124,8 +102,8 @@ where
     ) -> Result<usize, CapError> {
         // `Null` is not an object, `Reply` is minted by the kernel on `call`
         // and never carved, and `DeviceUntyped` would be a claim that this RAM
-        // is device registers -- which is exactly the lie the whole
-        // distinction exists to prevent.
+        // is device registers -- which is exactly the lie the whole distinction
+        // exists to prevent.
         if matches!(target, ObjectType::Null | ObjectType::Reply | ObjectType::DeviceUntyped) {
             return Err(CapError::BadObjectType);
         }

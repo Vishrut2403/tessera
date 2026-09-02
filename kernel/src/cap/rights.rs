@@ -1,14 +1,4 @@
 //! Rights, carried in the type system (invariant 3).
-//!
-//! A capability's rights are a `const` bitmask parameter, so an operation that
-//! needs a right is only *defined* for masks that contain it. Using a capability
-//! without the right is a missing method, not a runtime check.
-//!
-//! The mask is const, but a capability arrives from userspace as a runtime slot
-//! whose rights are only known when it is read. [`CSpace::lookup`] is the seam:
-//! it takes the required mask as a const parameter, checks the stored rights
-//! contain it once, and hands back a value whose type carries the proof. Every
-//! operation after that point is checked by the compiler.
 
 pub use abi::rights::{ALL, GRANT, MASKS, READ, WRITE, name};
 
@@ -20,9 +10,6 @@ pub trait HasWrite {}
 pub trait HasGrant {}
 
 /// `Subset<A, B>` exists exactly when `B`'s rights are a subset of `A`'s.
-///
-/// This is what stops [`Cap::reduce`] from being a rights *escalation*: the
-/// target mask has to be provably weaker, at compile time.
 pub trait Subset<const FROM: u8, const TO: u8> {}
 
 /// The type the marker traits and [`Subset`] are implemented on.

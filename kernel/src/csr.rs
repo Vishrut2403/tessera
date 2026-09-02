@@ -35,7 +35,8 @@ macro_rules! csr_rw {
                 }
             }
 
-            /// Atomically set the bits in `mask` (`csrs`), returning the old value.
+            /// Atomically set the bits in `mask` (`csrs`), returning the old
+            /// value.
             ///
             /// # Safety
             /// As [`write`].
@@ -53,7 +54,8 @@ macro_rules! csr_rw {
                 old
             }
 
-            /// Atomically clear the bits in `mask` (`csrc`), returning the old value.
+            /// Atomically clear the bits in `mask` (`csrc`), returning the old
+            /// value.
             ///
             /// # Safety
             /// As [`write`].

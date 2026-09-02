@@ -96,17 +96,12 @@ pub struct MemoryMap {
     pub free: Regions,
     /// Physical regions that are devices rather than memory, one per `reg`
     /// entry in the device tree, grown outward to whole pages (D-040).
-    ///
-    /// Deliberately *not* coalesced: adjacent devices stay separate
-    /// capabilities, so retyping the untyped for one transport hands you that
-    /// transport's page and not its neighbour's.
     pub devices: Regions,
-    /// The interrupt controller, if the device tree describes one. The kernel
-    /// maps and drives this one itself: deciding who receives an interrupt is
-    /// an authority question, so it is never handed out (D-041).
+    /// The interrupt controller, if the device tree describes one.
+    /// The kernel drives it; it is never handed out (D-041).
     pub plic: Option<crate::plic::PlicInfo>,
     /// The device tree blob itself, so it can be mapped into the root task
-    /// (D-041). It is inside `reserved`, so it is never handed out as memory.
+    /// (D-041).
     pub fdt: Region,
 }
 
@@ -156,10 +151,7 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
         let is_ram = p.depth == 1 && (p.node == "memory" || p.node.starts_with("memory@"));
         let is_reserved = p.depth == 2 && p.parent == "reserved-memory";
         // A device is a `reg` on a child of `/soc`, or a top-level node with a
-        // unit address that is not memory -- `flash@...`, `fw-cfg@...`. Nodes
-        // deeper than that are behind a bus with its own cell counts (a PCI
-        // child's `reg` is not a physical address), and `/cpus/cpu@0`'s `reg`
-        // is a hart id, so neither is read with the root's cells.
+        // unit address that is not memory -- `flash@...`, `fw-cfg@...`.
         let is_device = !is_ram
             && !is_reserved
             && ((p.depth == 2 && p.parent == "soc")
@@ -221,10 +213,10 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
     }
     free.drop_empty();
 
-    // A device region overlapping RAM is a device tree we do not understand, and
-    // one overlapping a device the kernel drives is the console or the shutdown
-    // register: handing either to userspace would put the kernel's own hardware
-    // in someone else's address space.
+    // A device region overlapping RAM is a device tree we do not understand,
+    // and one overlapping a device the kernel drives is the console or the
+    // shutdown register: handing either to userspace would put the kernel's own
+    // hardware in someone else's address space.
     let mut kept = Regions::new();
     for d in devices.iter() {
         let clashes_with_ram = ram.iter().any(|r| r.overlaps(d));

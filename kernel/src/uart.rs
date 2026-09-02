@@ -47,7 +47,8 @@ unsafe impl Send for Uart {}
 
 impl Uart {
     /// # Safety
-    /// `base` must be an NS16550A's physical address, byte-spaced registers, exclusively owned.
+    /// `base` must be an NS16550A's physical address, byte-spaced registers,
+    /// exclusively owned.
     pub const unsafe fn new(base: usize) -> Self {
         Self { base: PhysAddr::new(base) }
     }

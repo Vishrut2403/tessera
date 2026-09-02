@@ -1,8 +1,4 @@
 //! The rights bits, as they appear on the wire.
-//!
-//! The kernel re-exports these and adds the typestate machinery that makes a
-//! missing right a compile error (invariant 3). Userspace only ever needs the
-//! bits, to name them in a `Mint`.
 
 /// Read the object, or receive from an endpoint.
 pub const READ: u8 = 1 << 0;

@@ -1,8 +1,4 @@
 //! The IPC fast path, measured (D-033, O-009).
-//!
-//! Run it with `cargo bench-ipc`, which adds `-icount shift=0`. Without that
-//! the counters read host wall-clock time and the numbers mean nothing — the
-//! harness says so rather than printing them anyway.
 
 #![no_std]
 #![no_main]
@@ -49,8 +45,7 @@ fn instret() -> u64 {
     v
 }
 
-/// Instructions between two adjacent reads. Under `-icount` this is a handful;
-/// without it, thousands (O-009), and nothing finer is measurable.
+/// Instructions between two adjacent reads.
 fn floor() -> u64 {
     let a = instret();
     let b = instret();
@@ -174,8 +169,7 @@ fn round_trips_inner(trips: u32, tagged: bool) -> u64 {
 }
 
 /// Both threads in *one* address space, so a switch between them is a `satp`
-/// comparison instead of a write and a flush. Neither program touches its
-/// stack, so one stack page between them is safe.
+/// comparison instead of a write and a flush.
 fn round_trips_shared(trips: u32) -> u64 {
     const SERVER_TEXT: usize = USER_TEXT;
     const CLIENT_TEXT: usize = USER_TEXT + PAGE_SIZE;

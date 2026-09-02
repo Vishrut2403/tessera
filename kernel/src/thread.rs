@@ -21,7 +21,6 @@ pub fn next_id() -> ThreadId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
     /// Retyped but never started: no address space, no CSpace, no entry point.
-    /// On no queue anywhere, which is what makes it safe to configure (D-037).
     Inactive,
     /// On the run queue, waiting for a hart.
     Ready,
@@ -61,14 +60,6 @@ pub mod fs {
 }
 
 /// A thread control block.
-///
-/// `frame` is deliberately first: the trap entry hands the Rust side a pointer
-/// to the frame, and recovering the whole TCB from it is then a cast rather than
-/// a lookup. That is the same trick seL4 plays, and it is why the fast path can
-/// find its thread without touching a table.
-///
-/// One TCB occupies one frame. There is no `Drop` and no free list: until M4
-/// hands out untyped memory, a thread's frame is gone once spawned (D-014).
 #[repr(C)]
 pub struct Tcb {
     pub frame: TrapFrame,
@@ -81,12 +72,10 @@ pub struct Tcb {
     pub satp: usize,
     /// Intrusive run queue link. The queue owns no memory of its own.
     pub next: Option<NonNull<Tcb>>,
-    /// Intrusive endpoint queue link. Separate from `next` so a thread can be
-    /// taken off an endpoint and put on the run queue without the two lists
-    /// fighting over one field.
+    /// Intrusive endpoint queue link.
     pub ipc_next: Option<NonNull<Tcb>>,
     /// The one-shot reply capability handed over by a `call` this thread
-    /// received. Null when the thread is not serving anyone.
+    /// received.
     pub reply: RawCap,
     /// Root CNode of this thread's capability space.
     pub cspace: RawCap,
@@ -95,14 +84,12 @@ pub struct Tcb {
     /// True while this thread is blocked on a `call` rather than a bare `send`,
     /// so whoever receives knows to take a reply capability.
     pub call_pending: bool,
-    /// Where this thread's faults are delivered (D-034). Null means a fault
-    /// kills the thread, which is what happens before a pager is attached.
+    /// Where this thread's faults are delivered (D-034).
     pub fault_ep: RawCap,
     /// True while the thread is blocked on a fault rather than a syscall, so
     /// the reply resumes it instead of overwriting its registers.
     pub faulted: bool,
-    /// This TCB's own physical address. A reply capability names the caller by
-    /// its TCB, so `reply` finds the thread without a lookup.
+    /// This TCB's own physical address.
     pub self_paddr: PhysAddr,
 }
 
@@ -128,8 +115,9 @@ impl Tcb {
         let mut frame = TrapFrame::default();
         frame.x[reg::SP] = stack_top.as_usize();
         frame.sepc = entry.as_usize();
-        // SPP = 0 so `sret` drops to U-mode; SPIE = 1 so it re-enables interrupts
-        // there; FS = Off so the first float traps and we allocate lazily.
+        // SPP = 0 so `sret` drops to U-mode; SPIE = 1 so it re-enables
+        // interrupts there; FS = Off so the first float traps and we allocate
+        // lazily.
         frame.sstatus = sstatus_bits::SPIE | fs::OFF;
 
         // SAFETY: the caller promised an exclusively owned, mapped frame.
@@ -156,11 +144,6 @@ impl Tcb {
     }
 
     /// Lay out a TCB that exists but cannot run.
-    ///
-    /// This is what `retype` produces. Everything a thread needs to run --
-    /// address space, CSpace, entry point -- arrives later through invocations
-    /// on the capability, which is the whole point of making a thread an object
-    /// (D-037). `satp` of zero is the marker: `Resume` refuses it.
     ///
     /// # Safety
     /// `paddr` must be a TCB object we own exclusively and nothing refers to.
@@ -231,10 +214,6 @@ impl Tcb {
 }
 
 /// Whether an instruction word is a floating-point one.
-///
-/// The FP-disabled trap is just "illegal instruction", so without this every
-/// genuinely illegal instruction would be mistaken for a thread asking for the
-/// FPU. O-008 established that `stval` carries the word.
 pub fn is_fp_instruction(word: usize) -> bool {
     matches!(
         word as u32 & 0x7f,

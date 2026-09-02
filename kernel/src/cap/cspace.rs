@@ -12,8 +12,7 @@ use crate::mm::{PhysAddr, phys_to_virt};
 pub enum ResolveError {
     /// The root, or a slot the walk descended into, is not a CNode.
     NotACNode,
-    /// The remaining depth is smaller than the next CNode's radix. The address
-    /// does not name a slot in this tree, it stops partway into one.
+    /// The remaining depth is smaller than the next CNode's radix.
     DepthMismatch,
     /// More than 64 bits of address were asked for.
     TooDeep,
@@ -41,10 +40,6 @@ unsafe fn slots<'a>(cap: &RawCap) -> &'a mut [Slot] {
 }
 
 /// A capability space: the root CNode, and everything reachable from it.
-///
-/// A CNode is itself a capability, so a subtree of a CSpace can be handed to
-/// another process in one operation — that recursion is the whole reason this
-/// is a tree rather than a table (D-029).
 pub struct CSpace {
     root: RawCap,
 }
@@ -73,10 +68,6 @@ impl CSpace {
     }
 
     /// Walk `cptr` to the slot it names.
-    ///
-    /// The low `depth` bits of `cptr` are the address. Each level consumes its
-    /// own CNode's radix, most significant bits first, so a two-level space of
-    /// 64-slot CNodes addresses `(outer << 6) | inner` at depth 12.
     pub fn resolve(&self, cptr: u64, depth: u8) -> Result<NonNull<Slot>, ResolveError> {
         if depth > 64 {
             return Err(ResolveError::TooDeep);
@@ -120,10 +111,6 @@ impl CSpace {
     }
 
     /// Resolve `cptr` and prove, once, that it names a `T` carrying `R`.
-    ///
-    /// This is the seam between runtime and compile time (D-026): everything
-    /// upstream is a `u64` from userspace, everything downstream is a value
-    /// whose type carries the rights it was checked for.
     pub fn lookup<T: ObjectKind, const R: u8>(
         &self,
         cptr: u64,
@@ -155,10 +142,8 @@ impl CSpace {
     }
 
     /// Copy the capability at `src` into the empty slot at `dst`, weakened to
-    /// `rights` and carrying `badge`. The copy becomes a child of the original.
-    ///
-    /// Rights are intersected, never widened: this is the runtime half of the
-    /// guarantee `Cap::reduce` makes at compile time.
+    /// `rights` and carrying `badge`.
+    /// Rights are intersected, never widened.
     pub fn mint(
         &mut self,
         src: (u64, u8),
@@ -185,9 +170,6 @@ impl CSpace {
 
     /// Carve `count` objects out of the untyped at `src` and install them in
     /// consecutive slots starting at `dst`, as children of the untyped.
-    ///
-    /// The whole batch is planned before anything is written, and the slots are
-    /// checked empty first, so a failure leaves the region untouched (D-027).
     pub fn retype(
         &mut self,
         src: (u64, u8),
@@ -256,9 +238,6 @@ impl CSpace {
     }
 
     /// Destroy everything derived from `cptr`, leaving the capability itself.
-    ///
-    /// Revoking an untyped resets its watermark, which is the only way memory
-    /// is ever reused: there is no free list anywhere in the kernel.
     pub fn revoke(&mut self, cptr: u64, depth: u8) -> Result<usize, CapError> {
         let target = self.resolve(cptr, depth)?;
         // SAFETY: `&mut self` is exclusive access to this whole capability space.
@@ -296,15 +275,6 @@ pub unsafe fn init_cnode(paddr: PhysAddr, size_bits: u8) {
 }
 
 /// Build the first capability space out of a region of untyped memory.
-///
-/// This is the bootstrap: a CSpace is normally made by retyping *through* a
-/// CSpace, so the first one has to come from somewhere else. The kernel makes
-/// it once and hands it to the initial task, the way seL4's boot info does.
-///
-/// Slot 0 holds the untyped itself, slot 1 the CNode carved out of it. The
-/// CNode is a child of the untyped, so revoking slot 0 destroys the very space
-/// it is stored in -- which is correct, and a good reason not to hold the
-/// original untyped in the space it roots once there is a real init task.
 pub fn bootstrap(mut region: RawCap, cnode_bits: u8) -> Result<CSpace, CapError> {
     let cap = Cap::<super::kind::Untyped, { super::rights::WRITE }>::from_raw(region)?;
 

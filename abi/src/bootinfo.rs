@@ -1,30 +1,21 @@
 //! What the kernel tells the root task, and the only thing it ever tells it.
-//!
-//! One page, mapped read-only into the root task at a known address. After the
-//! root task reads it the kernel is out of the resource business entirely: every
-//! frame, page table, thread and endpoint in the system is retyped out of one of
-//! the untypeds described here (D-038).
 
 use crate::PAGE_SIZE;
 
 /// `"tessera\0"`, so a garbage page is obvious rather than plausible.
 pub const MAGIC: u64 = 0x7465_7373_6572_6100;
 
-/// Bumped whenever a field moves. The root task refuses a version it does not
-/// know, because reading this struct wrongly is unrecoverable.
+/// Bumped whenever a field moves.
 pub const VERSION: u32 = 2;
 
-/// Where the kernel maps the boot info page: above the image and the stack,
-/// and inside the same gigabyte so it costs no extra page tables.
+/// Where the kernel maps the boot info page: above the image and the stack, and
+/// inside the same gigabyte so it costs no extra page tables.
 pub const VADDR: usize = 0x3000_0000;
 
 /// Where the device tree is mapped, read-only, in the same gigabyte.
 pub const FDT_VADDR: usize = 0x3010_0000;
 
 /// The capability slots the kernel fills in before the root task runs.
-///
-/// Everything else in the root CNode is empty and is the root task's to use;
-/// [`BootInfo::first_free_slot`] is where that starts.
 pub mod slot {
     /// Always empty: a null cptr must not resolve to anything.
     pub const NULL: u64 = 0;
@@ -50,8 +41,7 @@ pub struct UntypedDesc {
     /// Log2 of the region's size.
     pub size_bits: u8,
     /// Non-zero for a device region: retypable only into frames, and never
-    /// zeroed, because zeroing MMIO writes device registers. Always zero until
-    /// M7c introduces them.
+    /// zeroed, because zeroing MMIO writes device registers.
     pub is_device: u8,
     _pad: [u8; 6],
 }
@@ -75,10 +65,8 @@ pub struct BootInfo {
     pub version: u32,
     pub untyped_count: u32,
 
-    /// Address bits the root CNode consumes. Every cptr below is used at this
-    /// depth, because the root task's CSpace starts out one level deep. A `u64`
-    /// so the struct has no implicit padding: it is written into a page
-    /// userspace can read, and padding would be whatever the kernel stack held.
+    /// Address bits the root CNode consumes.
+    /// A `u64` so the struct has no implicit padding to leak.
     pub cnode_radix: u64,
     pub cnode_slots: u64,
 
@@ -93,9 +81,7 @@ pub struct BootInfo {
     pub stack_bottom: u64,
     pub stack_top: u64,
     pub bootinfo_vaddr: u64,
-    /// The device tree, mapped read-only. Everything the root task knows about
-    /// a device beyond "it is at this address" it reads from here: which region
-    /// is a virtio transport, and which interrupt each one raises (D-041).
+    /// The device tree, mapped read-only.
     pub fdt_vaddr: u64,
     pub fdt_size: u64,
     /// The highest interrupt source the platform's controller has.

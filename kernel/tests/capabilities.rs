@@ -23,9 +23,6 @@ extern "C" fn test_main_entry(_hartid: usize, dtb_pa: usize) -> ! {
 }
 
 /// An untyped capability over `1 << bits` bytes of real, owned memory.
-///
-/// A region must be aligned to its own size, so this burns frames off the bump
-/// allocator until one lands on the right boundary and then takes the run.
 fn untyped(bits: u8) -> RawCap {
     let size = 1usize << bits;
     let count = 1usize << (bits.saturating_sub(12));
@@ -76,9 +73,9 @@ fn reducing_rights_narrows_what_is_stored() {
     let weaker = cap.reduce::<READ>();
     assert_eq!(weaker.raw().rights, READ, "reduce did not narrow the stored rights");
 
-    // And the weakened capability can no longer be re-widened: `reduce::<ALL>()`
-    // on it does not compile, because Mask<READ>: Subset<READ, ALL> has no impl.
-    // See the `compile_fail` note in DESIGN.md D-026.
+    // And the weakened capability can no longer be re-widened:
+    // `reduce::<ALL>()` on it does not compile, because Mask<READ>:
+    // Subset<READ, ALL> has no impl.
     let weaker_still = weaker.reduce::<0>();
     assert_eq!(weaker_still.raw().rights, 0);
 }
@@ -100,8 +97,8 @@ fn grant_is_what_makes_a_capability_delegatable() {
 
 #[test_case]
 fn an_unaligned_region_is_refused() {
-    // 0x8000_1000 is page-aligned but not 64 KiB aligned, so it cannot be a
-    // 64 KiB region: objects placed at aligned offsets inside it would not be
+    // 0x8000_1000 is page-aligned but not 64 KiB aligned, so it cannot be a 64
+    // KiB region: objects placed at aligned offsets inside it would not be
     // aligned addresses.
     assert_eq!(
         carve(PhysAddr::new(0x8000_1000), 16, 0, 12).unwrap_err(),

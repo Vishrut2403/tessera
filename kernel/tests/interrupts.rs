@@ -1,9 +1,5 @@
 //! Interrupts as capabilities: the controller, the per-source table, and the
 //! notification an interrupt turns into (D-041).
-//!
-//! The whole path — device tree to a userspace thread woken by real hardware —
-//! is exercised by the root task in `tests/root.rs`. What is here is the parts,
-//! and the refusals that path never triggers.
 
 #![no_std]
 #![no_main]
@@ -170,7 +166,7 @@ fn binding_records_the_target_and_unmasks_the_source() {
 #[test_case]
 fn the_scheduler_can_tell_whether_hardware_could_still_wake_anyone() {
     // An empty run queue means "finished" only when nothing outside it can make
-    // a thread runnable. This is the question the idle loop asks.
+    // a thread runnable.
     irq::reset();
     assert!(!irq::any_bound());
 

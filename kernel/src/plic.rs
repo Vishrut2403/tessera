@@ -1,12 +1,4 @@
 //! The platform-level interrupt controller (D-041).
-//!
-//! The only device the kernel drives that is not the console or the timer, and
-//! it is here because deciding *who* receives an interrupt is an authority
-//! question. Everything past that decision — what the device meant, what to do
-//! about it — happens in userspace.
-//!
-//! Nothing here is hardcoded: the base address, the number of sources and the
-//! hart context all come from the device tree.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -45,13 +37,9 @@ static BASE: AtomicUsize = AtomicUsize::new(0);
 static INFO: SpinLock<Option<PlicInfo>> = SpinLock::new(None);
 
 /// Find the controller in the device tree.
-///
-/// Two passes, because a property can name its node but a node cannot name its
-/// properties: the first finds which node calls itself a PLIC, the second reads
-/// that node's `reg` and context list.
 pub fn find(fdt: &Fdt) -> Option<PlicInfo> {
-    // The node name is copied out rather than borrowed: a `Property` only
-    // lives for the duration of the callback that produced it.
+    // The node name is copied out rather than borrowed: a `Property` only lives
+    // for the duration of the callback that produced it.
     let mut node = [0u8; 64];
     let mut node_len = 0usize;
     let mut ndev = 0usize;
@@ -82,9 +70,7 @@ pub fn find(fdt: &Fdt) -> Option<PlicInfo> {
                         Some(Region::from_start_len(PhysAddr::new(base as usize), size as usize));
                 }
             }
-            // Pairs of (interrupt parent, cause). The index of the entry whose
-            // cause is 9 is this hart's supervisor context -- on QEMU virt that
-            // is context 1, with M-mode at 0, but the number is read, not known.
+            // Pairs of (interrupt parent, cause).
             "interrupts-extended" => {
                 for (i, chunk) in p.value.chunks_exact(8).enumerate() {
                     if read_cells(chunk, 4, 1) == Ok(CAUSE_S_EXTERNAL) && context.is_none() {
@@ -177,10 +163,7 @@ pub fn claim() -> Option<usize> {
 }
 
 /// Tell the controller this hart is finished with `irq`.
-///
-/// Must happen while the source is still enabled: the specification says a
-/// completion for a source that is not enabled for the context is ignored, so
-/// masking has to come after this, not before.
+/// Must happen while the source is still enabled, or it is ignored.
 pub fn complete(irq: usize) {
     let context = INFO.lock().map_or(0, |i| i.context);
     write(reg::CLAIM + context * reg::CONTEXT_STRIDE, irq as u32);

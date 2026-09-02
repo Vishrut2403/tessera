@@ -1,8 +1,4 @@
 //! Hand-encoded user programs: scaffolding until there is an ELF loader.
-//!
-//! M3 needs code running in U-mode before anything can load code from anywhere,
-//! so these are RV64I words written out by hand. M7's filesystem server is what
-//! eventually replaces them.
 
 use crate::mm::{PAGE_SIZE, PhysAddr, phys_to_virt};
 
@@ -86,10 +82,6 @@ pub const fn ld(rd: usize, rs1: usize, offset: i32) -> u32 {
 }
 
 /// A small program, assembled into a fixed buffer.
-///
-/// `li` only reaches 12 bits, and a packed message header does not fit, so
-/// anything wider needs `lui` + `addi`. A builder keeps the tests readable
-/// instead of a wall of hand-encoded words.
 pub struct Prog<const N: usize> {
     words: [u32; N],
     len: usize,
@@ -173,7 +165,8 @@ pub const fn syscall(n: usize) -> [u32; 2] {
     [li(A7, n as u32), ECALL]
 }
 
-/// Copy `words` into `frame` through the direct map, ready to be mapped as user text.
+/// Copy `words` into `frame` through the direct map, ready to be mapped as user
+/// text.
 ///
 /// # Safety
 /// `frame` must be a frame we own, and `words` must fit in a page.
@@ -185,9 +178,6 @@ pub unsafe fn write_to_frame(frame: PhysAddr, words: &[u32]) {
 }
 
 /// A client that calls `ep_slot` `trips` times, then exits.
-///
-/// The counter lives in `a6`, which is neither `a0`/`a1` nor one of the message
-/// registers `a2..a5`, so it survives every transfer.
 pub fn ipc_client(ep_slot: u32, msginfo: u32, call: usize, exit: usize, trips: u32) -> Prog<32> {
     const COUNTER: usize = 16;
     let head = Prog::<32>::new().li(COUNTER, trips);

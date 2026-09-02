@@ -1,11 +1,4 @@
 //! A device tree reader, in userspace and outside the TCB (D-041).
-//!
-//! The kernel has its own minimal walk, because it must find RAM before
-//! anything else exists. This one answers the questions a driver asks — which
-//! node claims to be a given device, where its registers are, which interrupt
-//! it raises — and every line of it is unprivileged. The duplication is the
-//! point: putting these queries in a crate the kernel links would drag them
-//! back into the trusted computing base.
 
 const MAGIC: u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE: u32 = 1;
@@ -56,7 +49,7 @@ fn cstr(b: &[u8], off: usize) -> Option<&[u8]> {
 impl<'a> Fdt<'a> {
     /// # Safety
     /// `ptr` must point at a device tree blob of at least `len` bytes that
-    /// stays mapped for `'a`. The kernel maps ours read-only before we run.
+    /// stays mapped for `'a`.
     pub unsafe fn new(ptr: *const u8, len: usize) -> Option<Self> {
         // SAFETY: the caller promised `len` readable bytes at `ptr`.
         let blob = unsafe { core::slice::from_raw_parts(ptr, len) };
@@ -113,10 +106,6 @@ impl<'a> Fdt<'a> {
     }
 
     /// The first device whose `compatible` list contains `what`.
-    ///
-    /// Two passes, because a property can name its node but a node cannot name
-    /// its properties: the first finds which node matches, the second reads
-    /// that node's `reg` and `interrupts`.
     pub fn find(&self, what: &[u8]) -> Option<Device> {
         let mut node = [0u8; 64];
         let mut node_len = 0usize;
