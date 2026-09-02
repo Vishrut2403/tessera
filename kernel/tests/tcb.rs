@@ -458,3 +458,33 @@ fn suspending_a_resumed_thread_takes_it_off_the_run_queue_before_it_runs() {
     assert_eq!(stack_word(&child_space, 8), 0, "the child ran anyway");
     sched::kill_all();
 }
+
+// --- Fault endpoints are checked when they are installed (D-042) ---
+
+#[test_case]
+fn a_fault_endpoint_without_write_is_refused() {
+    let mut cs = new_cspace();
+    let child = make(&mut cs, ObjectType::Tcb, 0, CHILD_TCB);
+    let ep = make(&mut cs, ObjectType::Endpoint, 0, SPARE);
+    let target = thread_of(&child);
+
+    assert_eq!(
+        kernel::cap::tcb::set_fault_ep(target, RawCap { rights: READ, ..ep }),
+        Err(CapError::MissingRights { wanted: WRITE, held: READ }),
+        "the kernel sends the fault, so the thread must be able to send it itself",
+    );
+    assert!(target.fault_ep.is_null(), "a refused fault endpoint must not be installed");
+
+    assert_eq!(kernel::cap::tcb::set_fault_ep(target, RawCap { rights: WRITE, ..ep }), Ok(()));
+    assert_eq!(target.fault_ep.paddr, ep.paddr);
+}
+
+#[test_case]
+fn a_thread_may_still_be_configured_with_no_pager_at_all() {
+    let mut cs = new_cspace();
+    let child = make(&mut cs, ObjectType::Tcb, 0, CHILD_TCB);
+    let target = thread_of(&child);
+
+    assert_eq!(kernel::cap::tcb::set_fault_ep(target, RawCap::NULL), Ok(()));
+    assert!(target.fault_ep.is_null());
+}

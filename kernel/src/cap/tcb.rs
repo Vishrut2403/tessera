@@ -41,6 +41,15 @@ pub fn check(cap: RawCap, caller: &Tcb) -> Result<TcbCap, CapError> {
     Ok(typed)
 }
 
+/// A fault endpoint the kernel will send on, so the thread must hold it with
+/// `WRITE` (D-042). Null is allowed: a thread without a pager is killed.
+fn check_fault_ep(fault_ep: RawCap) -> Result<(), CapError> {
+    if fault_ep.is_null() {
+        return Ok(());
+    }
+    Cap::<kind::Endpoint, { rights::WRITE }>::from_raw(fault_ep).map(|_| ())
+}
+
 /// Give a thread an address space, a capability space, and a pager.
 pub fn configure(
     target: &mut Tcb,
@@ -62,9 +71,7 @@ pub fn configure(
     if !vspace.is_assigned() {
         return Err(CapError::NotAssigned);
     }
-    if !fault_ep.is_null() && fault_ep.kind != ObjectType::Endpoint {
-        return Err(CapError::WrongType { wanted: ObjectType::Endpoint, found: fault_ep.kind });
-    }
+    check_fault_ep(fault_ep)?;
 
     target.cspace = cspace;
     target.fault_ep = fault_ep;
@@ -74,9 +81,7 @@ pub fn configure(
 
 /// Attach a pager on its own, leaving everything else alone.
 pub fn set_fault_ep(target: &mut Tcb, fault_ep: RawCap) -> Result<(), CapError> {
-    if !fault_ep.is_null() && fault_ep.kind != ObjectType::Endpoint {
-        return Err(CapError::WrongType { wanted: ObjectType::Endpoint, found: fault_ep.kind });
-    }
+    check_fault_ep(fault_ep)?;
     target.fault_ep = fault_ep;
     Ok(())
 }

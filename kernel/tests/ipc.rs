@@ -8,7 +8,7 @@
 
 use kernel::cap::cspace::{CSpace, bootstrap};
 use kernel::cap::object::SLOT_BITS;
-use kernel::cap::rights::ALL;
+use kernel::cap::rights::{ALL, READ, WRITE};
 use kernel::cap::{ObjectType, RawCap};
 use kernel::csr::{interrupt_bits, sie, sstatus, sstatus_bits};
 use kernel::ipc::MessageInfo;
@@ -42,6 +42,8 @@ const USER_TEXT: usize = 0x1000_0000;
 const USER_STACK: usize = 0x2000_0000;
 /// The endpoint capability lives in slot 8 of every thread's CSpace.
 const EP_SLOT: u64 = 8;
+/// A second, deliberately weaker copy of the same endpoint.
+const EP_WEAK: u64 = 9;
 const D: u8 = 6;
 
 fn kernel_mapper() -> mm::Mapper {
@@ -441,5 +443,135 @@ fn queued_senders_are_served_in_the_order_they_arrived() {
         "senders were served out of order: {:?}",
         &seen[..3]
     );
+    sched::kill_all();
+}
+
+// --- Endpoint rights (D-042) ---
+
+/// The same endpoint in slot 8, held with exactly `rights`.
+fn cspace_holding(endpoint: RawCap, rights: u8) -> CSpace {
+    let mut cs = bootstrap(aligned_region(18), D + SLOT_BITS).expect("bootstrap");
+    cs.insert(EP_SLOT, D, RawCap { rights, ..endpoint }, None).expect("insert endpoint");
+    cs
+}
+
+/// `call(slot); *(sp - 8) = a0; exit()`.
+fn call_recording(slot: u64) -> Prog<16> {
+    Prog::new()
+        .li(A0, slot as u32)
+        .li(A0 + 1, MessageInfo::new(1, 1, false).bits() as u32)
+        .li(A0 + 2, 0x11)
+        .syscall(sched::syscall::CALL)
+        .raw(uprog::sd(2, A0, -8))
+        .exit()
+}
+
+/// `recv(slot); *(sp - 8) = a0; exit()`.
+fn recv_recording(slot: u64) -> Prog<16> {
+    Prog::new()
+        .li(A0, slot as u32)
+        .syscall(sched::syscall::RECV)
+        .raw(uprog::sd(2, A0, -8))
+        .exit()
+}
+
+/// `recv(ep); reply_recv(weak ep); *(sp - 8) = a0; exit()`.
+fn reply_recv_recording() -> Prog<24> {
+    Prog::new()
+        .li(A0, EP_SLOT as u32)
+        .syscall(sched::syscall::RECV)
+        .li(A0, EP_WEAK as u32)
+        .li(A0 + 1, MessageInfo::new(0, 1, false).bits() as u32)
+        .syscall(sched::syscall::REPLY_RECV)
+        .raw(uprog::sd(2, A0, -8))
+        .exit()
+}
+
+fn stack_word(space: &AddressSpace, offset: usize) -> u64 {
+    let (pa, _, _) = space.translate(VirtAddr::new(USER_STACK)).expect("stack unmapped");
+    // SAFETY: a stack frame this test mapped, readable through the direct map.
+    unsafe {
+        core::ptr::read_volatile(
+            mm::phys_to_virt(pa).as_ptr::<u64>().byte_add(PAGE_SIZE - offset),
+        )
+    }
+}
+
+#[test_case]
+fn sending_needs_write_on_the_endpoint() {
+    let ep = endpoint();
+    let cs = cspace_holding(ep, READ);
+    let space = spawn(call_recording(EP_SLOT).as_slice(), &cs);
+
+    let killed = sched::killed();
+    run_with_timer();
+
+    assert_eq!(sched::killed(), killed, "the sender should be refused, not killed");
+    assert_eq!(
+        stack_word(&space, 8) as usize,
+        sched::result::ERR_BAD_CAP,
+        "a receive-only endpoint capability was allowed to send",
+    );
+    sched::kill_all();
+}
+
+#[test_case]
+fn receiving_needs_read_on_the_endpoint() {
+    let ep = endpoint();
+    let cs = cspace_holding(ep, WRITE);
+    let space = spawn(recv_recording(EP_SLOT).as_slice(), &cs);
+
+    let killed = sched::killed();
+    run_with_timer();
+
+    assert_eq!(sched::killed(), killed);
+    assert_eq!(
+        stack_word(&space, 8) as usize,
+        sched::result::ERR_BAD_CAP,
+        "a send-only endpoint capability was allowed to receive",
+    );
+    sched::kill_all();
+}
+
+#[test_case]
+fn the_receive_half_of_reply_recv_needs_read() {
+    let ep = endpoint();
+    // The server receives with a full capability and then names a send-only
+    // copy of the same endpoint to `reply_recv`.
+    let mut server_cs = cspace_holding(ep, ALL);
+    server_cs.insert(EP_WEAK, D, RawCap { rights: WRITE, ..ep }, None).expect("weak copy");
+    let client_cs = cspace_holding(ep, WRITE);
+
+    let space = spawn(reply_recv_recording().as_slice(), &server_cs);
+    let _c = spawn(client(1, 0).as_slice(), &client_cs);
+
+    let killed = sched::killed();
+    run_with_timer();
+
+    assert_eq!(sched::killed(), killed);
+    assert_eq!(
+        stack_word(&space, 8) as usize,
+        sched::result::ERR_BAD_CAP,
+        "reply_recv received on a send-only endpoint capability",
+    );
+    sched::kill_all();
+}
+
+#[test_case]
+fn a_send_only_client_can_still_call_a_receive_only_server() {
+    let ep = endpoint();
+    // The shape the whole check exists to make safe: the client may only send,
+    // the server may only receive, and the reply rides the Reply capability.
+    let server_cs = cspace_holding(ep, READ);
+    let client_cs = cspace_holding(ep, WRITE);
+
+    let _s = spawn(server_once().as_slice(), &server_cs);
+    let _c = spawn(client(0x20, 0x99).as_slice(), &client_cs);
+
+    let (exited, killed) = (sched::exited(), sched::killed());
+    run_with_timer();
+
+    assert_eq!(sched::killed(), killed, "a thread faulted during the round trip");
+    assert_eq!(sched::exited(), exited + 2, "the round trip did not complete");
     sched::kill_all();
 }

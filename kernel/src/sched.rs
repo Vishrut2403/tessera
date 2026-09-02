@@ -498,6 +498,13 @@ fn invoke(tcb: &mut Tcb, is_call: bool) -> ! {
     };
 
     match cap.kind {
+        // `call` needs WRITE, not READ: the reply comes back through the
+        // kernel-minted Reply capability, never through the endpoint (D-042).
+        ObjectType::Endpoint if Cap::<kind::Endpoint, { rights::WRITE }>::from_raw(cap)
+            .is_err() =>
+        {
+            finish(tcb, result::ERR_BAD_CAP)
+        }
         ObjectType::Endpoint => ipc_send(tcb, cap, info, is_call),
         // A notification has nothing to reply with, so `call` on one is a
         // question it cannot answer; only `send` signals it (D-041).
@@ -580,6 +587,11 @@ fn sys_recv(tcb: &mut Tcb) -> ! {
         finish(tcb, result::ERR_BAD_CAP);
     };
     match ep_cap.kind {
+        ObjectType::Endpoint if Cap::<kind::Endpoint, { rights::READ }>::from_raw(ep_cap)
+            .is_err() =>
+        {
+            finish(tcb, result::ERR_BAD_CAP)
+        }
         ObjectType::Endpoint => receive_on(tcb, ep_cap),
         ObjectType::Notification => notification_wait(tcb, ep_cap),
         _ => finish(tcb, result::ERR_BAD_CAP),
@@ -789,7 +801,7 @@ fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
         let cptr = tcb.frame.x[reg::A0] as u64;
         if let Some(cs) = cspace_of(tcb)
             && let Ok(ep_cap) = cs.read(cptr, cs.root_depth())
-            && ep_cap.kind == ObjectType::Endpoint
+            && Cap::<kind::Endpoint, { rights::READ }>::from_raw(ep_cap).is_ok()
         {
             // SAFETY: a live endpoint from this thread's CSpace.
             let ep = unsafe { ipc::endpoint_at(ep_cap.paddr) };
