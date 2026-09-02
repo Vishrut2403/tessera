@@ -23,6 +23,9 @@ pub mod kind {
         PageTable => PageTable,
         Tcb => Tcb,
         Endpoint => Endpoint,
+        Notification => Notification,
+        IrqControl => IrqControl,
+        IrqHandler => IrqHandler,
         Reply => Reply,
     }
 }

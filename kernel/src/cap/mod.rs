@@ -71,6 +71,11 @@ pub struct RawCap {
     /// or zero. It lives here rather than in the object because a page table
     /// object is 512 PTEs with no room for metadata (D-037).
     pub asid: u16,
+    /// `IrqHandler` only: the interrupt source this capability speaks for.
+    /// It lives here because there is no object behind an `IrqHandler` at all
+    /// -- the capability *is* the authority -- and deliberately not in `badge`,
+    /// which `mint` lets the holder choose (D-041).
+    pub irq: u16,
     /// The object itself. Physical, because a capability outlives any mapping.
     pub paddr: PhysAddr,
     /// Untyped only: how much of the region has already been handed out.
@@ -90,6 +95,7 @@ impl RawCap {
         rights: 0,
         size_bits: 0,
         asid: 0,
+        irq: 0,
         paddr: PhysAddr::new(0),
         watermark: 0,
         badge: 0,

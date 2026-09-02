@@ -101,6 +101,13 @@ pub struct MemoryMap {
     /// capabilities, so retyping the untyped for one transport hands you that
     /// transport's page and not its neighbour's.
     pub devices: Regions,
+    /// The interrupt controller, if the device tree describes one. The kernel
+    /// maps and drives this one itself: deciding who receives an interrupt is
+    /// an authority question, so it is never handed out (D-041).
+    pub plic: Option<crate::plic::PlicInfo>,
+    /// The device tree blob itself, so it can be mapped into the root task
+    /// (D-041). It is inside `reserved`, so it is never handed out as memory.
+    pub fdt: Region,
 }
 
 /// Read the memory map out of the device tree.
@@ -111,6 +118,7 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
     let mut ram = Regions::new();
     let mut reserved = Regions::new();
     let mut devices = Regions::new();
+    let plic = crate::plic::find(&fdt);
 
     // Cell counts come from the root node.
     let mut address_cells = 2usize;
@@ -195,8 +203,9 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
             .push(Region::from_start_len(PhysAddr::new(addr as usize), size as usize));
     })?;
 
+    let fdt_region = Region::from_start_len(dtb, fdt.total_size());
     reserved.push(kernel)?;
-    reserved.push(Region::from_start_len(dtb, fdt.total_size()))?;
+    reserved.push(fdt_region)?;
 
     ram.normalize();
     reserved.normalize();
@@ -221,7 +230,8 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
         let clashes_with_ram = ram.iter().any(|r| r.overlaps(d));
         let clashes_with_kernel = kernel_space::DEVICES
             .iter()
-            .any(|(_, pa)| d.contains(PhysAddr::new(*pa)));
+            .any(|(_, pa)| d.contains(PhysAddr::new(*pa)))
+            || plic.is_some_and(|p| d.overlaps(&p.region));
         if !clashes_with_ram && !clashes_with_kernel {
             kept.push(*d)?;
         }
@@ -229,5 +239,5 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
     kept.sort();
     let devices = kept;
 
-    Ok(MemoryMap { ram, reserved, free, devices })
+    Ok(MemoryMap { ram, reserved, free, devices, plic, fdt: fdt_region })
 }

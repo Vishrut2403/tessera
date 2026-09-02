@@ -229,10 +229,13 @@ fn every_object_type_survives_the_wire() {
         (5, ObjectType::PageTable),
         (6, ObjectType::Tcb),
         (7, ObjectType::Endpoint),
-        (8, ObjectType::Reply),
+        (8, ObjectType::Notification),
+        (9, ObjectType::Reply),
+        (10, ObjectType::IrqControl),
+        (11, ObjectType::IrqHandler),
     ] {
         assert_eq!(ObjectType::from_u8(n), Some(expected));
         assert_eq!(expected as u8, n, "{} does not encode as {n}", expected.name());
     }
-    assert_eq!(ObjectType::from_u8(9), None);
+    assert_eq!(ObjectType::from_u8(12), None);
 }

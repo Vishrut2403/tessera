@@ -12,11 +12,14 @@ pub const MAGIC: u64 = 0x7465_7373_6572_6100;
 
 /// Bumped whenever a field moves. The root task refuses a version it does not
 /// know, because reading this struct wrongly is unrecoverable.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Where the kernel maps the boot info page: above the image and the stack,
 /// and inside the same gigabyte so it costs no extra page tables.
 pub const VADDR: usize = 0x3000_0000;
+
+/// Where the device tree is mapped, read-only, in the same gigabyte.
+pub const FDT_VADDR: usize = 0x3010_0000;
 
 /// The capability slots the kernel fills in before the root task runs.
 ///
@@ -33,6 +36,8 @@ pub mod slot {
     pub const TCB: u64 = 3;
     /// The read-only frame this struct lives in.
     pub const BOOTINFO: u64 = 4;
+    /// The right to claim interrupt sources (D-041). One exists.
+    pub const IRQ_CONTROL: u64 = 5;
     /// The first slot holding an untyped region.
     pub const FIRST_UNTYPED: u64 = 8;
 }
@@ -88,6 +93,13 @@ pub struct BootInfo {
     pub stack_bottom: u64,
     pub stack_top: u64,
     pub bootinfo_vaddr: u64,
+    /// The device tree, mapped read-only. Everything the root task knows about
+    /// a device beyond "it is at this address" it reads from here: which region
+    /// is a virtio transport, and which interrupt each one raises (D-041).
+    pub fdt_vaddr: u64,
+    pub fdt_size: u64,
+    /// The highest interrupt source the platform's controller has.
+    pub max_irq: u64,
     /// The lowest address the root task may map things at without colliding
     /// with anything the kernel put there.
     pub free_vaddr: u64,
@@ -111,6 +123,9 @@ impl BootInfo {
         stack_bottom: 0,
         stack_top: 0,
         bootinfo_vaddr: VADDR as u64,
+        fdt_vaddr: 0,
+        fdt_size: 0,
+        max_irq: 0,
         free_vaddr: 0,
         untyped: [UntypedDesc { paddr: 0, size_bits: 0, is_device: 0, _pad: [0; 6] }; MAX_UNTYPED],
     };

@@ -228,6 +228,12 @@ impl CSpace {
                 // load-bearing.
                 unsafe { crate::ipc::init_endpoint(made.paddr) };
             }
+            if made.kind == ObjectType::Notification {
+                // SAFETY: just carved out of the untyped, so nothing refers to
+                // it yet. Zeroed memory happens to be `Notification::EMPTY`,
+                // but relying on that would make the layout load-bearing.
+                unsafe { crate::notify::init(made.paddr) };
+            }
             if made.kind == ObjectType::Tcb {
                 // SAFETY: just carved out of the untyped, so nothing refers to
                 // it yet. It comes out inactive: no address space, no CSpace,

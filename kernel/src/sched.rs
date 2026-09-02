@@ -97,6 +97,10 @@ static KERNEL_CTX: SpinLock<KernelContext> = SpinLock::new(KernelContext::new_co
 static SPAWNED: AtomicUsize = AtomicUsize::new(0);
 static EXITED: AtomicUsize = AtomicUsize::new(0);
 static KILLED: AtomicUsize = AtomicUsize::new(0);
+/// Threads that exist and have not finished. Not `spawned - exited - killed`:
+/// `kill_all` destroys threads without either counter moving, and the idle loop
+/// has to know when there is genuinely nobody left to wake (D-041).
+static LIVE: AtomicUsize = AtomicUsize::new(0);
 static STOP_ON_EXIT: AtomicBool = AtomicBool::new(false);
 static POPS: AtomicUsize = AtomicUsize::new(0);
 
@@ -193,6 +197,7 @@ pub fn spawn_full(
 
     QUEUE.lock().push(tcb);
     SPAWNED.fetch_add(1, Ordering::Relaxed);
+    LIVE.fetch_add(1, Ordering::Relaxed);
     Ok(id)
 }
 
@@ -206,6 +211,7 @@ pub fn spawn_full(
 pub unsafe fn admit(tcb: NonNull<Tcb>) {
     QUEUE.lock().push(tcb);
     SPAWNED.fetch_add(1, Ordering::Relaxed);
+    LIVE.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn ready_count() -> usize {
@@ -280,6 +286,7 @@ pub fn kill_all() -> usize {
     while let Some(mut tcb) = take_next() {
         // SAFETY: off the queue and not current, so we are its only writer.
         unsafe { tcb.as_mut().state = ThreadState::Exited };
+        LIVE.fetch_sub(1, Ordering::Relaxed);
         n += 1;
     }
     n
@@ -316,7 +323,40 @@ fn activate(mut tcb: NonNull<Tcb>) -> *mut TrapFrame {
 }
 
 fn take_next() -> Option<NonNull<Tcb>> {
-    QUEUE.lock().pop()
+    if let Some(next) = QUEUE.lock().pop() {
+        return Some(next);
+    }
+    // The run queue is empty, which up to M7 meant there was nothing left to
+    // do. It no longer does: a thread blocked on a notification can be made
+    // runnable by hardware. Idle only while that is actually possible -- if no
+    // source is bound, nothing outside the queue can wake anybody, and waiting
+    // would be waiting forever (D-041).
+    while crate::irq::any_bound() && LIVE.load(Ordering::Relaxed) > 0 {
+        idle();
+        if let Some(next) = QUEUE.lock().pop() {
+            return Some(next);
+        }
+    }
+    None
+}
+
+/// Wait for an interrupt, with interrupts actually unmasked.
+///
+/// `wfi` resumes as soon as an enabled interrupt is *pending*, whether or not
+/// `sstatus.SIE` allows it to be taken -- so idling with interrupts masked would
+/// spin forever on a pending interrupt it never accepts.
+fn idle() {
+    use crate::csr::{sstatus, sstatus_bits};
+    let was_enabled = sstatus::read() & sstatus_bits::SIE != 0;
+    // SAFETY: unmasking so the pending interrupt can be taken; the kernel trap
+    // path handles it and puts whoever it wakes on the run queue.
+    unsafe {
+        sstatus::set(sstatus_bits::SIE);
+        core::arch::asm!("wfi", options(nomem, nostack));
+        if !was_enabled {
+            sstatus::clear(sstatus_bits::SIE);
+        }
+    }
 }
 
 /// Why a thread is coming off the hart.
@@ -352,6 +392,7 @@ fn retire(why: Retire) -> ! {
             Retire::Exited => {
                 t.state = ThreadState::Exited;
                 EXITED.fetch_add(1, Ordering::Relaxed);
+                LIVE.fetch_sub(1, Ordering::Relaxed);
                 if STOP_ON_EXIT.load(Ordering::Relaxed) {
                     leave();
                 }
@@ -359,6 +400,7 @@ fn retire(why: Retire) -> ! {
             Retire::Killed => {
                 t.state = ThreadState::Exited;
                 KILLED.fetch_add(1, Ordering::Relaxed);
+                LIVE.fetch_sub(1, Ordering::Relaxed);
             }
             // Already queued on an endpoint; touching the run queue here is
             // exactly the bug invariant 4 is about.
@@ -395,6 +437,14 @@ pub extern "C" fn user_trap(frame: *mut TrapFrame) -> ! {
         Cause::Interrupt(5) => {
             crate::time::on_tick();
             retire(Retire::Requeue)
+        }
+        Cause::Interrupt(9) => {
+            on_external_interrupt();
+            // Whoever was woken went on the run queue; this thread keeps the
+            // rest of its timeslice, because an interrupt arriving is not a
+            // scheduling decision (invariant 4).
+            // SAFETY: this thread is current and its frame is intact.
+            unsafe { return_to_user(tcb.frame_ptr()) }
         }
         Cause::Exception(8) => syscall(tcb),
         // A float in a thread that has not been given the FPU yet (D-025).
@@ -492,6 +542,22 @@ fn invoke(tcb: &mut Tcb, is_call: bool) -> ! {
 
     match cap.kind {
         ObjectType::Endpoint => ipc_send(tcb, cap, info, is_call),
+        // A notification has nothing to reply with, so `call` on one is a
+        // question it cannot answer; only `send` signals it (D-041).
+        ObjectType::Notification if is_call => finish(tcb, result::ERR_BAD_LABEL),
+        ObjectType::Notification => notification_signal(tcb, cap),
+        ObjectType::IrqControl if Cap::<kind::IrqControl, { rights::WRITE }>::from_raw(cap)
+            .is_err() =>
+        {
+            finish(tcb, result::ERR_BAD_CAP)
+        }
+        ObjectType::IrqControl => invoke_irq_control(tcb, cs, cptr, info),
+        ObjectType::IrqHandler if Cap::<kind::IrqHandler, { rights::WRITE }>::from_raw(cap)
+            .is_err() =>
+        {
+            finish(tcb, result::ERR_BAD_CAP)
+        }
+        ObjectType::IrqHandler => invoke_irq_handler(tcb, cs, cap, info),
         ObjectType::Untyped | ObjectType::DeviceUntyped => invoke_untyped(tcb, cs, cptr, info),
         ObjectType::CNode => invoke_cnode(tcb, cs, cptr, info),
         ObjectType::Frame | ObjectType::PageTable => invoke_mapping(tcb, cs, cptr, info),
@@ -556,11 +622,159 @@ fn sys_recv(tcb: &mut Tcb) -> ! {
     let Ok(ep_cap) = cs.read(cptr, cs.root_depth()) else {
         finish(tcb, result::ERR_BAD_CAP);
     };
-    if ep_cap.kind != ObjectType::Endpoint {
-        finish(tcb, result::ERR_BAD_CAP)
-    } else {
-        receive_on(tcb, ep_cap)
+    match ep_cap.kind {
+        ObjectType::Endpoint => receive_on(tcb, ep_cap),
+        ObjectType::Notification => notification_wait(tcb, ep_cap),
+        _ => finish(tcb, result::ERR_BAD_CAP),
     }
+}
+
+/// OR a badge into a notification and wake whoever is waiting for it.
+///
+/// Never blocks and never fails, which is exactly what lets the interrupt path
+/// call it: an interrupt has no thread behind it and cannot wait for anyone.
+/// Returns the thread to make runnable, if a signal woke one.
+///
+/// # Safety
+/// `cap` must name a live notification object.
+unsafe fn signal(paddr: crate::mm::PhysAddr, badge: u64) -> Option<NonNull<Tcb>> {
+    // SAFETY: the caller promised a live notification, and only this hart runs
+    // kernel code.
+    let n = unsafe { crate::notify::at(paddr) };
+    // SAFETY: the queue holds live TCBs the kernel owns.
+    match unsafe { n.dequeue() } {
+        Some(mut waiter) => {
+            // SAFETY: off the queue, so nothing else refers to it.
+            let w = unsafe { waiter.as_mut() };
+            // Anything signalled while nobody waited rides along with this one.
+            w.set_return((n.word | badge) as usize);
+            n.word = 0;
+            n.pending = false;
+            w.state = ThreadState::Ready;
+            Some(waiter)
+        }
+        None => {
+            n.post(badge);
+            None
+        }
+    }
+}
+
+/// `send` on a notification. The signaller keeps its timeslice: a signal is
+/// asynchronous, so there is no one to hand the hart to (invariant 4).
+fn notification_signal(tcb: &mut Tcb, cap: RawCap) -> ! {
+    if Cap::<kind::Notification, { rights::WRITE }>::from_raw(cap).is_err() {
+        finish(tcb, result::ERR_BAD_CAP);
+    }
+    // SAFETY: `cap` came from this thread's CSpace, so it names a live
+    // notification.
+    if let Some(woken) = unsafe { signal(cap.paddr, cap.badge) } {
+        QUEUE.lock().push(woken);
+    }
+    finish(tcb, result::OK)
+}
+
+/// An external interrupt: ask the controller which source, wake whoever holds
+/// it, and mask the source until they say the device is quiet again.
+pub fn on_external_interrupt() {
+    while let Some(irq) = crate::plic::claim() {
+        let target = crate::irq::target(irq);
+        // Completion first: the controller ignores a completion for a source
+        // that is not enabled for this context, so masking has to come after.
+        // Interrupts are already off inside a trap, so a source that re-asserts
+        // in between only becomes pending, and pending-but-masked is quiet.
+        crate::plic::complete(irq);
+        crate::plic::disable(irq);
+
+        if let Some((paddr, badge)) = target {
+            // SAFETY: the table only ever holds notifications that were live
+            // when they were bound, and revoking one unbinds it.
+            if let Some(woken) = unsafe { signal(paddr, badge) } {
+                QUEUE.lock().push(woken);
+            }
+        }
+    }
+}
+
+// --- Interrupts as capabilities (D-041) ---
+
+/// `IrqControl`: mint an `IrqHandler` for one source.
+fn invoke_irq_control(tcb: &mut Tcb, mut cs: CSpace, cptr: u64, info: MessageInfo) -> ! {
+    if info.label() != label::IRQ_GET {
+        finish(tcb, result::ERR_BAD_LABEL);
+    }
+    let irq = tcb.frame.x[reg::A0 + 2];
+    let dst = tcb.frame.x[reg::A0 + 3] as u64;
+    let depth = cs.root_depth();
+
+    if let Err(e) = crate::irq::claim(irq) {
+        finish(tcb, match e {
+            crate::irq::IrqError::AlreadyClaimed => result::ERR_STATE,
+            _ => result::ERR_BAD_LABEL,
+        });
+    }
+
+    let handler = RawCap {
+        kind: ObjectType::IrqHandler,
+        rights: rights::ALL,
+        irq: irq as u16,
+        ..RawCap::NULL
+    };
+    // A child of the `IrqControl` capability, so revoking that reclaims every
+    // handler ever minted from it.
+    let Ok(parent) = cs.resolve(cptr, depth) else { finish(tcb, result::ERR_BAD_CAP) };
+    match cs.insert(dst, depth, handler, Some(parent)) {
+        Ok(()) => finish(tcb, result::OK),
+        Err(e) => finish(tcb, cap_result(e)),
+    }
+}
+
+/// `IrqHandler`: bind a notification, or say the device is quiet again.
+fn invoke_irq_handler(tcb: &mut Tcb, cs: CSpace, cap: RawCap, info: MessageInfo) -> ! {
+    let irq = cap.irq as usize;
+    match info.label() {
+        label::IRQ_SET_NOTIFICATION => {
+            let ncptr = tcb.frame.x[reg::A0 + 2] as u64;
+            let Ok(n) = cs.read(ncptr, cs.root_depth()) else {
+                finish(tcb, result::ERR_BAD_CAP)
+            };
+            // Signalling it is what the kernel is about to do on this thread's
+            // behalf, so the thread has to be allowed to signal it itself.
+            if Cap::<kind::Notification, { rights::WRITE }>::from_raw(n).is_err() {
+                finish(tcb, result::ERR_BAD_CAP);
+            }
+            match crate::irq::bind(irq, n.paddr, n.badge) {
+                Ok(()) => finish(tcb, result::OK),
+                Err(_) => finish(tcb, result::ERR_STATE),
+            }
+        }
+        // The driver has cleared the device's own interrupt status, so the
+        // source can be unmasked. Until this arrives it stays masked, which is
+        // what stops a wedged driver's device from storming the kernel.
+        label::IRQ_ACK => {
+            crate::plic::enable(irq);
+            finish(tcb, result::OK)
+        }
+        _ => finish(tcb, result::ERR_BAD_LABEL),
+    }
+}
+
+/// `recv` on a notification: take the word if anything is pending, else block.
+fn notification_wait(tcb: &mut Tcb, cap: RawCap) -> ! {
+    if Cap::<kind::Notification, { rights::READ }>::from_raw(cap).is_err() {
+        finish(tcb, result::ERR_BAD_CAP);
+    }
+    // SAFETY: `cap` came from this thread's CSpace, so it names a live
+    // notification.
+    let n = unsafe { crate::notify::at(cap.paddr) };
+    if let Some(word) = n.take() {
+        finish(tcb, word as usize);
+    }
+    tcb.state = ThreadState::BlockedOnRecv;
+    let me = current_tcb().expect("no current thread");
+    // SAFETY: this thread is current, so it is on no other queue.
+    unsafe { n.enqueue(me) };
+    retire(Retire::Blocked)
 }
 
 /// The receive half, shared by `recv` and `reply_recv`.
@@ -881,6 +1095,7 @@ fn resume(target: &mut Tcb, cap: &RawCap) -> Result<(), CapError> {
     let ptr = unsafe { crate::cap::tcb::tcb_ptr(cap) };
     QUEUE.lock().push(ptr);
     SPAWNED.fetch_add(1, Ordering::Relaxed);
+    LIVE.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 

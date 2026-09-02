@@ -10,6 +10,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use rt::abi::{BootInfo, ObjectType, bootinfo, rights};
+use rt::fdt::Fdt;
 use rt::{entry, print, println, sys, thread_entry};
 
 entry!(main);
@@ -125,6 +126,7 @@ fn main() {
     unsafe { (base as *mut u64).add(1).write_volatile(DONE | child_id as u64) };
 
     check_device_untyped(bi, vspace, f + 8, base + 0x10000, ut);
+    wait_for_an_interrupt(bi, vspace, ut, f + 16, base + 0x20000);
 
     println!();
     println!("root task: done.");
@@ -143,11 +145,14 @@ fn check_device_untyped(bi: &BootInfo, vspace: u64, first_slot: u64, at: usize, 
     println!();
     println!("  device untyped:");
 
+    // The biggest device region, so the small single-page ones stay whole for
+    // whoever actually wants that device.
     let (i, u) = bi
         .untypeds()
         .iter()
         .enumerate()
-        .find(|(_, u)| u.is_device != 0)
+        .filter(|(_, u)| u.is_device != 0)
+        .max_by_key(|(_, u)| u.size_bits)
         .expect("no device regions");
     let dev = bi.untyped_slot(i);
     let (frame, spare, weak) = (first_slot, first_slot + 1, first_slot + 2);
@@ -187,6 +192,118 @@ fn check_device_untyped(bi: &BootInfo, vspace: u64, first_slot: u64, at: usize, 
 
     // SAFETY: the scratch frame is mapped read-write at `at - 0x10000`.
     unsafe { ((at - 0x10000) as *mut u64).add(2).write_volatile(u.paddr) };
+}
+
+/// Goldfish RTC registers, from the device tree's `google,goldfish-rtc`.
+/// Time is nanoseconds; the alarm fires once when the clock passes it.
+mod rtc {
+    pub const TIME_LOW: usize = 0x00;
+    pub const TIME_HIGH: usize = 0x04;
+    pub const ALARM_LOW: usize = 0x08;
+    pub const ALARM_HIGH: usize = 0x0c;
+    pub const IRQ_ENABLED: usize = 0x10;
+    pub const CLEAR_INTERRUPT: usize = 0x1c;
+}
+
+/// SAFETY: `at` must be inside a device frame this task has mapped read-write.
+unsafe fn mmio_read(at: usize, off: usize) -> u32 {
+    // SAFETY: the caller promised a mapped device register. Volatile because
+    // reads of a register are not redundant even when the address repeats.
+    unsafe { ((at + off) as *const u32).read_volatile() }
+}
+
+/// SAFETY: as above.
+unsafe fn mmio_write(at: usize, off: usize, value: u32) {
+    // SAFETY: as above.
+    unsafe { ((at + off) as *mut u32).write_volatile(value) }
+}
+
+/// Take a real interrupt, in userspace, as a notification (D-041).
+///
+/// The device tree says which node is a real-time clock, where its registers
+/// are and which source it raises; the boot info says which untyped covers
+/// those registers; `IrqControl` turns the source number into a capability.
+/// Nothing here is hardcoded and nothing here is privileged.
+fn wait_for_an_interrupt(bi: &BootInfo, vspace: u64, ram: u64, first_slot: u64, at: usize) {
+    println!();
+    println!("  interrupts:");
+
+    // SAFETY: the kernel mapped the device tree read-only before we ran, and
+    // the boot info says how long it is.
+    let fdt = unsafe { Fdt::new(bi.fdt_vaddr as *const u8, bi.fdt_size as usize) };
+    let Some(fdt) = fdt else {
+        println!("    no device tree");
+        return;
+    };
+    let Some(dev) = fdt.find(b"google,goldfish-rtc") else {
+        println!("    no real-time clock in the device tree");
+        return;
+    };
+    let Some(irq) = dev.irq else {
+        println!("    the clock raises no interrupt");
+        return;
+    };
+    println!("    device tree   : rtc at {:#x}, source {irq}", dev.paddr);
+
+    let Some((i, _)) = bi
+        .untypeds()
+        .iter()
+        .enumerate()
+        .find(|(_, u)| u.is_device != 0 && u.paddr == dev.paddr)
+    else {
+        println!("    no device untyped covers it");
+        return;
+    };
+
+    let (frame, ntfn, badged, handler) =
+        (first_slot, first_slot + 1, first_slot + 2, first_slot + 3);
+    sys::retype(bi.untyped_slot(i), ObjectType::Frame, 0, frame, 1).expect("rtc frame");
+    sys::retype(ram, ObjectType::Notification, 0, ntfn, 1).expect("notification");
+    sys::map_frame(frame, vspace, at, rights::READ | rights::WRITE, false).expect("map rtc");
+
+    // The kernel signals with the badge of the capability it was given, so the
+    // one it holds is a badged copy: that bit in the word is what says "the
+    // clock", as opposed to anything else this notification comes to serve.
+    const CLOCK: u64 = 1 << 0;
+    sys::mint(bootinfo::slot::CNODE, ntfn, badged, rights::ALL, CLOCK).expect("mint badge");
+
+    sys::irq_get(bootinfo::slot::IRQ_CONTROL, irq as usize, handler).expect("irq_get");
+    assert!(
+        sys::irq_get(bootinfo::slot::IRQ_CONTROL, irq as usize, handler + 1).is_err(),
+        "the same source was claimed twice"
+    );
+    sys::irq_set_notification(handler, badged).expect("bind");
+    println!("    claimed       : source {irq}, bound to a notification badged {CLOCK:#x}");
+
+    // Arm the clock 20 ms out. Reading TIME_LOW latches TIME_HIGH, so the
+    // order of these two reads is the protocol, not a preference.
+    // SAFETY: `at` is the clock's registers, mapped read-write just above.
+    let target = unsafe {
+        let low = mmio_read(at, rtc::TIME_LOW) as u64;
+        let high = mmio_read(at, rtc::TIME_HIGH) as u64;
+        ((high << 32) | low) + 20_000_000
+    };
+    // SAFETY: as above. High before low: writing the low half is what arms it.
+    unsafe {
+        mmio_write(at, rtc::IRQ_ENABLED, 1);
+        mmio_write(at, rtc::ALARM_HIGH, (target >> 32) as u32);
+        mmio_write(at, rtc::ALARM_LOW, target as u32);
+    }
+    println!("    armed         : alarm 20 ms out; waiting with an empty run queue");
+
+    let word = sys::wait(badged);
+    println!("    woken         : notification word {word:#x}");
+    assert_eq!(word, CLOCK, "woken by something that was not the clock");
+
+    // The source is still masked, and the clock is still asserting until its
+    // own status is cleared. Clear it first, then say so.
+    // SAFETY: as above.
+    unsafe { mmio_write(at, rtc::CLEAR_INTERRUPT, 1) };
+    sys::irq_ack(handler).expect("ack");
+    println!("    acknowledged  : device quiet, source unmasked again");
+
+    // SAFETY: the scratch frame is mapped read-write at `at - 0x20000`.
+    unsafe { ((at - 0x20000) as *mut u64).add(3).write_volatile(word | (irq as u64) << 32) };
 }
 
 thread_entry!(child_start => child);

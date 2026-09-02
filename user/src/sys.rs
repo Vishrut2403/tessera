@@ -188,6 +188,41 @@ pub fn get_address(frame: u64) -> core::result::Result<usize, Error> {
     if result::is_err(a0) { Err(Error(a0)) } else { Ok(a0) }
 }
 
+// --- Notifications and interrupts (D-041) ---
+
+/// Signal a notification: OR this capability's badge into its word and wake
+/// whoever is waiting. Never blocks, so `send` and not `call`.
+pub fn signal(notification: u64) -> Result {
+    send(notification, MessageInfo::default(), [0; MSG_REGS])
+}
+
+/// Wait for a notification, and take the badges that have accumulated.
+///
+/// Returns the whole word: several sources signalling one notification are told
+/// apart by which bits are set, which is how one thread waits in one place.
+pub fn wait(notification: u64) -> u64 {
+    ecall(syscall::RECV, notification, MessageInfo::default(), [0; MSG_REGS], 0).badge
+}
+
+/// Claim one interrupt source, minting an `IrqHandler` for it into `dst`.
+///
+/// Refused if anyone already holds a handler for that source: two drivers
+/// servicing one device is a race, not a configuration.
+pub fn irq_get(control: u64, irq: usize, dst: u64) -> Result {
+    invoke(control, label::IRQ_GET, [irq, dst as usize, 0, 0], 2)
+}
+
+/// Deliver this source to `notification` from now on, and unmask it.
+pub fn irq_set_notification(handler: u64, notification: u64) -> Result {
+    invoke(handler, label::IRQ_SET_NOTIFICATION, [notification as usize, 0, 0, 0], 1)
+}
+
+/// The device is quiet again: unmask the source. Until this arrives it stays
+/// masked, which is what stops a wedged driver's device storming the kernel.
+pub fn irq_ack(handler: u64) -> Result {
+    invoke(handler, label::IRQ_ACK, [0; MSG_REGS], 0)
+}
+
 // --- Invocations on threads ---
 
 pub fn tcb_configure(tcb: u64, cspace: u64, vspace: u64, fault_ep: u64) -> Result {

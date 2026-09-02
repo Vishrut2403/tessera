@@ -330,6 +330,7 @@ pub extern "C" fn dispatch(frame: &mut TrapFrame) {
 
     match cause {
         Cause::Interrupt(5) => crate::time::on_tick(),
+        Cause::Interrupt(9) => crate::sched::on_external_interrupt(),
         Cause::Exception(3) => {
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
             skip_faulting_instruction(frame);

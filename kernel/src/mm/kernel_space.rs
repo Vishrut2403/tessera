@@ -132,6 +132,18 @@ pub fn build(map: &MemoryMap, alloc: &mut impl FrameAllocator) -> Result<Mapper,
         )?;
     }
 
+    // The interrupt controller, whose size the device tree reports: 6 MiB on
+    // QEMU virt, because the per-context register blocks are 4 KiB apart.
+    if let Some(plic) = map.plic {
+        mapper.map_range(
+            VirtAddr::new(KERNEL_VMA + plic.region.start.as_usize()),
+            plic.region.start,
+            plic.region.len(),
+            PteFlags::KERNEL_RW,
+            alloc,
+        )?;
+    }
+
     Ok(mapper)
 }
 

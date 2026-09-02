@@ -23,7 +23,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     kernel::init();
 
     println!();
-    println!("tessera :: M7 -- a real userspace, loaded from ELF");
+    println!("tessera :: M7 -- userspace drivers: ELF, device memory, interrupts");
     println!("  hart          : {}", hartid);
     println!("  device tree   : {:#x}", dtb_pa);
     println!("  sp            : {:#018x}", kernel::stack_pointer());
@@ -316,6 +316,14 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     // and objects are made by userspace out of the untypeds handed over below.
     println!();
     println!("root task:");
+        if let Some(plic) = map.plic {
+        kernel::plic::init(plic);
+        kernel::irq::enable();
+        println!(
+            "  interrupts    : plic at {} ({} sources, hart context {}), sie.SEIE on",
+            plic.region.start, plic.ndev, plic.context
+        );
+    }
     let rt = kernel::root::load(&kspace, &map).expect("could not load the root task");
     println!("  image         : {} KiB of ELF embedded in .rodata", kernel::root::IMAGE.len() / 1024);
     println!("  entry         : {:#x}  (image {:#x}..{:#x})", rt.entry, rt.image.0, rt.image.1);
@@ -342,7 +350,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!();
     println!("  threads exited: {}", sched::exited() - before);
     println!();
-    println!("M7b complete. Parking. (Ctrl-A x to exit QEMU)");
+    println!("M7d complete. Parking. (Ctrl-A x to exit QEMU)");
     qemu::park()
 }
 

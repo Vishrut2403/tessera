@@ -71,6 +71,13 @@ pub mod label {
     pub const SUSPEND: u64 = 11;
     /// PageTable: install the kernel half and bind an ASID (D-037).
     pub const ASSIGN: u64 = 12;
+    /// IrqControl: mint an `IrqHandler` for one source (D-041).
+    pub const IRQ_GET: u64 = 14;
+    /// IrqHandler: deliver this source to a notification from now on.
+    pub const IRQ_SET_NOTIFICATION: u64 = 15;
+    /// IrqHandler: the device is quiet again; unmask the source.
+    pub const IRQ_ACK: u64 = 16;
+
     /// Frame: where it physically is, for a device that does not walk page
     /// tables. Needs `WRITE`, because a physical address is what lets a holder
     /// aim a bus master at memory it has no capability for (D-040).

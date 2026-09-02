@@ -31,6 +31,13 @@ extern "C" fn test_main_entry(_hartid: usize, dtb_pa: usize) -> ! {
     // SAFETY: `kspace` maps this code, this stack and `gp` where they are.
     unsafe { mm::kernel_space::activate(&kspace) };
 
+    // The root task takes a real interrupt, so this image needs the controller
+    // driven and `sie.SEIE` on, exactly as the kernel binary does.
+    if let Some(plic) = map.plic {
+        kernel::plic::init(plic);
+        kernel::irq::enable();
+    }
+
     test_main();
     qemu::exit_success()
 }
@@ -218,6 +225,15 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
         memory_map().devices.iter().any(|d| d.contains(PhysAddr::new(device_pa))),
         "{device_pa:#x} is not a device region the kernel discovered"
     );
+
+    // And the interrupt it took: the low half is the notification word it was
+    // woken with, the high half the source the device tree named.
+    // SAFETY: the same scratch page, one word further on.
+    let irq_word = unsafe { p.add(3).read_volatile() };
+    assert_eq!(irq_word & 0xffff_ffff, 1, "the root task was not woken by its own badge");
+    let irq = (irq_word >> 32) as usize;
+    assert!(irq > 0 && irq < kernel::irq::MAX_IRQ, "source {irq} is not a real interrupt");
+    assert!(kernel::irq::is_claimed(irq), "source {irq} was never claimed");
 
     // The root task and the thread it made, both off the end of `main`.
     assert_eq!(sched::exited() - before, 2);

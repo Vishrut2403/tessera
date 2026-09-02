@@ -37,9 +37,19 @@ pub enum ObjectType {
     Tcb,
     /// An IPC rendezvous point.
     Endpoint,
+    /// An asynchronous wake-up: a word of badges, and whoever is waiting for
+    /// it. What an interrupt becomes on its way to userspace (D-041).
+    Notification,
     /// A one-shot right to reply to a caller. Only the kernel mints these, on
     /// `call`, so it is deliberately absent from everything `retype` accepts.
     Reply,
+    /// The right to claim interrupt sources. One of these exists, and the root
+    /// task starts holding it (D-041).
+    IrqControl,
+    /// The right to receive, and to acknowledge, one interrupt source. Minted
+    /// by `IrqControl`, never retyped: there is no object behind it, so the
+    /// capability *is* the authority.
+    IrqHandler,
 }
 
 impl ObjectType {
@@ -71,9 +81,10 @@ impl ObjectType {
             ObjectType::Frame | ObjectType::PageTable | ObjectType::Tcb => {
                 Some(PAGE_SHIFT as u8)
             }
-            ObjectType::Endpoint => Some(SLOT_BITS),
-            // Never retyped into: minted by the kernel, pointing at a TCB.
-            ObjectType::Reply => None,
+            ObjectType::Endpoint | ObjectType::Notification => Some(SLOT_BITS),
+            // Never retyped into. `Reply` is minted by the kernel on `call`;
+            // the two interrupt kinds have no memory behind them at all.
+            ObjectType::Reply | ObjectType::IrqControl | ObjectType::IrqHandler => None,
         }
     }
 
@@ -101,7 +112,10 @@ impl ObjectType {
             5 => ObjectType::PageTable,
             6 => ObjectType::Tcb,
             7 => ObjectType::Endpoint,
-            8 => ObjectType::Reply,
+            8 => ObjectType::Notification,
+            9 => ObjectType::Reply,
+            10 => ObjectType::IrqControl,
+            11 => ObjectType::IrqHandler,
             _ => return None,
         })
     }
@@ -116,7 +130,10 @@ impl ObjectType {
             ObjectType::PageTable => "page-table",
             ObjectType::Tcb => "tcb",
             ObjectType::Endpoint => "endpoint",
+            ObjectType::Notification => "notification",
             ObjectType::Reply => "reply",
+            ObjectType::IrqControl => "irq-control",
+            ObjectType::IrqHandler => "irq-handler",
         }
     }
 }

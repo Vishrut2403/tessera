@@ -5,6 +5,7 @@
 
 #![no_std]
 
+pub mod fdt;
 pub mod io;
 pub mod sys;
 

@@ -108,6 +108,22 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
     let info_frame = crate::mm::alloc_frame().ok_or(RootError::OutOfMemory)?;
     map_one(&mut space, bootinfo::VADDR, info_frame, PteFlags::USER_RO)?;
 
+    // The device tree, read-only, at its own address. Not copied: the blob is
+    // already in `reserved`, so nothing else will ever be handed those pages.
+    // This is what lets the root task find out which region is a virtio
+    // transport and which interrupt it raises, without the kernel having a
+    // vocabulary of device kinds (D-041).
+    let fdt = map.fdt.page_aligned_out();
+    let fdt_offset = map.fdt.start.as_usize() - fdt.start.as_usize();
+    for (i, page) in (fdt.start.as_usize()..fdt.end.as_usize()).step_by(PAGE_SIZE).enumerate() {
+        map_one(
+            &mut space,
+            bootinfo::FDT_VADDR + i * PAGE_SIZE,
+            PhysAddr::new(page),
+            PteFlags::USER_RO,
+        )?;
+    }
+
     let cnode_pa = alloc_aligned(CNODE_BITS).ok_or(RootError::OutOfMemory)?;
     let tcb_pa = crate::mm::alloc_frame().ok_or(RootError::OutOfMemory)?;
 
@@ -151,6 +167,12 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
         None,
     )?;
     cs.insert(
+        bootinfo::slot::IRQ_CONTROL,
+        depth,
+        RawCap { kind: ObjectType::IrqControl, rights: ALL, ..RawCap::NULL },
+        None,
+    )?;
+    cs.insert(
         bootinfo::slot::BOOTINFO,
         depth,
         RawCap {
@@ -165,7 +187,14 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
         None,
     )?;
 
+    // Every interrupt source starts unclaimed; the root task is the only
+    // holder of the right to claim any of them.
+    crate::irq::reset();
+
     let mut info = BootInfo {
+        fdt_vaddr: (bootinfo::FDT_VADDR + fdt_offset) as u64,
+        fdt_size: map.fdt.len() as u64,
+        max_irq: map.plic.map_or(0, |p| p.ndev as u64),
         cnode_radix: depth as u64,
         cnode_slots: cs.root_slots() as u64,
         image_start: image_start as u64,
