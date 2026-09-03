@@ -909,17 +909,31 @@ fn invoke_untyped(tcb: &mut Tcb, mut cs: CSpace, cptr: u64, info: MessageInfo) -
     finish(tcb, value)
 }
 
-fn invoke_cnode(tcb: &mut Tcb, mut cs: CSpace, _cptr: u64, info: MessageInfo) -> ! {
+/// The invoked CNode is the *destination* space: `dst` is an index in it, at
+/// its own radix, while `src` names a slot in the caller's own root (D-043).
+/// Invoking your own root CNode is therefore exactly the old behaviour.
+fn invoke_cnode(tcb: &mut Tcb, cs: CSpace, cptr: u64, info: MessageInfo) -> ! {
     let depth = cs.root_depth();
     let src = tcb.frame.x[reg::A0 + 2] as u64;
     let dst = tcb.frame.x[reg::A0 + 3] as u64;
-    let rights = tcb.frame.x[reg::A0 + 4] as u8;
+    let rights_mask = tcb.frame.x[reg::A0 + 4] as u8;
     let badge = tcb.frame.x[reg::A0 + 5] as u64;
 
+    // Writing a capability into a CNode is granting authority over whatever it
+    // names, so the destination must be held with `WRITE`.
+    let Ok(target) = cs.read(cptr, depth) else { finish(tcb, result::ERR_BAD_CAP) };
+    if Cap::<kind::CNode, { rights::WRITE }>::from_raw(target).is_err() {
+        finish(tcb, result::ERR_BAD_CAP);
+    }
+    let Ok(mut into) = CSpace::new(target) else { finish(tcb, result::ERR_BAD_CAP) };
+    let into_depth = into.root_depth();
+
     let outcome = match info.label() {
-        label::MINT => cs.mint((src, depth), (dst, depth), rights, badge).map(|()| result::OK),
-        label::REVOKE => cs.revoke(src, depth).map(|_| result::OK),
-        label::DELETE => cs.delete(src, depth).map(|_| result::OK),
+        label::MINT => cs
+            .mint_into(&mut into, (src, depth), (dst, into_depth), rights_mask, badge)
+            .map(|()| result::OK),
+        label::REVOKE => into.revoke(src, into_depth).map(|_| result::OK),
+        label::DELETE => into.delete(src, into_depth).map(|_| result::OK),
         _ => finish(tcb, result::ERR_BAD_LABEL),
     };
     finish(tcb, outcome.unwrap_or(result::ERR_BAD_CAP))

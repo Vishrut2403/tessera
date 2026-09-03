@@ -2,8 +2,10 @@
 
 #![no_std]
 
+pub mod elf;
 pub mod fdt;
 pub mod io;
+pub mod spawn;
 pub mod sys;
 
 pub use abi;

@@ -370,3 +370,87 @@ fn a_hart_with_no_asid_bits_refuses_rather_than_handing_out_zero() {
     let mut pool = AsidPool::new(0);
     assert_eq!(pool.allocate(), Err(AsidError::NotSupported));
 }
+
+// --- Endowing another capability space (D-043) ---
+
+/// A second space, so a capability can be put somewhere its holder cannot
+/// reach: the shape a parent building a child is in.
+fn child_space(parent: &mut CSpace) -> CSpace {
+    parent.retype((0, D), ObjectType::CNode, D + SLOT_BITS, (20, D), &mut [RawCap::NULL])
+        .expect("retype a child cnode");
+    CSpace::new(parent.read(20, D).unwrap()).expect("the child cnode is not a cnode")
+}
+
+#[test_case]
+fn a_capability_can_be_minted_into_another_space() {
+    let mut parent = space();
+    parent.retype((0, D), ObjectType::Frame, 0, (8, D), &mut [RawCap::NULL]).expect("frame");
+    let mut child = child_space(&mut parent);
+
+    parent.mint_into(&mut child, (8, D), (3, D), ALL, 0).expect("mint into the child");
+
+    let there = child.read(3, D).expect("nothing landed in the child");
+    assert_eq!(there.kind, ObjectType::Frame);
+    assert_eq!(there.paddr, parent.read(8, D).unwrap().paddr, "a different frame arrived");
+    // And nothing landed in the parent's own slot 3.
+    assert!(parent.read(3, D).unwrap().is_null(), "the copy went into the parent as well");
+}
+
+#[test_case]
+fn a_copy_in_another_space_is_still_a_descendant_of_the_original() {
+    let mut parent = space();
+    parent.retype((0, D), ObjectType::Frame, 0, (8, D), &mut [RawCap::NULL]).expect("frame");
+    let mut child = child_space(&mut parent);
+    parent.mint_into(&mut child, (8, D), (3, D), ALL, 0).expect("mint");
+
+    assert_eq!(parent.descendants(8, D).unwrap(), 1, "the copy is not linked to its source");
+    // Revoking in the parent reaches across the boundary: authority a parent
+    // handed out is authority it can take back.
+    assert_eq!(parent.revoke(8, D).unwrap(), 1);
+    assert!(child.read(3, D).unwrap().is_null(), "the child kept a revoked capability");
+}
+
+#[test_case]
+fn rights_cannot_be_widened_on_the_way_into_another_space() {
+    let mut parent = space();
+    parent.retype((0, D), ObjectType::Frame, 0, (8, D), &mut [RawCap::NULL]).expect("frame");
+    parent.mint((8, D), (9, D), READ | GRANT, 0).expect("weaken");
+    let mut child = child_space(&mut parent);
+
+    parent.mint_into(&mut child, (9, D), (3, D), ALL, 0).expect("mint");
+    assert_eq!(
+        child.read(3, D).unwrap().rights,
+        READ | GRANT,
+        "a child was handed more rights than its parent held"
+    );
+}
+
+#[test_case]
+fn minting_a_capability_without_grant_into_another_space_is_refused() {
+    let mut parent = space();
+    parent.retype((0, D), ObjectType::Frame, 0, (8, D), &mut [RawCap::NULL]).expect("frame");
+    parent.mint((8, D), (9, D), READ | WRITE, 0).expect("weaken");
+    let mut child = child_space(&mut parent);
+
+    assert_eq!(
+        parent.mint_into(&mut child, (9, D), (3, D), ALL, 0),
+        Err(CapError::MissingRights { wanted: GRANT, held: READ | WRITE }),
+        "a capability that may not be delegated was delegated"
+    );
+    assert!(child.read(3, D).unwrap().is_null());
+}
+
+#[test_case]
+fn an_occupied_slot_in_another_space_is_not_overwritten() {
+    let mut parent = space();
+    parent.retype((0, D), ObjectType::Frame, 0, (8, D), &mut [RawCap::NULL]).expect("frames");
+    parent.retype((0, D), ObjectType::Frame, 0, (9, D), &mut [RawCap::NULL]).expect("frames");
+    let mut child = child_space(&mut parent);
+
+    parent.mint_into(&mut child, (8, D), (3, D), ALL, 0).expect("first");
+    assert_eq!(
+        parent.mint_into(&mut child, (9, D), (3, D), ALL, 0),
+        Err(CapError::SlotOccupied)
+    );
+    assert_eq!(child.read(3, D).unwrap().paddr, parent.read(8, D).unwrap().paddr);
+}

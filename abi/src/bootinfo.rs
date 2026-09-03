@@ -6,7 +6,7 @@ use crate::PAGE_SIZE;
 pub const MAGIC: u64 = 0x7465_7373_6572_6100;
 
 /// Bumped whenever a field moves.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Where the kernel maps the boot info page: above the image and the stack, and
 /// inside the same gigabyte so it costs no extra page tables.
@@ -14,6 +14,9 @@ pub const VADDR: usize = 0x3000_0000;
 
 /// Where the device tree is mapped, read-only, in the same gigabyte.
 pub const FDT_VADDR: usize = 0x3010_0000;
+
+/// Where the boot modules are mapped, read-only, one after another (D-043).
+pub const MODULE_VADDR: usize = 0x3020_0000;
 
 /// The capability slots the kernel fills in before the root task runs.
 pub mod slot {
@@ -29,6 +32,9 @@ pub mod slot {
     pub const BOOTINFO: u64 = 4;
     /// The right to claim interrupt sources (D-041). One exists.
     pub const IRQ_CONTROL: u64 = 5;
+    /// A spawned task's endpoint back to whoever spawned it. Empty in the root
+    /// task: the kernel is not on the other end of anything (D-043).
+    pub const ENDPOINT: u64 = 6;
     /// The first slot holding an untyped region.
     pub const FIRST_UNTYPED: u64 = 8;
 }
@@ -58,6 +64,38 @@ impl UntypedDesc {
 
 /// How many regions the page has room to describe.
 pub const MAX_UNTYPED: usize = 128;
+
+/// How many boot modules the page has room to describe.
+pub const MAX_MODULES: usize = 4;
+
+/// One image the kernel carried in and mapped read-only, for the root task to
+/// load into a process of its own (D-043).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleDesc {
+    pub vaddr: u64,
+    pub size: u64,
+    /// NUL-padded, so a module is found by name and not by position.
+    pub name: [u8; 16],
+}
+
+impl ModuleDesc {
+    pub const EMPTY: ModuleDesc = ModuleDesc { vaddr: 0, size: 0, name: [0; 16] };
+
+    pub const fn new(vaddr: u64, size: u64, name: &str) -> Self {
+        let (bytes, mut name_buf, mut i) = (name.as_bytes(), [0u8; 16], 0);
+        while i < bytes.len() && i < 16 {
+            name_buf[i] = bytes[i];
+            i += 1;
+        }
+        Self { vaddr, size, name: name_buf }
+    }
+
+    pub fn name(&self) -> &str {
+        let len = self.name.iter().position(|c| *c == 0).unwrap_or(self.name.len());
+        core::str::from_utf8(&self.name[..len]).unwrap_or("?")
+    }
+}
 
 #[repr(C)]
 pub struct BootInfo {
@@ -89,7 +127,10 @@ pub struct BootInfo {
     /// The lowest address the root task may map things at without colliding
     /// with anything the kernel put there.
     pub free_vaddr: u64,
+    /// A `u64` so the struct has no implicit padding to leak.
+    pub module_count: u64,
 
+    pub modules: [ModuleDesc; MAX_MODULES],
     pub untyped: [UntypedDesc; MAX_UNTYPED],
 }
 
@@ -113,6 +154,8 @@ impl BootInfo {
         fdt_size: 0,
         max_irq: 0,
         free_vaddr: 0,
+        module_count: 0,
+        modules: [ModuleDesc::EMPTY; MAX_MODULES],
         untyped: [UntypedDesc { paddr: 0, size_bits: 0, is_device: 0, _pad: [0; 6] }; MAX_UNTYPED],
     };
 
@@ -122,6 +165,15 @@ impl BootInfo {
 
     pub fn untypeds(&self) -> &[UntypedDesc] {
         &self.untyped[..self.untyped_count as usize]
+    }
+
+    pub fn modules(&self) -> &[ModuleDesc] {
+        &self.modules[..self.module_count as usize]
+    }
+
+    /// The module called `name`, if the kernel carried one in.
+    pub fn module(&self, name: &str) -> Option<&ModuleDesc> {
+        self.modules().iter().find(|m| m.name() == name)
     }
 
     /// The cptr of the untyped described by `untypeds()[i]`.

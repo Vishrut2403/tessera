@@ -20,6 +20,12 @@ name = "root"
 path = "src/bin/root.rs"
 test = false
 
+# A boot module, not loaded by the kernel: the root task loads it (D-043).
+[[bin]]
+name = "blk"
+path = "src/bin/blk.rs"
+test = false
+
 [dependencies]
 tessera-abi = { path = "../abi" }
 

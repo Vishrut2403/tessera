@@ -1,6 +1,6 @@
 //! Loading the root task: the last thing the kernel creates by itself (D-039).
 
-use abi::bootinfo::{self, BootInfo, UntypedDesc};
+use abi::bootinfo::{self, BootInfo, ModuleDesc, UntypedDesc};
 
 use crate::cap::cspace::{CSpace, init_cnode};
 use crate::cap::object::SLOT_BITS;
@@ -16,6 +16,12 @@ use crate::thread::{Tcb, ThreadId};
 
 /// The root task's ELF, built by `build.rs` and embedded in `.rodata`.
 pub static IMAGE: &[u8] = include_bytes!(env!("ROOT_TASK_ELF"));
+
+/// The images the kernel carries in but does not load: it copies each into
+/// frames and maps them read-only, and the root task loads them itself into
+/// processes of their own (D-043). Multiboot calls these modules; Fuchsia's
+/// kernel carries a whole bootfs the same way.
+pub static MODULES: [(&str, &[u8]); 1] = [("blk", include_bytes!(env!("BLK_ELF")))];
 
 /// Top of the root task's stack. Its image is linked well below this.
 pub const STACK_TOP: usize = 0x2000_0000;
@@ -70,6 +76,8 @@ pub struct RootTask {
     pub untyped_bytes: u64,
     /// How many of `untypeds` are device regions rather than RAM (D-040).
     pub devices: usize,
+    /// Boot modules mapped read-only for the root task to load (D-043).
+    pub modules: usize,
 }
 
 /// Build the root task's address space, capability space and thread, and put it
@@ -109,6 +117,16 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
             PhysAddr::new(page),
             PteFlags::USER_RO,
         )?;
+    }
+
+    // The boot modules, copied into frames of their own so no page of kernel
+    // `.rodata` is ever reachable from userspace, and mapped read-only.
+    let mut modules = [ModuleDesc::EMPTY; bootinfo::MAX_MODULES];
+    let mut module_va = bootinfo::MODULE_VADDR;
+    for (i, (name, bytes)) in MODULES.iter().take(bootinfo::MAX_MODULES).enumerate() {
+        map_module(&mut space, module_va, bytes)?;
+        modules[i] = ModuleDesc::new(module_va as u64, bytes.len() as u64, name);
+        module_va += (bytes.len() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     }
 
     let cnode_pa = alloc_aligned(CNODE_BITS).ok_or(RootError::OutOfMemory)?;
@@ -189,6 +207,8 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
         stack_bottom: (STACK_TOP - STACK_PAGES * PAGE_SIZE) as u64,
         stack_top: STACK_TOP as u64,
         free_vaddr: FREE_VADDR as u64,
+        module_count: MODULES.len().min(bootinfo::MAX_MODULES) as u64,
+        modules,
         ..BootInfo::EMPTY
     };
 
@@ -224,6 +244,7 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
     }
     info.untyped_count = count as u32;
     info.first_free_slot = info.first_untyped + count as u64;
+    let module_count = info.module_count as usize;
 
     // SAFETY: `info_frame` is a frame we own, reachable through the direct map,
     // and `BootInfo` fits in a page by construction.
@@ -248,7 +269,27 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
         untypeds: count,
         untyped_bytes: bytes,
         devices,
+        modules: module_count,
     })
+}
+
+/// Copy a boot module into fresh frames and map it read-only (D-043).
+fn map_module(space: &mut AddressSpace, at: usize, bytes: &[u8]) -> Result<(), RootError> {
+    for (i, chunk) in bytes.chunks(PAGE_SIZE).enumerate() {
+        let frame = crate::mm::alloc_frame().ok_or(RootError::OutOfMemory)?;
+        // SAFETY: a page we just took from the allocator, reachable through the
+        // direct map; `chunk` is at most one page. The tail stays zero because
+        // frames arrive zeroed, so nothing else leaks into the last page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                chunk.as_ptr(),
+                phys_to_virt(frame).as_mut_ptr::<u8>(),
+                chunk.len(),
+            )
+        };
+        map_one(space, at + i * PAGE_SIZE, frame, PteFlags::USER_RO)?;
+    }
+    Ok(())
 }
 
 /// Copy one `PT_LOAD` segment into fresh frames and map them.

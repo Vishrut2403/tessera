@@ -141,16 +141,14 @@ impl CSpace {
         Ok(())
     }
 
-    /// Copy the capability at `src` into the empty slot at `dst`, weakened to
-    /// `rights` and carrying `badge`.
+    /// The copy `mint` would make, and the slot it descends from.
     /// Rights are intersected, never widened.
-    pub fn mint(
-        &mut self,
+    fn prepare_mint(
+        &self,
         src: (u64, u8),
-        dst: (u64, u8),
         rights: u8,
         badge: u64,
-    ) -> Result<(), CapError> {
+    ) -> Result<(RawCap, NonNull<Slot>), CapError> {
         let source = self.resolve(src.0, src.1)?;
         // SAFETY: a live slot we hold exclusively.
         let original = unsafe { source.as_ref().cap };
@@ -163,9 +161,35 @@ impl CSpace {
                 held: original.rights,
             });
         }
+        Ok((RawCap { rights: original.rights & rights, badge, ..original }, source))
+    }
 
-        let copy = RawCap { rights: original.rights & rights, badge, ..original };
+    /// Copy the capability at `src` into the empty slot at `dst`, weakened to
+    /// `rights` and carrying `badge`.
+    pub fn mint(
+        &mut self,
+        src: (u64, u8),
+        dst: (u64, u8),
+        rights: u8,
+        badge: u64,
+    ) -> Result<(), CapError> {
+        let (copy, source) = self.prepare_mint(src, rights, badge)?;
         self.insert(dst.0, dst.1, copy, Some(source))
+    }
+
+    /// `mint`, but into a slot of some *other* capability space -- how a parent
+    /// endows a child it is building (D-043). The copy is still a derivative of
+    /// the source, so revoking the original reclaims it across the boundary.
+    pub fn mint_into(
+        &self,
+        into: &mut CSpace,
+        src: (u64, u8),
+        dst: (u64, u8),
+        rights: u8,
+        badge: u64,
+    ) -> Result<(), CapError> {
+        let (copy, source) = self.prepare_mint(src, rights, badge)?;
+        into.insert(dst.0, dst.1, copy, Some(source))
     }
 
     /// Carve `count` objects out of the untyped at `src` and install them in

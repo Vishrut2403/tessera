@@ -183,6 +183,8 @@ fn a_sub_page_region_yields_nothing() {
 
 #[test_case]
 fn the_root_task_runs_and_starts_a_thread_of_its_own() {
+    // The only test in this image that may call `load`: each call admits
+    // another root task to the run queue, and two of them race for the clock.
     let kspace = kernel_mapper();
     let rt = root::load(&kspace, &memory_map()).expect("the root task did not load");
 
@@ -191,6 +193,41 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
     assert!(rt.devices > 0, "no device regions were handed over");
     assert!(rt.untypeds > rt.devices, "nothing but devices was handed over");
     assert!(rt.space.asid().as_u16() != 0, "the root task's space has no ASID");
+
+    // The boot modules the kernel carried in but did not load: mapped read-only
+    // for the root task to load itself (D-043).
+    assert_eq!(rt.modules, root::MODULES.len());
+    let (module_pa, flags, _) = rt
+        .space
+        .translate(VirtAddr::new(abi::bootinfo::MODULE_VADDR))
+        .expect("no boot module is mapped");
+    assert!(flags.contains(kernel::mm::PteFlags::U), "a module is not user-reachable");
+    assert!(flags.contains(kernel::mm::PteFlags::R), "a module is not readable");
+    assert!(!flags.contains(kernel::mm::PteFlags::W), "a module is writable");
+    assert!(!flags.contains(kernel::mm::PteFlags::X), "a module is executable in place");
+    assert_ne!(
+        module_pa,
+        PhysAddr::new(root::MODULES[0].1.as_ptr() as usize),
+        "the module was mapped in place rather than copied"
+    );
+    let seen = mm::phys_to_virt(module_pa).as_ptr::<u8>();
+    for (i, byte) in root::MODULES[0].1.iter().take(64).enumerate() {
+        // SAFETY: a frame the kernel filled, read back through the direct map.
+        assert_eq!(unsafe { seen.add(i).read_volatile() }, *byte, "module byte {i} differs");
+    }
+
+    // And the boot info names each one, so the root task can ask for it.
+    let (info_pa, _, _) =
+        rt.space.translate(VirtAddr::new(abi::bootinfo::VADDR)).expect("no boot info page");
+    // SAFETY: the page the kernel just wrote a `BootInfo` into.
+    let bi = unsafe { &*mm::phys_to_virt(info_pa).as_ptr::<abi::BootInfo>() };
+    assert_eq!(bi.modules().len(), root::MODULES.len());
+    for (name, bytes) in root::MODULES {
+        let m = bi.module(name).unwrap_or_else(|| panic!("no module called {name}"));
+        assert_eq!(m.size, bytes.len() as u64);
+        assert!(rt.space.translate(VirtAddr::new(m.vaddr as usize)).is_some());
+    }
+    assert!(bi.module("nothing-by-this-name").is_none());
 
     // Nothing maps the scratch region yet: the root task builds the two
     // intermediate page tables and the mapping itself (D-035).
@@ -235,6 +272,28 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
     assert!(irq > 0 && irq < kernel::irq::MAX_IRQ, "source {irq} is not a real interrupt");
     assert!(kernel::irq::is_claimed(irq), "source {irq} was never claimed");
 
-    // The root task and the thread it made, both off the end of `main`.
-    assert_eq!(sched::exited() - before, 2);
+    // The task it loaded out of a boot module, in an address space of its own,
+    // answered -- and its own page at the address the root task also has a page
+    // at held something else (D-043).
+    // SAFETY: the same scratch page, one word further on.
+    let spawned = unsafe { p.add(4).read_volatile() };
+    assert_eq!(spawned >> 48, 0x5b1c, "the root task spawned nothing: {spawned:#x}");
+    assert!(spawned & 0xffff != 0, "the spawned task reported no thread id");
+
+    // The root task, the thread it made, and the process it loaded.
+    assert_eq!(sched::exited() - before, 3);
 }
+
+// --- Boot modules (D-043) ---
+
+#[test_case]
+fn every_boot_module_is_a_riscv_executable() {
+    assert!(!root::MODULES.is_empty(), "no boot modules were embedded");
+    for (name, bytes) in root::MODULES {
+        let elf =
+            Elf::parse(bytes).unwrap_or_else(|e| panic!("module {name} does not parse: {e:?}"));
+        let (lo, hi) = elf.image_range().expect("no loadable segments");
+        assert!(lo <= elf.entry() && elf.entry() < hi, "module {name}: entry outside its image");
+    }
+}
+

@@ -5,9 +5,9 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use rt::abi::{BootInfo, ObjectType, bootinfo, rights};
+use rt::abi::{BootInfo, MessageInfo, ObjectType, bootinfo, rights};
 use rt::fdt::Fdt;
-use rt::{entry, print, println, sys, thread_entry};
+use rt::{entry, print, println, spawn, sys, thread_entry};
 
 entry!(main);
 
@@ -16,6 +16,13 @@ static CHILD_RAN: AtomicUsize = AtomicUsize::new(0);
 
 /// Written to the scratch page when the root task has finished successfully.
 pub const DONE: u64 = 0xd02e_0000_0000_0000;
+
+/// What the root task writes to the page it shares an *address* -- not a page
+/// -- with the task it spawns.
+pub const PARENT_MAGIC: u64 = 0x0dad_0000_0000_0001;
+
+/// Written to the scratch page once a spawned task has answered.
+pub const SPAWNED: u64 = 0x5b1c_0000_0000_0000;
 
 fn main() {
     // SAFETY: the kernel mapped a `BootInfo` here read-only before we ran, and
@@ -118,9 +125,63 @@ fn main() {
 
     check_device_untyped(bi, vspace, f + 8, base + 0x10000, ut);
     wait_for_an_interrupt(bi, vspace, ut, f + 16, base + 0x20000);
+    let spawned = spawn_a_driver(bi, vspace, ut, f + 24, base + 0x30000);
+
+    // SAFETY: the scratch frame is still mapped read-write at `base`.
+    unsafe { (base as *mut u64).add(4).write_volatile(spawned) };
 
     println!();
     println!("root task: done.");
+}
+
+/// Load a boot module into a process of its own -- new address space, new
+/// capability space, new thread -- with no help from the kernel (D-043).
+fn spawn_a_driver(bi: &BootInfo, vspace: u64, ram: u64, first_slot: u64, scratch: usize) -> u64 {
+    println!();
+    println!("  spawning:");
+
+    let Some(module) = bi.module("blk") else {
+        println!("    no blk module in the boot info");
+        return 0;
+    };
+    println!("    module        : {} at {:#x}, {} bytes", module.name(), module.vaddr, module.size);
+
+    // SAFETY: the kernel mapped the module read-only before we ran, and the
+    // boot info says how long it is.
+    let image =
+        unsafe { core::slice::from_raw_parts(module.vaddr as *const u8, module.size as usize) };
+
+    // A page of our own at the address the child will also have a page at.
+    // Two processes, one virtual address, two different frames.
+    let ours = first_slot;
+    sys::retype(ram, ObjectType::Frame, 0, ours, 1).expect("shared frame");
+    sys::map_frame(ours, vspace, spawn::SHARED_VADDR, rights::READ | rights::WRITE, false)
+        .expect("map ours");
+    // SAFETY: a frame we just retyped and mapped read-write.
+    unsafe { (spawn::SHARED_VADDR as *mut u64).write_volatile(PARENT_MAGIC) };
+
+    let mut nursery =
+        spawn::Nursery { untyped: ram, next_slot: first_slot + 1, vspace, scratch };
+    let child = spawn::spawn(image, &mut nursery).expect("spawn");
+    println!(
+        "    loaded        : entry {:#x}, {} objects retyped, running",
+        child.entry,
+        nursery.next_slot - first_slot - 1
+    );
+
+    // It holds the endpoint with WRITE alone; we hold the original, so we are
+    // the only one who can receive on it (D-042).
+    let msg = sys::recv(child.endpoint);
+    assert_eq!(msg.info.label(), spawn::HELLO, "the child said something else");
+    sys::reply(MessageInfo::new(spawn::HELLO, 1, false), [0xacc_e5_ed, 0, 0, 0]).expect("reply");
+
+    // SAFETY: our own frame, still mapped where we put it.
+    let ours_now = unsafe { (spawn::SHARED_VADDR as *const u64).read_volatile() };
+    assert_eq!(ours_now, PARENT_MAGIC, "the child reached into our address space");
+    assert_ne!(msg.words[1] as u64, PARENT_MAGIC, "the child read our page, not its own");
+    println!("    child said    : thread {}, wrote {:#x}", msg.words[0], msg.words[1]);
+    println!("    {:#x}    : {ours_now:#x} to us, {:#x} to it", msg.words[2], msg.words[1]);
+    SPAWNED | msg.words[0] as u64
 }
 
 /// Check what a device untyped is and is not allowed to become, from the

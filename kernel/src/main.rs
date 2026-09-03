@@ -333,6 +333,11 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         rt.untyped_bytes / 1024
     );
     println!("  device untyped: {} regions, one per device tree `reg`", rt.devices);
+    println!(
+        "  boot modules  : {} mapped read-only at {:#x}, for the root task to load",
+        rt.modules,
+        abi::bootinfo::MODULE_VADDR
+    );
     println!("  thread        : {}", rt.id);
 
     let before = sched::exited();
@@ -348,7 +353,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!();
     println!("  threads exited: {}", sched::exited() - before);
     println!();
-    println!("M7d complete. Parking. (Ctrl-A x to exit QEMU)");
+    println!("M7e-1 complete. Parking. (Ctrl-A x to exit QEMU)");
     qemu::park()
 }
 
