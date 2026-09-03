@@ -91,9 +91,29 @@ pub mod result {
     pub const ERR_STATE: usize = usize::MAX - 5;
     /// The address space has no ASID, or the pool had none left.
     pub const ERR_ASID: usize = usize::MAX - 6;
+    /// A mapping needs an intermediate page table that does not exist. The
+    /// kernel makes none, so this is the caller's to fix by retyping one and
+    /// trying again (D-035).
+    pub const ERR_NO_TABLE: usize = usize::MAX - 7;
+
+    /// The smallest error code there is. A new code goes *below* this line and
+    /// this constant moves with it, or `is_err` silently stops recognising it.
+    pub const LAST: usize = ERR_NO_TABLE;
 
     /// Whether `a0` came back as one of the error codes above.
     pub const fn is_err(a0: usize) -> bool {
-        a0 >= ERR_ASID
+        a0 >= LAST
     }
+
+    /// Every code, so a test can prove `LAST` was moved when one was added.
+    pub const ALL: [usize; 8] = [
+        ERR_BAD_CAP,
+        ERR_BAD_LABEL,
+        ERR_NO_REPLY,
+        ERR_NO_CSPACE,
+        ERR_MAP,
+        ERR_STATE,
+        ERR_ASID,
+        ERR_NO_TABLE,
+    ];
 }

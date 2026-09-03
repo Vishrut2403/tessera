@@ -105,30 +105,33 @@ impl<'a> Fdt<'a> {
         Some(())
     }
 
-    /// The first device whose `compatible` list contains `what`.
-    pub fn find(&self, what: &[u8]) -> Option<Device> {
-        let mut node = [0u8; 64];
-        let mut node_len = 0usize;
-        self.walk(|n, name, value| {
-            if node_len == 0
-                && name == b"compatible"
-                && value.windows(what.len()).any(|w| w == what)
-                && n.len() <= node.len()
-            {
-                node[..n.len()].copy_from_slice(n);
-                node_len = n.len();
-            }
-        })?;
-        if node_len == 0 {
-            return None;
-        }
-
+    /// Every device whose `compatible` list contains `what`, in tree order.
+    /// Properties arrive grouped by node, so a node is complete as soon as the
+    /// next one starts -- which is why the last one is flushed after the walk.
+    pub fn each_compatible(&self, what: &[u8], mut f: impl FnMut(Device)) -> Option<()> {
+        let mut name_buf = [0u8; 64];
+        let mut name_len = 0usize;
         let mut device = Device::default();
-        self.walk(|n, name, value| {
-            if n != &node[..node_len] {
+        let mut matches = false;
+        let f = &mut f;
+
+        self.walk(|node, prop, value| {
+            if node.len() > name_buf.len() {
                 return;
             }
-            match name {
+            if name_len != node.len() || name_buf[..name_len] != *node {
+                if matches && device.size != 0 {
+                    f(device);
+                }
+                name_buf[..node.len()].copy_from_slice(node);
+                name_len = node.len();
+                device = Device::default();
+                matches = false;
+            }
+            match prop {
+                b"compatible" => {
+                    matches = value.windows(what.len()).any(|w| w == what);
+                }
                 // Two address cells and two size cells: what `/` and `/soc`
                 // both declare on this platform.
                 b"reg" => {
@@ -142,6 +145,20 @@ impl<'a> Fdt<'a> {
             }
         })?;
 
-        (device.size != 0).then_some(device)
+        if matches && device.size != 0 {
+            f(device);
+        }
+        Some(())
+    }
+
+    /// The first device whose `compatible` list contains `what`.
+    pub fn find(&self, what: &[u8]) -> Option<Device> {
+        let mut found = None;
+        self.each_compatible(what, |d| {
+            if found.is_none() {
+                found = Some(d);
+            }
+        })?;
+        found
     }
 }

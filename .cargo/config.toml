@@ -10,15 +10,20 @@ rustflags = [
 ]
 
 # `cargo run` and `cargo test` both go through this; OpenSBI is `-bios default`.
+#
+# It is a shell line rather than a plain argument list because of the disk
+# (D-044). `cargo run` runs the binary from wherever cargo was invoked, but a
+# test binary runs from its own package directory, so no single *relative* path
+# to the image is right for both. `$0` is the kernel image cargo appends, and
+# every build of it lives under the workspace's `target/`, so stripping from
+# the first `target/` onwards recovers the workspace root -- for the absolute
+# path `cargo test` passes and the relative one `cargo run` passes alike.
+#
+# `kernel/build.rs` writes the image; QEMU refuses to start without it, and
+# every test image boots through this runner.
 runner = [
-    "qemu-system-riscv64",
-    "-machine", "virt",
-    "-cpu", "rv64",
-    "-smp", "1",
-    "-m", "128M",
-    "-nographic",
-    "-bios", "default",
-    "-kernel",
+    "sh", "-c",
+    'root=${0%%target/*}; exec qemu-system-riscv64 -machine virt -cpu rv64 -smp 1 -m 128M -nographic -bios default -global virtio-mmio.force-legacy=false -drive file="${root}target/disk.img",if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -kernel "$0"',
 ]
 
 [alias]
@@ -27,10 +32,10 @@ runner = [
 # counter tracks guest execution instead of host wall-clock time (O-009).
 bench-ipc = [
     "test", "--test", "bench", "--config",
-    "target.riscv64gc-unknown-none-elf.runner=['qemu-system-riscv64','-machine','virt','-cpu','rv64','-smp','1','-m','128M','-nographic','-bios','default','-icount','shift=0','-kernel']",
+    'target.riscv64gc-unknown-none-elf.runner=["sh","-c","root=${0%%target/*}; exec qemu-system-riscv64 -machine virt -cpu rv64 -smp 1 -m 128M -nographic -bios default -global virtio-mmio.force-legacy=false -drive file=\"${root}target/disk.img\",if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -icount shift=0 -kernel \"$0\""]',
 ]
 
 kdebug = [
     "run", "--config",
-    "target.riscv64gc-unknown-none-elf.runner=['qemu-system-riscv64','-machine','virt','-cpu','rv64','-smp','1','-m','128M','-nographic','-bios','default','-s','-S','-kernel']",
+    'target.riscv64gc-unknown-none-elf.runner=["sh","-c","root=${0%%target/*}; exec qemu-system-riscv64 -machine virt -cpu rv64 -smp 1 -m 128M -nographic -bios default -global virtio-mmio.force-legacy=false -drive file=\"${root}target/disk.img\",if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -s -S -kernel \"$0\""]',
 ]

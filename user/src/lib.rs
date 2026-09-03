@@ -7,6 +7,8 @@ pub mod fdt;
 pub mod io;
 pub mod spawn;
 pub mod sys;
+pub mod virtio;
+pub mod vm;
 
 pub use abi;
 pub use sys::{Error, Result};

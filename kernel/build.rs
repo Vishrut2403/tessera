@@ -13,6 +13,33 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
 
     build_user(&dir);
+    make_disk(&dir);
+}
+
+/// The raw image the QEMU runner attaches as a virtio-blk device (D-044).
+/// Created here rather than by hand so a fresh clone can `cargo test` with no
+/// extra step: QEMU refuses to start at all if the file is missing.
+fn make_disk(kernel_dir: &PathBuf) {
+    const BLOCKS: usize = 2048;
+    const BLOCK: usize = 512;
+
+    let path = kernel_dir.join("../target/disk.img");
+    println!("cargo::rerun-if-changed={}", path.display());
+    if path.metadata().is_ok_and(|m| m.len() == (BLOCKS * BLOCK) as u64) {
+        return;
+    }
+
+    // Each block holds its own number, so a driver that reads block N and gets
+    // block M has a bug that says which block it actually fetched.
+    let mut image = vec![0u8; BLOCKS * BLOCK];
+    for (n, block) in image.chunks_mut(BLOCK).enumerate() {
+        block[..8].copy_from_slice(&(0x7e55e7a_0000_0000u64 | n as u64).to_le_bytes());
+        block[BLOCK - 8..].copy_from_slice(&(n as u64).to_le_bytes());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("could not make the target directory");
+    }
+    std::fs::write(&path, &image).expect("could not write the disk image");
 }
 
 /// The user binaries the kernel embeds: the root task it loads, and the boot

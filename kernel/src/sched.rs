@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::cap::cspace::CSpace;
 use crate::cap::{Cap, CapError, ObjectType, RawCap, kind, rights};
 use crate::ipc::{self, EndpointState, MessageInfo};
+use crate::mm::page_table::MapError;
 use crate::mm::{AddressSpace, VirtAddr};
 use crate::sync::SpinLock;
 use crate::thread::{Tcb, ThreadId, ThreadState};
@@ -966,12 +967,16 @@ fn invoke_mapping(tcb: &mut Tcb, cs: CSpace, cptr: u64, info: MessageInfo) -> ! 
                 let executable = level != 0 && cap.rights & crate::cap::rights::GRANT != 0;
                 crate::cap::vspace::map_frame(cap, &vspace, vaddr, rights_mask, executable)
             };
-            finish(tcb, outcome.map_or(result::ERR_MAP, |()| result::OK))
+            // Through `cap_result`, not a flat `ERR_MAP`, so a missing
+            // intermediate level is distinguishable from every other way a
+            // mapping can fail -- which is what D-035 always assumed.
+            finish(tcb, outcome.map_or_else(cap_result, |()| result::OK))
         }
         label::UNMAP => {
             // SAFETY: as above.
             let cap = unsafe { &mut target.clone().as_mut().cap };
-            finish(tcb, crate::cap::vspace::unmap(cap).map_or(result::ERR_MAP, |()| result::OK))
+            let outcome = crate::cap::vspace::unmap(cap);
+            finish(tcb, outcome.map_or_else(cap_result, |()| result::OK))
         }
         label::GET_ADDRESS => {
             // SAFETY: as above.
@@ -1000,6 +1005,9 @@ fn cap_result(e: CapError) -> usize {
     match e {
         CapError::SelfInvocation | CapError::NotInactive => result::ERR_STATE,
         CapError::NotAssigned | CapError::AlreadyAssigned | CapError::Asid(_) => result::ERR_ASID,
+        // Distinguished from every other mapping failure because it is the one
+        // the caller can act on: retype a page table and try again (D-035).
+        CapError::Map(MapError::MissingTable) => result::ERR_NO_TABLE,
         CapError::AlreadyMapped | CapError::Map(_) => result::ERR_MAP,
         _ => result::ERR_BAD_CAP,
     }

@@ -6,8 +6,8 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use rt::abi::{BootInfo, MessageInfo, ObjectType, bootinfo, rights};
-use rt::fdt::Fdt;
-use rt::{entry, print, println, spawn, sys, thread_entry};
+use rt::fdt::{Device, Fdt};
+use rt::{entry, println, spawn, sys, thread_entry};
 
 entry!(main);
 
@@ -125,24 +125,34 @@ fn main() {
 
     check_device_untyped(bi, vspace, f + 8, base + 0x10000, ut);
     wait_for_an_interrupt(bi, vspace, ut, f + 16, base + 0x20000);
-    let spawned = spawn_a_driver(bi, vspace, ut, f + 24, base + 0x30000);
+    let (spawned, sectors) = spawn_a_driver(bi, vspace, ut, f + 24, base + 0x30000);
 
     // SAFETY: the scratch frame is still mapped read-write at `base`.
-    unsafe { (base as *mut u64).add(4).write_volatile(spawned) };
+    unsafe {
+        (base as *mut u64).add(4).write_volatile(spawned);
+        (base as *mut u64).add(5).write_volatile(sectors);
+    }
 
     println!();
     println!("root task: done.");
 }
 
 /// Load a boot module into a process of its own -- new address space, new
-/// capability space, new thread -- with no help from the kernel (D-043).
-fn spawn_a_driver(bi: &BootInfo, vspace: u64, ram: u64, first_slot: u64, scratch: usize) -> u64 {
+/// capability space, new thread -- with no help from the kernel (D-043), then
+/// bring it up as a device driver over the endpoint it starts with (D-044).
+fn spawn_a_driver(
+    bi: &BootInfo,
+    vspace: u64,
+    ram: u64,
+    first_slot: u64,
+    scratch: usize,
+) -> (u64, u64) {
     println!();
     println!("  spawning:");
 
     let Some(module) = bi.module("blk") else {
         println!("    no blk module in the boot info");
-        return 0;
+        return (0, 0);
     };
     println!("    module        : {} at {:#x}, {} bytes", module.name(), module.vaddr, module.size);
 
@@ -153,35 +163,169 @@ fn spawn_a_driver(bi: &BootInfo, vspace: u64, ram: u64, first_slot: u64, scratch
 
     // A page of our own at the address the child will also have a page at.
     // Two processes, one virtual address, two different frames.
-    let ours = first_slot;
+    let (ours, child_ram, handler, ntfn, badged) =
+        (first_slot, first_slot + 1, first_slot + 2, first_slot + 3, first_slot + 4);
     sys::retype(ram, ObjectType::Frame, 0, ours, 1).expect("shared frame");
     sys::map_frame(ours, vspace, spawn::SHARED_VADDR, rights::READ | rights::WRITE, false)
         .expect("map ours");
     // SAFETY: a frame we just retyped and mapped read-write.
     unsafe { (spawn::SHARED_VADDR as *mut u64).write_volatile(PARENT_MAGIC) };
 
-    let mut nursery =
-        spawn::Nursery { untyped: ram, next_slot: first_slot + 1, vspace, scratch };
-    let child = spawn::spawn(image, &mut nursery).expect("spawn");
+    // Memory of its own to retype from: a driver that had to ask us for every
+    // page table would not be much of a separate process.
+    sys::retype(ram, ObjectType::Untyped, 18, child_ram, 1).expect("child untyped");
+
+    let (transports, count) = virtio_transports(bi);
+    let mut grants = [spawn::Grant { src: 0, dst: 0, rights: 0 }; 1 + MAX_TRANSPORTS];
+    grants[0] = spawn::Grant { src: child_ram, dst: spawn::UNTYPED, rights: rights::ALL };
+    for i in 0..count {
+        grants[i + 1] = spawn::Grant {
+            src: transports[i].1,
+            dst: spawn::FIRST_DEVICE + i as u64,
+            rights: rights::ALL,
+        };
+    }
+    println!("    endowed       : 256 KiB of untyped and {count} virtio transports to probe");
+
+    let mut nursery = spawn::Nursery::new(ram, first_slot + 5, vspace, scratch);
+    let child = spawn::spawn(image, &mut nursery, &grants[..count + 1]).expect("spawn");
     println!(
         "    loaded        : entry {:#x}, {} objects retyped, running",
         child.entry,
-        nursery.next_slot - first_slot - 1
+        nursery.alloc.next_slot - first_slot - 5
     );
 
-    // It holds the endpoint with WRITE alone; we hold the original, so we are
-    // the only one who can receive on it (D-042).
-    let msg = sys::recv(child.endpoint);
-    assert_eq!(msg.info.label(), spawn::HELLO, "the child said something else");
-    sys::reply(MessageInfo::new(spawn::HELLO, 1, false), [0xacc_e5_ed, 0, 0, 0]).expect("reply");
+    serve(&child, &transports[..count], ram, handler, ntfn, badged)
+}
 
-    // SAFETY: our own frame, still mapped where we put it.
-    let ours_now = unsafe { (spawn::SHARED_VADDR as *const u64).read_volatile() };
-    assert_eq!(ours_now, PARENT_MAGIC, "the child reached into our address space");
-    assert_ne!(msg.words[1] as u64, PARENT_MAGIC, "the child read our page, not its own");
-    println!("    child said    : thread {}, wrote {:#x}", msg.words[0], msg.words[1]);
-    println!("    {:#x}    : {ours_now:#x} to us, {:#x} to it", msg.words[2], msg.words[1]);
-    SPAWNED | msg.words[0] as u64
+/// How many virtio-mmio transports the platform is expected to present.
+const MAX_TRANSPORTS: usize = 8;
+
+/// Every virtio-mmio transport the device tree names, paired with the device
+/// untyped that covers it. Nothing is hardcoded: the tree says where each one
+/// is and which source it raises.
+fn virtio_transports(bi: &BootInfo) -> ([(Device, u64); MAX_TRANSPORTS], usize) {
+    let mut out = [(Device::default(), 0u64); MAX_TRANSPORTS];
+    let mut count = 0usize;
+
+    // SAFETY: the kernel mapped the device tree read-only before we ran, and
+    // the boot info says how long it is.
+    let Some(fdt) = (unsafe { Fdt::new(bi.fdt_vaddr as *const u8, bi.fdt_size as usize) }) else {
+        return (out, 0);
+    };
+    fdt.each_compatible(b"virtio,mmio", |device| {
+        if count == MAX_TRANSPORTS {
+            return;
+        }
+        // A transport we hold no capability for is one we cannot hand over.
+        let found = bi
+            .untypeds()
+            .iter()
+            .enumerate()
+            .find(|(_, u)| u.is_device != 0 && u.paddr == device.paddr);
+        if let Some((i, _)) = found {
+            out[count] = (device, bi.untyped_slot(i));
+            count += 1;
+        }
+    });
+    (out, count)
+}
+
+/// The bring-up conversation, from the parent's side.
+fn serve(
+    child: &spawn::Child,
+    transports: &[(Device, u64)],
+    ram: u64,
+    handler: u64,
+    ntfn: u64,
+    badged: u64,
+) -> (u64, u64) {
+    /// The badge the driver's interrupt arrives under.
+    const DISK: u64 = 1 << 1;
+    let mut result = 0u64;
+
+    loop {
+        let msg = sys::recv(child.endpoint);
+        match msg.info.label() {
+            spawn::HELLO => {
+                // SAFETY: our own frame, still mapped where we put it.
+                let ours = unsafe { (spawn::SHARED_VADDR as *const u64).read_volatile() };
+                assert_eq!(ours, PARENT_MAGIC, "the child reached into our address space");
+                assert_ne!(msg.words[1] as u64, PARENT_MAGIC, "the child read our page");
+                println!("    child said    : thread {}, wrote {:#x}", msg.words[0], msg.words[1]);
+                println!("    {:#x}    : {ours:#x} to us, {:#x} to it", msg.words[2], msg.words[1]);
+                result = SPAWNED | msg.words[0] as u64;
+                sys::reply(MessageInfo::new(spawn::HELLO, 1, false), [0xacc_e5ed, 0, 0, 0])
+                    .expect("reply");
+            }
+            spawn::CLAIM_IRQ => {
+                let irq =
+                    claim_for(child, transports, msg.words[0], ram, handler, ntfn, badged, DISK);
+                sys::reply(MessageInfo::new(spawn::CLAIM_IRQ, 1, false), [irq, 0, 0, 0])
+                    .expect("reply");
+            }
+            spawn::READY => {
+                let sectors = msg.words[0] as u64;
+                assert!(sectors > 0, "the driver never brought a device up");
+                println!("    driver up     : {sectors} sectors visible to it");
+                sys::reply(MessageInfo::new(spawn::READY, 0, false), [0; 4]).expect("reply");
+                return (result, sectors);
+            }
+            other => {
+                println!("    unknown message {other:#x} from the driver");
+                sys::reply(MessageInfo::new(0, 0, false), [0; 4]).expect("reply");
+                return (result, 0);
+            }
+        }
+    }
+}
+
+/// Claim the source the driver asked for, bind it to a notification, hand both
+/// over -- and take back every transport it did not keep. Probing needs breadth;
+/// running does not (D-044).
+#[allow(clippy::too_many_arguments)]
+fn claim_for(
+    child: &spawn::Child,
+    transports: &[(Device, u64)],
+    index: usize,
+    ram: u64,
+    handler: u64,
+    ntfn: u64,
+    badged: u64,
+    badge: u64,
+) -> usize {
+    let Some((device, _)) = transports.get(index) else {
+        println!("    claim         : the driver asked for a transport we never gave it");
+        return 0;
+    };
+    let Some(irq) = device.irq else {
+        println!("    claim         : transport {index} raises no interrupt");
+        return 0;
+    };
+
+    sys::retype(ram, ObjectType::Notification, 0, ntfn, 1).expect("notification");
+    sys::mint(bootinfo::slot::CNODE, ntfn, badged, rights::ALL, badge).expect("mint badge");
+    sys::irq_get(bootinfo::slot::IRQ_CONTROL, irq as usize, handler).expect("irq_get");
+    sys::irq_set_notification(handler, badged).expect("bind");
+
+    sys::mint(child.cnode, handler, spawn::IRQ_HANDLER, rights::ALL, 0).expect("mint handler");
+    sys::mint(child.cnode, badged, spawn::NOTIFICATION, rights::READ, badge).expect("mint ntfn");
+
+    // Everything it probed but did not want. `delete` empties the slot in the
+    // child's CNode and revokes what was derived from it, so the frame the
+    // driver mapped over those registers is unmapped with it.
+    let mut taken = 0;
+    for i in 0..transports.len() {
+        if i != index {
+            let _ = sys::delete(child.cnode, spawn::FIRST_DEVICE + i as u64);
+            taken += 1;
+        }
+    }
+    println!(
+        "    claim         : {:#x} raises source {irq}; {taken} unused transports taken back",
+        device.paddr
+    );
+    irq as usize
 }
 
 /// Check what a device untyped is and is not allowed to become, from the

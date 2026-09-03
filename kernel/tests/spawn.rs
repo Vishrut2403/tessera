@@ -249,3 +249,26 @@ fn a_module_name_survives_the_round_trip_through_the_boot_info() {
     let long = abi::bootinfo::ModuleDesc::new(0, 0, "a-name-far-longer-than-sixteen-bytes");
     assert_eq!(long.name().len(), 16);
 }
+
+// --- The result ABI ---
+
+#[test_case]
+fn every_error_code_is_recognised_as_an_error() {
+    // `is_err` is a range check against the smallest code, so adding one below
+    // it without moving `LAST` makes the new code read as success. That is not
+    // hypothetical: `ERR_NO_TABLE` did exactly that, and a mapping that failed
+    // for want of a page table came back to userspace as `Ok`.
+    for code in result::ALL {
+        assert!(result::is_err(code), "{code:#x} is not recognised as an error");
+    }
+    assert!(!result::is_err(result::OK));
+    assert!(!result::is_err(result::ALL[result::ALL.len() - 1] - 1), "the range is too wide");
+}
+
+#[test_case]
+fn a_missing_page_table_is_its_own_error() {
+    // The one mapping failure a caller can do something about, so it must not
+    // be flattened into every other one (D-035).
+    assert_ne!(result::ERR_NO_TABLE, result::ERR_MAP);
+    assert!(result::is_err(result::ERR_NO_TABLE));
+}

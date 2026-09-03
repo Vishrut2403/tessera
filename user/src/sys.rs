@@ -11,6 +11,12 @@ pub struct Error(pub usize);
 pub type Result<T = ()> = core::result::Result<T, Error>;
 
 impl Error {
+    /// Whether this is the one mapping failure a caller can fix, by retyping
+    /// an intermediate page table and trying again (D-035).
+    pub const fn is_missing_table(self) -> bool {
+        self.0 == result::ERR_NO_TABLE
+    }
+
     pub const fn name(self) -> &'static str {
         match self.0 {
             result::ERR_BAD_CAP => "bad capability",
@@ -20,6 +26,7 @@ impl Error {
             result::ERR_MAP => "mapping failed",
             result::ERR_STATE => "wrong thread state",
             result::ERR_ASID => "asid",
+            result::ERR_NO_TABLE => "no intermediate page table",
             _ => "unknown",
         }
     }

@@ -280,6 +280,14 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
     assert_eq!(spawned >> 48, 0x5b1c, "the root task spawned nothing: {spawned:#x}");
     assert!(spawned & 0xffff != 0, "the spawned task reported no thread id");
 
+    // And it brought a real device up: probe, feature negotiation, a queue and
+    // `DRIVER_OK`, all from an unprivileged process (D-044). The capacity is
+    // the image `kernel/build.rs` writes, so this is end to end -- the driver
+    // read it out of the device's own configuration space.
+    // SAFETY: the same scratch page, one word further on.
+    let sectors = unsafe { p.add(5).read_volatile() };
+    assert_eq!(sectors, 2048, "the driver reported {sectors} sectors, not the disk image's 2048");
+
     // The root task, the thread it made, and the process it loaded.
     assert_eq!(sched::exited() - before, 3);
 }
