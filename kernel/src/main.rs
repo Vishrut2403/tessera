@@ -353,7 +353,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!();
     println!("  threads exited: {}", sched::exited() - before);
     println!();
-    println!("M7e-2 complete. Parking. (Ctrl-A x to exit QEMU)");
+    println!("M7e-3 complete. Parking. (Ctrl-A x to exit QEMU)");
     qemu::park()
 }
 

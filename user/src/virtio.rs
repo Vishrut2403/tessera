@@ -61,6 +61,13 @@ pub const DESC_OFF: usize = 0;
 pub const AVAIL_OFF: usize = 16 * QUEUE_SIZE as usize;
 pub const USED_OFF: usize = 256;
 
+/// Descriptor flags. `NEXT` chains, `WRITE` marks a buffer the *device* may
+/// write -- which is how it learns which parts of a request are output.
+pub mod desc_flags {
+    pub const NEXT: u16 = 1;
+    pub const WRITE: u16 = 2;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioError {
     /// The register block did not start with the virtio magic.
@@ -210,10 +217,119 @@ impl Transport {
         self.add_status(status::DRIVER_OK);
     }
 
+    /// Tell the device there is something new in queue `q`'s available ring.
+    pub fn notify(&self, q: u32) {
+        self.write(reg::QUEUE_NOTIFY, q);
+    }
+
+    /// Why the device raised its interrupt line. Bit 0 is a used-ring update.
+    pub fn interrupt_status(&self) -> u32 {
+        self.read(reg::INTERRUPT_STATUS)
+    }
+
+    /// Clear the reasons named in `bits`. The device keeps asserting until
+    /// this is written, so it comes *before* the source is unmasked (D-041).
+    pub fn ack_interrupt(&self, bits: u32) {
+        self.write(reg::INTERRUPT_ACK, bits);
+    }
+
     /// A 64-bit field of the device-specific configuration space.
     pub fn config_u64(&self, off: usize) -> u64 {
         let low = self.read(reg::CONFIG + off) as u64;
         let high = self.read(reg::CONFIG + off + 4) as u64;
         (high << 32) | low
     }
+}
+
+/// The three rings, in one frame the driver owns. `va` is where the driver has
+/// it mapped; `pa` is what the device is told, because a bus master does not
+/// walk page tables (D-040).
+pub struct Queue {
+    va: usize,
+    pa: u64,
+}
+
+impl Queue {
+    /// # Safety
+    /// `va` must be a zeroed page mapped read-write whose physical address is
+    /// `pa`, and nothing else may be using it.
+    pub const unsafe fn new(va: usize, pa: u64) -> Self {
+        Self { va, pa }
+    }
+
+    /// Where the driver has the frame mapped, for the buffers it puts in the
+    /// same page.
+    pub const fn va(&self) -> usize {
+        self.va
+    }
+    /// Where the device sees it.
+    pub const fn pa(&self) -> u64 {
+        self.pa
+    }
+
+    pub const fn desc_pa(&self) -> u64 {
+        self.pa + DESC_OFF as u64
+    }
+    pub const fn avail_pa(&self) -> u64 {
+        self.pa + AVAIL_OFF as u64
+    }
+    pub const fn used_pa(&self) -> u64 {
+        self.pa + USED_OFF as u64
+    }
+
+    /// One descriptor: a buffer, and what follows it in the chain.
+    pub fn set_desc(&self, i: usize, addr: u64, len: u32, flags: u16, next: u16) {
+        let at = self.va + DESC_OFF + i * 16;
+        // SAFETY: `new`'s caller promised a mapped page, and `i` below
+        // `QUEUE_SIZE` keeps the whole 16-byte entry inside the descriptor
+        // table. Volatile because the device reads this memory too.
+        unsafe {
+            (at as *mut u64).write_volatile(addr);
+            ((at + 8) as *mut u32).write_volatile(len);
+            ((at + 12) as *mut u16).write_volatile(flags);
+            ((at + 14) as *mut u16).write_volatile(next);
+        }
+    }
+
+    /// Offer the chain starting at `head`. The fences are the protocol, not a
+    /// precaution: the device may be reading while this runs, and it must never
+    /// see a bumped index before the descriptors it points at.
+    pub fn submit(&self, head: u16) {
+        // SAFETY: as above; the available ring is 4 + 2 * QUEUE_SIZE bytes at
+        // `AVAIL_OFF`, and the slot is masked to the ring size.
+        unsafe {
+            let idx = ((self.va + AVAIL_OFF + 2) as *const u16).read_volatile();
+            let slot = self.va + AVAIL_OFF + 4 + (idx as usize % QUEUE_SIZE as usize) * 2;
+            (slot as *mut u16).write_volatile(head);
+            fence();
+            ((self.va + AVAIL_OFF + 2) as *mut u16).write_volatile(idx.wrapping_add(1));
+        }
+        fence();
+    }
+
+    /// How many chains the device has finished, ever.
+    pub fn used_idx(&self) -> u16 {
+        // SAFETY: as above.
+        let idx = unsafe { ((self.va + USED_OFF + 2) as *const u16).read_volatile() };
+        fence();
+        idx
+    }
+
+    /// The `id`, `len` pair the device wrote at ring position `i`.
+    pub fn used(&self, i: usize) -> (u32, u32) {
+        let at = self.va + USED_OFF + 4 + (i % QUEUE_SIZE as usize) * 8;
+        // SAFETY: as above; the used ring is 4 + 8 * QUEUE_SIZE bytes.
+        unsafe {
+            (
+                (at as *const u32).read_volatile(),
+                ((at + 4) as *const u32).read_volatile(),
+            )
+        }
+    }
+}
+
+/// A full barrier. On RISC-V this is `fence rw, rw`, which is what Linux's
+/// `virtio_wmb` becomes on this target.
+fn fence() {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }

@@ -39,6 +39,9 @@ pub const UNTYPED: u64 = bootinfo::slot::FIRST_UNTYPED;
 pub const IRQ_HANDLER: u64 = 9;
 /// The notification that source is bound to.
 pub const NOTIFICATION: u64 = 10;
+/// The badge a spawned driver's device interrupt arrives under, so both ends
+/// agree on what a notification word means (D-038).
+pub const DEVICE_BADGE: u64 = 1 << 1;
 /// Device untypeds, one per candidate device, from here.
 pub const FIRST_DEVICE: u64 = 16;
 /// The first slot a spawned task may put objects of its own in.

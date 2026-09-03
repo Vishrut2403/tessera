@@ -9,7 +9,7 @@
 #![no_main]
 
 use rt::abi::{MessageInfo, ObjectType, PAGE_SIZE, bootinfo, rights};
-use rt::virtio::{self, Transport};
+use rt::virtio::{self, Queue, Transport, desc_flags};
 use rt::{entry, println, spawn, sys, vm};
 
 entry!(main);
@@ -27,6 +27,20 @@ const CANDIDATES: usize = 8;
 /// virtio-blk puts its capacity, in 512-byte sectors, first in config space.
 const BLK_CAPACITY: usize = 0;
 
+/// The request buffers, in the same frame as the rings and clear of them.
+const HEADER_OFF: usize = 512;
+const DATA_OFF: usize = 1024;
+const STATUS_OFF: usize = 2048;
+const SECTOR: usize = 512;
+
+/// A read request, and the status the device reports for one that worked.
+const BLK_T_IN: u32 = 0;
+const BLK_S_OK: u8 = 0;
+
+/// Two sectors far apart, so "it always returns block zero" is not a way to
+/// pass. `kernel/build.rs` writes each block's own number into it.
+const READ_SECTORS: [u64; 2] = [5, 1000];
+
 fn main() {
     let id = sys::thread_id();
     println!("  blk driver    : running as thread {id}, in an address space of its own");
@@ -37,7 +51,7 @@ fn main() {
     say_hello(id);
 
     let mut frames = [0u64; CANDIDATES];
-    let sectors = match probe(&mut alloc, vspace, &mut frames) {
+    let (sectors, verified) = match probe(&mut alloc, vspace, &mut frames) {
         Some((index, transport)) => {
             // Only the parent holds `IrqControl`, so the source is its to
             // claim. It also takes back the transports we did not want, which
@@ -62,11 +76,14 @@ fn main() {
             assert!(sys::get_address(frames[index]).is_ok(), "our own transport went with them");
             println!("    narrowed      : the transports we did not keep are no longer ours");
 
-            bring_up(&mut alloc, vspace, &transport)
+            match bring_up(&mut alloc, vspace, &transport) {
+                Some((queue, sectors)) => (sectors, read_sectors(&queue, &transport)),
+                None => (0, 0),
+            }
         }
         None => {
             println!("    probe         : no block device behind any of {CANDIDATES} transports");
-            0
+            (0, 0)
         }
     };
 
@@ -74,9 +91,93 @@ fn main() {
     // driver that gives up silently would hang it.
     sys::call(
         bootinfo::slot::ENDPOINT,
-        MessageInfo::new(spawn::READY, 1, false),
-        [sectors as usize, 0, 0, 0],
+        MessageInfo::new(spawn::READY, 2, false),
+        [sectors as usize, verified, 0, 0],
     );
+}
+
+/// Read each of `READ_SECTORS` and check the block says which one it is.
+/// Returns how many came back correct.
+fn read_sectors(queue: &Queue, transport: &Transport) -> usize {
+    let mut verified = 0;
+    for sector in READ_SECTORS {
+        match read_one(queue, transport, sector) {
+            Some((first, last)) => {
+                // Each block of the image carries its own number at both ends,
+                // so a read of the wrong block says which one it fetched.
+                let want = 0x07e5_5e7a_0000_0000 | sector;
+                if first == want && last == sector {
+                    verified += 1;
+                    println!("    read sector {sector:<4}: {first:#x}, and {last} at the far end");
+                } else {
+                    println!("    read sector {sector:<4}: wrong block -- {first:#x} / {last}");
+                }
+            }
+            None => println!("    read sector {sector:<4}: failed"),
+        }
+    }
+    verified
+}
+
+/// One 512-byte read: a three-descriptor chain, a kick, and a *blocking* wait
+/// on the notification. The run queue is empty while we are in `wait`, so the
+/// kernel idles until the device raises its line (D-041).
+fn read_one(queue: &Queue, transport: &Transport, sector: u64) -> Option<(u64, u64)> {
+    let (va, pa) = (queue.va(), queue.pa());
+
+    // SAFETY: our own frame, mapped read-write, and these offsets are past the
+    // three rings.
+    unsafe {
+        ((va + HEADER_OFF) as *mut u32).write_volatile(BLK_T_IN);
+        ((va + HEADER_OFF + 4) as *mut u32).write_volatile(0);
+        ((va + HEADER_OFF + 8) as *mut u64).write_volatile(sector);
+        // A value the device must overwrite, so "it never ran" cannot read as
+        // "it said ok".
+        ((va + STATUS_OFF) as *mut u8).write_volatile(0xff);
+    }
+
+    // Three descriptors, because the flags are how the device learns which
+    // parts it may write, and the status must be separate from the data.
+    queue.set_desc(0, pa + HEADER_OFF as u64, 16, desc_flags::NEXT, 1);
+    queue.set_desc(1, pa + DATA_OFF as u64, SECTOR as u32, desc_flags::NEXT | desc_flags::WRITE, 2);
+    queue.set_desc(2, pa + STATUS_OFF as u64, 1, desc_flags::WRITE, 0);
+
+    let before = queue.used_idx();
+    queue.submit(0);
+    transport.notify(0);
+
+    let word = sys::wait(spawn::NOTIFICATION);
+
+    // Clear the device's own reason first, then unmask the source: the
+    // controller ignores a completion for a source that is not enabled, and a
+    // device still asserting would raise again immediately (D-041).
+    transport.ack_interrupt(transport.interrupt_status());
+    sys::irq_ack(spawn::IRQ_HANDLER).ok()?;
+
+    if word != spawn::DEVICE_BADGE {
+        println!("    woken by {word:#x}, which is not the disk");
+        return None;
+    }
+    if queue.used_idx() == before {
+        println!("    the device raised an interrupt without finishing anything");
+        return None;
+    }
+
+    let (id, len) = queue.used(before as usize);
+    // SAFETY: the buffers the device has just finished writing.
+    let status = unsafe { ((va + STATUS_OFF) as *const u8).read_volatile() };
+    if id != 0 || status != BLK_S_OK {
+        println!("    chain {id} came back with status {status:#x}, {len} bytes");
+        return None;
+    }
+
+    // SAFETY: as above -- the 512-byte data buffer.
+    unsafe {
+        Some((
+            ((va + DATA_OFF) as *const u64).read_volatile(),
+            ((va + DATA_OFF + SECTOR - 8) as *const u64).read_volatile(),
+        ))
+    }
 }
 
 /// The isolation demonstration: our page at the address our parent also has a
@@ -148,38 +249,41 @@ fn probe(
 /// Reset, negotiate, hand the device a queue, and say it may start. Returns
 /// the capacity in sectors, or zero if the device would not come up: nothing
 /// here panics, because a dead driver would leave its parent blocked.
-fn bring_up(alloc: &mut vm::Alloc, vspace: u64, transport: &Transport) -> u64 {
+fn bring_up(
+    alloc: &mut vm::Alloc,
+    vspace: u64,
+    transport: &Transport,
+) -> Option<(Queue, u64)> {
     if let Err(e) = transport.negotiate() {
         println!("    negotiation   : refused, {e:?}");
-        return 0;
+        return None;
     }
     println!("    negotiated    : status {:#x}, features accepted", transport.status());
 
     // One frame holds the descriptor table, the available ring and the used
     // ring. The device is a bus master, so what it is given is the *physical*
     // address -- which is why `GetAddress` needs `WRITE` on the frame (D-040).
-    let Ok(queue) = alloc.object(ObjectType::Frame, 0) else { return 0 };
+    let Ok(frame) = alloc.object(ObjectType::Frame, 0) else { return None };
     let rw = rights::READ | rights::WRITE;
-    if vm::map(alloc, vspace, queue, QUEUE_VADDR, rw, false).is_err() {
+    if vm::map(alloc, vspace, frame, QUEUE_VADDR, rw, false).is_err() {
         println!("    queue 0       : could not be mapped");
-        return 0;
+        return None;
     }
-    let Ok(base) = sys::get_address(queue) else { return 0 };
-    let base = base as u64;
+    let Ok(base) = sys::get_address(frame) else { return None };
 
-    match transport.configure_queue(
-        0,
-        base + virtio::DESC_OFF as u64,
-        base + virtio::AVAIL_OFF as u64,
-        base + virtio::USED_OFF as u64,
-    ) {
+    // SAFETY: a frame we retyped -- so it arrived zeroed -- mapped read-write
+    // at `QUEUE_VADDR`, and `get_address` says where the device sees it.
+    let queue = unsafe { Queue::new(QUEUE_VADDR, base as u64) };
+
+    match transport.configure_queue(0, queue.desc_pa(), queue.avail_pa(), queue.used_pa()) {
         Ok(max) => println!(
-            "    queue 0       : {} of {max} slots, rings at {base:#x} physical",
-            virtio::QUEUE_SIZE
+            "    queue 0       : {} of {max} slots, rings at {:#x} physical",
+            virtio::QUEUE_SIZE,
+            queue.pa()
         ),
         Err(e) => {
             println!("    queue 0       : refused, {e:?}");
-            return 0;
+            return None;
         }
     }
 
@@ -190,5 +294,5 @@ fn bring_up(alloc: &mut vm::Alloc, vspace: u64, transport: &Transport) -> u64 {
         transport.status(),
         sectors / 2
     );
-    sectors
+    Some((queue, sectors))
 }

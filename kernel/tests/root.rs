@@ -285,8 +285,14 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
     // the image `kernel/build.rs` writes, so this is end to end -- the driver
     // read it out of the device's own configuration space.
     // SAFETY: the same scratch page, one word further on.
-    let sectors = unsafe { p.add(5).read_volatile() };
+    let disk = unsafe { p.add(5).read_volatile() };
+    let (sectors, verified) = (disk & 0xffff_ffff, disk >> 32);
     assert_eq!(sectors, 2048, "the driver reported {sectors} sectors, not the disk image's 2048");
+
+    // Then it moved bytes: two sectors, far apart, each carrying its own number
+    // at both ends, fetched over a virtqueue and completed by an interrupt the
+    // driver blocked for (D-045).
+    assert_eq!(verified, 2, "the driver read back {verified} of 2 sectors correctly");
 
     // The root task, the thread it made, and the process it loaded.
     assert_eq!(sched::exited() - before, 3);

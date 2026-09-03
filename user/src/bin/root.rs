@@ -240,36 +240,43 @@ fn serve(
     ntfn: u64,
     badged: u64,
 ) -> (u64, u64) {
-    /// The badge the driver's interrupt arrives under.
-    const DISK: u64 = 1 << 1;
     let mut result = 0u64;
 
     loop {
         let msg = sys::recv(child.endpoint);
         match msg.info.label() {
             spawn::HELLO => {
-                // SAFETY: our own frame, still mapped where we put it.
-                let ours = unsafe { (spawn::SHARED_VADDR as *const u64).read_volatile() };
-                assert_eq!(ours, PARENT_MAGIC, "the child reached into our address space");
-                assert_ne!(msg.words[1] as u64, PARENT_MAGIC, "the child read our page");
-                println!("    child said    : thread {}, wrote {:#x}", msg.words[0], msg.words[1]);
-                println!("    {:#x}    : {ours:#x} to us, {:#x} to it", msg.words[2], msg.words[1]);
-                result = SPAWNED | msg.words[0] as u64;
+                // Answer before judging. A caller left blocked in `call` is a
+                // hung system, and an assertion that hangs reports nothing --
+                // the same reason `reply_recv` replies before it checks its
+                // endpoint (D-042).
                 sys::reply(MessageInfo::new(spawn::HELLO, 1, false), [0xacc_e5ed, 0, 0, 0])
                     .expect("reply");
+
+                // SAFETY: our own frame, still mapped where we put it.
+                let ours = unsafe { (spawn::SHARED_VADDR as *const u64).read_volatile() };
+                println!("    child said    : thread {}, wrote {:#x}", msg.words[0], msg.words[1]);
+                println!("    {:#x}    : {ours:#x} to us, {:#x} to it", msg.words[2], msg.words[1]);
+                assert_eq!(ours, PARENT_MAGIC, "the child reached into our address space");
+                assert_ne!(msg.words[1] as u64, PARENT_MAGIC, "the child read our page");
+                result = SPAWNED | msg.words[0] as u64;
             }
             spawn::CLAIM_IRQ => {
                 let irq =
-                    claim_for(child, transports, msg.words[0], ram, handler, ntfn, badged, DISK);
+                    claim_for(child, transports, msg.words[0], ram, handler, ntfn, badged);
                 sys::reply(MessageInfo::new(spawn::CLAIM_IRQ, 1, false), [irq, 0, 0, 0])
                     .expect("reply");
             }
             spawn::READY => {
-                let sectors = msg.words[0] as u64;
-                assert!(sectors > 0, "the driver never brought a device up");
-                println!("    driver up     : {sectors} sectors visible to it");
+                // Again: the driver is blocked in `call` until this returns,
+                // and it has to be free to exit before anything is asserted.
                 sys::reply(MessageInfo::new(spawn::READY, 0, false), [0; 4]).expect("reply");
-                return (result, sectors);
+
+                let (sectors, verified) = (msg.words[0] as u64, msg.words[1]);
+                println!("    driver up     : {sectors} sectors, {verified} of them read back");
+                assert!(sectors > 0, "the driver never brought a device up");
+                assert_eq!(verified, 2, "the driver read back {verified} of 2 sectors");
+                return (result, sectors | (verified as u64) << 32);
             }
             other => {
                 println!("    unknown message {other:#x} from the driver");
@@ -292,7 +299,6 @@ fn claim_for(
     handler: u64,
     ntfn: u64,
     badged: u64,
-    badge: u64,
 ) -> usize {
     let Some((device, _)) = transports.get(index) else {
         println!("    claim         : the driver asked for a transport we never gave it");
@@ -304,12 +310,14 @@ fn claim_for(
     };
 
     sys::retype(ram, ObjectType::Notification, 0, ntfn, 1).expect("notification");
-    sys::mint(bootinfo::slot::CNODE, ntfn, badged, rights::ALL, badge).expect("mint badge");
+    sys::mint(bootinfo::slot::CNODE, ntfn, badged, rights::ALL, spawn::DEVICE_BADGE)
+        .expect("mint badge");
     sys::irq_get(bootinfo::slot::IRQ_CONTROL, irq as usize, handler).expect("irq_get");
     sys::irq_set_notification(handler, badged).expect("bind");
 
     sys::mint(child.cnode, handler, spawn::IRQ_HANDLER, rights::ALL, 0).expect("mint handler");
-    sys::mint(child.cnode, badged, spawn::NOTIFICATION, rights::READ, badge).expect("mint ntfn");
+    sys::mint(child.cnode, badged, spawn::NOTIFICATION, rights::READ, spawn::DEVICE_BADGE)
+        .expect("mint ntfn");
 
     // Everything it probed but did not want. `delete` empties the slot in the
     // child's CNode and revokes what was derived from it, so the frame the
