@@ -33,6 +33,9 @@ pub enum CapError {
     Resolve(cspace::ResolveError),
     /// The destination slot already holds a capability.
     SlotOccupied,
+    /// A badge was asked for on something that has no server on the other end
+    /// (D-050).
+    CannotBadge,
     /// Untyped memory cannot be copied, only moved: a copy would carry a
     /// second watermark over the same region (D-049).
     CannotCopy,
@@ -73,15 +76,21 @@ pub struct RawCap {
     pub irq: u16,
     /// The object itself. Physical, because a capability outlives any mapping.
     pub paddr: PhysAddr,
-    /// Untyped only: how much of the region has already been handed out.
-    pub watermark: usize,
-    /// Set when a capability is minted, to identify the holder to a server (M5).
-    pub badge: u64,
-    /// Frames and page tables: the root of the address space this is mapped
-    /// into, or zero.
-    pub mapped_root: PhysAddr,
-    /// Where in that address space, valid only when `mapped_root` is non-zero.
-    pub mapped_vaddr: usize,
+    /// Two payload words whose meaning `kind` decides. No object needs more
+    /// than two, and none needs two different meanings at once, so they are
+    /// shared rather than laid out side by side (D-050):
+    ///
+    /// | kind | `w0` | `w1` |
+    /// |---|---|---|
+    /// | untyped, device untyped | watermark | unused |
+    /// | frame, page table | mapped root | mapped vaddr |
+    /// | endpoint, notification | unused | badge |
+    /// | everything else | unused | unused |
+    ///
+    /// Private, so that table is enforced by the accessors below instead of
+    /// being remembered at every use.
+    w0: usize,
+    w1: usize,
 }
 
 impl RawCap {
@@ -92,14 +101,26 @@ impl RawCap {
         asid: 0,
         irq: 0,
         paddr: PhysAddr::new(0),
-        watermark: 0,
-        badge: 0,
-        mapped_root: PhysAddr::new(0),
-        mapped_vaddr: 0,
+        w0: 0,
+        w1: 0,
     };
 
     pub const fn is_null(&self) -> bool {
         matches!(self.kind, ObjectType::Null)
+    }
+
+    /// A capability over an object, with no payload set. Callers outside this
+    /// module build capabilities through this rather than by struct update,
+    /// which is what keeps the payload words private (D-050).
+    pub const fn new(kind: ObjectType, rights: u8, size_bits: u8, paddr: PhysAddr) -> RawCap {
+        RawCap { kind, rights, size_bits, paddr, ..RawCap::NULL }
+    }
+
+    /// The same capability held with fewer rights. Rights are only ever
+    /// narrowed, never widened, which `mint` and `reduce` both rely on.
+    pub const fn with_rights(mut self, rights: u8) -> RawCap {
+        self.rights &= rights;
+        self
     }
 
     /// An untyped capability over a region. The one shape callers build by hand.
@@ -112,12 +133,55 @@ impl RawCap {
         RawCap { kind: ObjectType::DeviceUntyped, rights, size_bits, paddr, ..RawCap::NULL }
     }
 
+    /// How much of an untyped region has already been handed out. Zero for
+    /// anything that is not untyped, which has no watermark to speak of.
+    pub const fn watermark(&self) -> usize {
+        if self.kind.is_untyped() { self.w0 } else { 0 }
+    }
+
+    pub const fn set_watermark(&mut self, to: usize) {
+        debug_assert!(self.kind.is_untyped(), "only untyped memory has a watermark");
+        self.w0 = to;
+    }
+
+    /// The badge a holder was minted with, to identify it to a server. Zero on
+    /// anything a badge cannot mean something on, so a frame's mapped address
+    /// can never be read back as one.
+    pub const fn badge(&self) -> u64 {
+        if self.kind.is_badgeable() { self.w1 as u64 } else { 0 }
+    }
+
+    pub const fn set_badge(&mut self, to: u64) {
+        debug_assert!(self.kind.is_badgeable(), "only endpoints and notifications carry a badge");
+        self.w1 = to as usize;
+    }
+
     /// Where this capability is mapped, if anywhere.
     pub const fn mapping(&self) -> Option<(PhysAddr, usize)> {
-        match self.mapped_root.as_usize() {
-            0 => None,
-            root => Some((PhysAddr::new(root), self.mapped_vaddr)),
+        if !self.kind.is_mappable() {
+            return None;
         }
+        match self.w0 {
+            0 => None,
+            root => Some((PhysAddr::new(root), self.w1)),
+        }
+    }
+
+    pub const fn set_mapping(&mut self, root: PhysAddr, vaddr: usize) {
+        debug_assert!(self.kind.is_mappable(), "only frames and page tables are mapped");
+        self.w0 = root.as_usize();
+        self.w1 = vaddr;
+    }
+
+    /// A copy of this capability carrying nothing that belonged to the previous
+    /// holder: no badge, and no mapping of its own (D-047, D-050).
+    pub const fn fresh_copy(&self) -> RawCap {
+        let mut copy = *self;
+        copy.w1 = 0;
+        if copy.kind.is_mappable() {
+            copy.w0 = 0;
+        }
+        copy
     }
 
     /// Whether an ASID has been bound, which is what makes a root page table
@@ -127,8 +191,10 @@ impl RawCap {
     }
 
     pub const fn clear_mapping(&mut self) {
-        self.mapped_root = PhysAddr::new(0);
-        self.mapped_vaddr = 0;
+        if self.kind.is_mappable() {
+            self.w0 = 0;
+            self.w1 = 0;
+        }
     }
 
     /// Size of the object in bytes.
@@ -182,7 +248,7 @@ impl<T: ObjectKind, const R: u8> Cap<T, R> {
     }
 
     pub const fn badge(&self) -> u64 {
-        self.raw.badge
+        self.raw.badge()
     }
 
     /// Weaken this capability to a smaller set of rights.
@@ -202,6 +268,10 @@ where
     /// A copy to hand to someone else, carrying `badge` so a server can tell
     /// holders apart.
     pub fn delegate(&self, badge: u64) -> RawCap {
-        RawCap { badge, ..self.raw }
+        let mut copy = self.raw.fresh_copy();
+        if badge != 0 && copy.kind.is_badgeable() {
+            copy.set_badge(badge);
+        }
+        copy
     }
 }

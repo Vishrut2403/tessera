@@ -162,13 +162,7 @@ pub fn message_of(tcb: &Tcb) -> MessageInfo {
 
 /// A one-shot capability naming the thread waiting for a reply.
 pub fn reply_cap(caller: PhysAddr) -> RawCap {
-    RawCap {
-        kind: ObjectType::Reply,
-        rights: crate::cap::rights::READ,
-        size_bits: 0,
-        paddr: caller,
-        ..RawCap::NULL
-    }
+    RawCap::new(ObjectType::Reply, crate::cap::rights::ALL, 0, caller)
 }
 
 /// Whether a thread is parked on an endpoint and can be woken with a message.

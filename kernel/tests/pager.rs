@@ -513,13 +513,7 @@ fn the_map_and_unmap_calls_a_pager_makes_compose_into_copy_on_write() {
     }
 
     // A capability to the shared frame, mapped read-only into the client.
-    let orig = RawCap {
-        kind: ObjectType::Frame,
-        rights: ALL,
-        size_bits: 12,
-        paddr: shared,
-        ..RawCap::NULL
-    };
+    let orig = RawCap::new(ObjectType::Frame, ALL, 12, shared);
     cs.insert(20, D, orig, None).expect("insert shared");
     let os = cs.resolve(20, D).unwrap();
     // SAFETY: a live slot only this hart is touching.
@@ -596,13 +590,7 @@ fn run_cow_end_to_end() -> (PhysAddr, PhysAddr) {
     cs.insert(
         FRAME,
         D,
-        RawCap {
-            kind: ObjectType::Frame,
-            rights: ALL,
-            size_bits: 12,
-            paddr: shared,
-            ..RawCap::NULL
-        },
+        RawCap::new(ObjectType::Frame, ALL, 12, shared),
         None,
     )
     .expect("shared frame");

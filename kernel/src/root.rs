@@ -143,13 +143,7 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
     // SAFETY: `cnode_pa` is 2^CNODE_BITS bytes of memory we just took from the
     // allocator, so nothing else refers to it.
     unsafe { init_cnode(cnode_pa, CNODE_BITS) };
-    let cnode = RawCap {
-        kind: ObjectType::CNode,
-        rights: ALL,
-        size_bits: CNODE_BITS,
-        paddr: cnode_pa,
-        ..RawCap::NULL
-    };
+    let cnode = RawCap::new(ObjectType::CNode, ALL, CNODE_BITS, cnode_pa);
     let mut cs = CSpace::new(cnode)?;
     let depth = cs.root_depth();
 
@@ -160,41 +154,28 @@ pub fn load(kernel: &Mapper, map: &MemoryMap) -> Result<RootTask, RootError> {
     cs.insert(
         bootinfo::slot::VSPACE,
         depth,
-        RawCap { asid: space.asid().as_u16(), ..vspace_cap(space.root()) },
+        {
+            let mut v = vspace_cap(space.root());
+            v.asid = space.asid().as_u16();
+            v
+        },
         None,
     )?;
     cs.insert(
         bootinfo::slot::TCB,
         depth,
-        RawCap {
-            kind: ObjectType::Tcb,
-            rights: ALL,
-            size_bits: PAGE_SHIFT as u8,
-            paddr: tcb_pa,
-            ..RawCap::NULL
-        },
+        RawCap::new(ObjectType::Tcb, ALL, PAGE_SHIFT as u8, tcb_pa),
         None,
     )?;
     cs.insert(
         bootinfo::slot::IRQ_CONTROL,
         depth,
-        RawCap { kind: ObjectType::IrqControl, rights: ALL, ..RawCap::NULL },
+        RawCap::new(ObjectType::IrqControl, ALL, 0, PhysAddr::new(0)),
         None,
     )?;
-    cs.insert(
-        bootinfo::slot::BOOTINFO,
-        depth,
-        RawCap {
-            kind: ObjectType::Frame,
-            rights: READ,
-            size_bits: PAGE_SHIFT as u8,
-            paddr: info_frame,
-            mapped_root: space.root(),
-            mapped_vaddr: bootinfo::VADDR,
-            ..RawCap::NULL
-        },
-        None,
-    )?;
+    let mut info_cap = RawCap::new(ObjectType::Frame, READ, PAGE_SHIFT as u8, info_frame);
+    info_cap.set_mapping(space.root(), bootinfo::VADDR);
+    cs.insert(bootinfo::slot::BOOTINFO, depth, info_cap, None)?;
 
     // Every interrupt source starts unclaimed; the root task is the only holder
     // of the right to claim any of them.

@@ -62,7 +62,7 @@ fn retype_into(
     }
 
     // Plan the whole batch before touching anything.
-    let mut watermark = raw.watermark;
+    let mut watermark = raw.watermark();
     for slot in out.iter_mut() {
         let carved = carve(raw.paddr, raw.size_bits, watermark, bits)?;
         watermark = carved.watermark;
@@ -112,7 +112,7 @@ where
 
     /// Bytes of this region not yet handed out.
     pub const fn free_bytes(&self) -> usize {
-        self.raw.size() - self.raw.watermark
+        self.raw.size() - self.raw.watermark()
     }
 }
 
@@ -137,6 +137,6 @@ where
     }
 
     pub const fn free_bytes(&self) -> usize {
-        self.raw.size() - self.raw.watermark
+        self.raw.size() - self.raw.watermark()
     }
 }

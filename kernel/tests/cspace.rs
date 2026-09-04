@@ -115,11 +115,11 @@ fn retyping_installs_objects_as_children_of_the_untyped() {
 #[test_case]
 fn retyping_moves_the_watermark() {
     let mut cs = space();
-    let before = cs.read(0, D).unwrap().watermark;
+    let before = cs.read(0, D).unwrap().watermark();
     let mut made = [RawCap::NULL; 2];
     cs.retype((0, D), ObjectType::Frame, 0, (8, D), &mut made).expect("retype");
 
-    let after = cs.read(0, D).unwrap().watermark;
+    let after = cs.read(0, D).unwrap().watermark();
     assert!(after > before, "the watermark did not move");
     assert_eq!(after - before, 2 * mm::PAGE_SIZE);
 }
@@ -127,7 +127,7 @@ fn retyping_moves_the_watermark() {
 #[test_case]
 fn retyping_into_an_occupied_slot_is_refused_and_changes_nothing() {
     let mut cs = space();
-    let watermark = cs.read(0, D).unwrap().watermark;
+    let watermark = cs.read(0, D).unwrap().watermark();
 
     let mut made = [RawCap::NULL; 1];
     // Slot 1 already holds the root CNode.
@@ -135,7 +135,7 @@ fn retyping_into_an_occupied_slot_is_refused_and_changes_nothing() {
         cs.retype((0, D), ObjectType::Frame, 0, (1, D), &mut made),
         Err(CapError::SlotOccupied)
     );
-    assert_eq!(cs.read(0, D).unwrap().watermark, watermark, "the region was touched anyway");
+    assert_eq!(cs.read(0, D).unwrap().watermark(), watermark, "the region was touched anyway");
 }
 
 #[test_case]
@@ -143,7 +143,7 @@ fn retyping_needs_write_on_the_untyped() {
     let mut cs = space();
     // Built by hand, because an untyped can no longer be copied at all (D-049)
     // and a move would carry its rights along unchanged.
-    let weak = RawCap { rights: READ, ..cs.read(0, D).unwrap() };
+    let weak = cs.read(0, D).unwrap().with_rights(READ);
     cs.insert(3, D, weak, None).expect("insert a weakened untyped");
 
     let mut made = [RawCap::NULL; 1];
@@ -167,7 +167,7 @@ fn a_minted_copy_is_a_child_with_no_more_rights_than_the_original() {
     assert_eq!(copy.kind, ObjectType::Endpoint);
     assert_eq!(copy.paddr, made[0].paddr, "the copy names a different object");
     assert_eq!(copy.rights, READ);
-    assert_eq!(copy.badge, 0x1234);
+    assert_eq!(copy.badge(), 0x1234);
     assert_eq!(cs.descendants(8, D).unwrap(), 1);
 }
 
@@ -275,10 +275,10 @@ fn revoking_an_untyped_lets_its_memory_be_used_again() {
     let mut made = [RawCap::NULL; 4];
     cs.retype((4, D), ObjectType::Frame, 0, (8, D), &mut made).expect("retype");
     let first_time = made;
-    assert!(cs.read(4, D).unwrap().watermark > 0);
+    assert!(cs.read(4, D).unwrap().watermark() > 0);
 
     assert_eq!(cs.revoke(4, D).unwrap(), 4, "the four frames should have gone");
-    assert_eq!(cs.read(4, D).unwrap().watermark, 0, "the watermark was not reset");
+    assert_eq!(cs.read(4, D).unwrap().watermark(), 0, "the watermark was not reset");
     for i in 8..12u64 {
         assert!(cs.read(i, D).unwrap().is_null(), "slot {i} survived");
     }
@@ -477,7 +477,7 @@ fn moving_leaves_the_source_empty_and_carries_the_watermark() {
     let mut cs = space();
     cs.retype((0, D), ObjectType::Frame, 0, (8, D), &mut [RawCap::NULL]).expect("first frame");
     let before = cs.read(0, D).unwrap();
-    assert!(before.watermark > 0, "the first retype left no watermark to carry");
+    assert!(before.watermark() > 0, "the first retype left no watermark to carry");
 
     let mut same = CSpace::new(*cs.root()).expect("same space");
     cs.move_into(&mut same, (0, D), (9, D)).expect("move");
@@ -485,7 +485,7 @@ fn moving_leaves_the_source_empty_and_carries_the_watermark() {
     assert!(cs.read(0, D).unwrap().is_null(), "the source still holds it");
     let after = cs.read(9, D).unwrap();
     assert_eq!(after.paddr, before.paddr);
-    assert_eq!(after.watermark, before.watermark, "the watermark did not travel");
+    assert_eq!(after.watermark(), before.watermark(), "the watermark did not travel");
 
     // And the region carries on where it left off rather than starting again.
     cs.retype((9, D), ObjectType::Frame, 0, (10, D), &mut [RawCap::NULL]).expect("second frame");

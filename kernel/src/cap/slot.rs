@@ -9,7 +9,7 @@ use super::RawCap;
 pub type SlotRef = Option<NonNull<Slot>>;
 
 /// One capability, plus its position in the derivation tree.
-#[repr(C, align(128))]
+#[repr(C, align(64))]
 pub struct Slot {
     pub cap: RawCap,
     parent: SlotRef,
@@ -226,7 +226,7 @@ pub unsafe fn revoke(root: NonNull<Slot>) -> usize {
         // again.
         if root.as_ref().cap.kind.is_untyped() {
             let mut r = root;
-            r.as_mut().cap.watermark = 0;
+            r.as_mut().cap.set_watermark(0);
         }
     }
 

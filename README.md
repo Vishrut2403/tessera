@@ -81,11 +81,11 @@ same number of run queue operations.
 
 | | |
 |---|---|
-| trusted computing base | 6177 lines, 1074 unsafe (17.4%) |
+| trusted computing base | 6197 lines, 1074 unsafe (17.3%) |
 | unprivileged userspace | 2018 lines |
 | null syscall | 127 instructions |
-| IPC round trip | 1136 instructions |
-| tests | 274 cases across 19 bootable images |
+| IPC round trip | 963 instructions |
+| tests | 275 cases across 19 bootable images |
 
 `BENCHMARK.md` covers how these were measured, how the unsafe line count moved
 over time, and a 37% IPC regression that a bisect traced to one commit.
@@ -106,7 +106,7 @@ cargo install cargo-binutils
 | command | what it does |
 |---|---|
 | `cargo run` | boot the demo above |
-| `cargo test` | 274 cases across 19 images, each its own kernel |
+| `cargo test` | 275 cases across 19 images, each its own kernel |
 | `cargo bench-ipc --release` | measure the IPC fast path |
 | `./scripts/unsafe-audit.sh` | TCB lines against unsafe lines |
 | `cargo kdebug` | boot halted on a gdb stub |
@@ -138,7 +138,7 @@ driver between requests rather than during one.
 
 Everything runs on a single hart under QEMU, so there has been no concurrency
 testing and nothing has run on real hardware. The IPC fast path is also not
-hand-written assembly: about 280 of the 1136 instructions in a round trip are
+hand-written assembly: about 280 of the 963 instructions in a round trip are
 the generic trap entry saving all 31 registers.
 
 Each of the claims above has a test behind it. Where a test could have passed

@@ -38,10 +38,10 @@ Measured on QEMU 11.1.0, release profile:
 | what | instructions |
 |---|---|
 | null syscall (`ecall` in, `ecall` out) | 127 |
-| IPC round trip, no ASID (full TLB flush) | 1136 |
-| IPC round trip, ASID-tagged spaces | 1134 |
-| IPC round trip, one shared address space | 1124 |
-| round trip / null syscall | 8x |
+| IPC round trip, no ASID (full TLB flush) | 963 |
+| IPC round trip, ASID-tagged spaces | 961 |
+| IPC round trip, one shared address space | 951 |
+| round trip / null syscall | 7x |
 
 ASIDs save only 2 instructions here, and that is worth stating rather than
 glossing. What they save is a TLB flush, and a TLB flush costs almost nothing in
@@ -49,10 +49,11 @@ instructions while being one of the more expensive things a real machine does.
 This is the point where an instruction count stops describing a real system, and
 the number should not be quoted as though it did.
 
-## 3. A 37% regression, found and traced
+## 3. A regression, traced and mostly fixed
 
-At M5 this benchmark reported 826 instructions for a round trip. It now reports
-1136. That is 310 more instructions, about 38%.
+At M5 this benchmark reported 826 instructions for a round trip. By M8 it
+reported 1136, which is 310 more, about 38%. It now reports 963, so 173 of
+those have been recovered and 137 remain.
 
 The first question was whether the comparison was even valid, since the M5
 figure came from an earlier session on a possibly different toolchain. It is
@@ -73,7 +74,8 @@ commit:
 | M7d, notifications and interrupts | 127 | 1123 |
 | M7f, the filesystem server | 127 | 1129 |
 | M8, crash and restart | 127 | 1134 |
-| working tree, with D-049 | 127 | 1136 |
+| with D-049, untyped moved not copied | 127 | 1136 |
+| with D-050, capability payload shared | 127 | **963** |
 
 **M6 accounts for 292 of the 310 instructions.** Everything built in M7 and M8,
 which is most of the system by line count, adds 18 in total. That is the useful
@@ -115,8 +117,8 @@ M5 and M6 apart from the wrappers already accounted for above.
 
 | | M5 | now |
 |---|---|---|
-| `RawCap` | 32 bytes | 48 bytes |
-| `Slot` | 64 bytes | 128 bytes |
+| `RawCap` | 32 bytes | 48 bytes, now 32 again |
+| `Slot` | 64 bytes | 128 bytes, now 64 again |
 
 `RawCap` grew when M6 began recording a mapping in the capability that made it
 (D-034), adding `mapped_root` and `mapped_vaddr`, and M7 later added `asid`. A
@@ -129,13 +131,17 @@ The other stages, measured the same way on the current tree: `deliver` costs 107
 instructions, `ipc_send` from entry to the end of `deliver` costs 133, and
 `switch_direct` costs 32 and runs twice per round trip.
 
-**The fix, if it is ever wanted.** The fields that grew `RawCap` are mutually
+**The fix, applied (D-050).** The fields that grew `RawCap` are mutually
 exclusive by object kind. A watermark only means something for untyped, a
 mapping only for a frame or a page table, a badge only for an endpoint or a
-notification. No capability needs two of them at once. Overlapping them would
-take `RawCap` back to 32 bytes and a `Slot` back to 64, which halves the memory
-a CNode occupies and should recover most of the 77 instructions per lookup. That
-is a refactor across the whole capability layer and has not been attempted.
+notification. No capability needs two at once, so they now share two payload
+words whose meaning `kind` decides, reached only through accessors that consult
+it. `RawCap` is back to 32 bytes and a `Slot` to 64, which also halves what a
+CNode occupies.
+
+That took the round trip from 1136 to 963. The 137 instructions still separating
+it from M5 are the `deliver` wrapper and the capability-transfer branch M6 added,
+plus ordinary code growth, and have not been chased further.
 
 ### What is deliberately not optimised
 
@@ -158,9 +164,9 @@ image does not exist in this project, so the comparison is not made. Numbers
 lifted from published benchmarks on other hardware would not be a comparison
 either. They would be decoration.
 
-What can be said without it: a round trip costs 8 null syscalls, about a quarter
-of it is a register save and restore the fast path does not need, and the 310
-instructions it gained since M5 have been traced to a cause.
+What can be said without it: a round trip costs 7 null syscalls, about a third
+of it is a register save and restore the fast path does not need, and of the 310
+instructions it had gained since M5, 173 were traced to a cause and removed.
 
 ## 5. The trusted computing base
 
@@ -180,8 +186,9 @@ would only flatter the number.
 | M7 driver and filesystem | 6057 | 1013 | 16.7% |
 | M8 crash and restart | 6107 | 1038 | 17.0% |
 | untyped moved, not copied | 6177 | 1074 | 17.4% |
+| capability payload shared | 6197 | 1074 | 17.3% |
 
-Final figure: 6177 lines, 1074 of them inside `unsafe`, in 190 regions.
+Final figure: 6197 lines, 1074 of them inside `unsafe`, in 190 regions.
 
 Two movements need explaining rather than hiding.
 
@@ -213,7 +220,7 @@ unsafe core that had stopped growing.
 
 | | lines |
 |---|---|
-| TCB (`kernel/src` and `abi/`) | 6177 |
+| TCB (`kernel/src` and `abi/`) | 6197 |
 | userspace (`user/src`), outside the TCB | 2018 |
 
 The most useful single figure the project produced: M7e and M7f, which are a
@@ -256,13 +263,13 @@ Stated because a benchmark document that only flatters is not evidence.
 - No real hardware. QEMU `virt` only. Nothing has run on silicon, and the
   `sstc`-absent timer path has never executed.
 - One client per server. Both servers keep a single connection's worth of state.
-- The IPC round trip is 37% slower than at M5, and the cause is understood
-  rather than fixed. See section 3.
+- The IPC round trip is still 17% slower than at M5 after the fix in section 3,
+  and the remainder has not been chased.
 
 ## 8. Reproducing all of it
 
 ```sh
-cargo test                 # 274 cases across 19 bootable images
+cargo test                 # 275 cases across 19 bootable images
 cargo test --release       # the same, optimised
 cargo run                  # boots the whole demo, ending in a crash and restart
 cargo bench-ipc --release  # the numbers in section 2

@@ -2,8 +2,8 @@
 
 use crate::PAGE_SHIFT;
 
-/// A capability slot is 128 bytes, so a CNode of 2^n slots is 2^(n+7) bytes.
-pub const SLOT_BITS: u8 = 7;
+/// A capability slot is 64 bytes, so a CNode of 2^n slots is 2^(n+6) bytes.
+pub const SLOT_BITS: u8 = 6;
 
 /// Every kind of object the kernel knows how to make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +45,19 @@ impl ObjectType {
     /// Whether this is memory waiting to be given a type.
     pub const fn is_untyped(self) -> bool {
         matches!(self, ObjectType::Untyped | ObjectType::DeviceUntyped)
+    }
+
+    /// Whether it can be mapped into an address space, and therefore whether
+    /// it records where it went (D-034). These are the two kinds that spend
+    /// both of a capability's payload words (D-050).
+    pub const fn is_mappable(self) -> bool {
+        matches!(self, ObjectType::Frame | ObjectType::PageTable)
+    }
+
+    /// Whether a badge means anything on it. A badge identifies a holder to a
+    /// server, and only these two have a server on the other end (D-050).
+    pub const fn is_badgeable(self) -> bool {
+        matches!(self, ObjectType::Endpoint | ObjectType::Notification)
     }
 
     /// Whether retyping it must skip zeroing, because the bytes are registers.

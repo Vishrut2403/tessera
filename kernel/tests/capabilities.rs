@@ -41,7 +41,7 @@ fn untyped(bits: u8) -> RawCap {
 
 #[test_case]
 fn a_lookup_that_needs_a_right_the_slot_lacks_fails() {
-    let raw = RawCap { rights: READ, ..untyped(12) };
+    let raw = untyped(12).with_rights(READ);
 
     // Asking for exactly what is held succeeds.
     assert!(Cap::<kind::Untyped, READ>::from_raw(raw).is_ok());
@@ -53,7 +53,8 @@ fn a_lookup_that_needs_a_right_the_slot_lacks_fails() {
 
 #[test_case]
 fn a_lookup_of_the_wrong_kind_fails() {
-    let raw = RawCap { kind: ObjectType::Frame, ..untyped(12) };
+    let mut raw = untyped(12);
+    raw.kind = ObjectType::Frame;
     let err = Cap::<kind::Untyped, ALL>::from_raw(raw).unwrap_err();
     assert_eq!(err, CapError::WrongType { wanted: ObjectType::Untyped, found: ObjectType::Frame });
 }
@@ -82,15 +83,35 @@ fn reducing_rights_narrows_what_is_stored() {
 
 #[test_case]
 fn grant_is_what_makes_a_capability_delegatable() {
-    let cap = Cap::<kind::Untyped, { GRANT | WRITE }>::from_raw(untyped(12)).unwrap();
+    // An endpoint, because a badge names a holder to a server and only an
+    // endpoint or a notification has one on the other end (D-050).
+    let ep = RawCap::new(ObjectType::Endpoint, GRANT | WRITE, SLOT_BITS, untyped(12).paddr);
+    let cap = Cap::<kind::Endpoint, { GRANT | WRITE }>::from_raw(ep).unwrap();
     let handed_over = cap.delegate(0xbad_9e);
 
-    assert_eq!(handed_over.badge, 0xbad_9e, "the badge did not survive delegation");
+    assert_eq!(handed_over.badge(), 0xbad_9e, "the badge did not survive delegation");
     assert_eq!(handed_over.paddr, cap.paddr(), "delegation moved the object");
     assert_eq!(handed_over.rights, cap.raw().rights);
 
     // `cap.reduce::<WRITE>().delegate(..)` does not compile: `delegate` is only
     // defined where Mask<R>: HasGrant, and WRITE alone does not implement it.
+}
+
+#[test_case]
+fn only_an_endpoint_or_a_notification_carries_a_badge() {
+    // A frame spends both payload words on where it is mapped, so a badge has
+    // nowhere to live and must not silently land on top of one (D-050).
+    let mut frame = untyped(12);
+    frame.kind = ObjectType::Frame;
+    frame.set_mapping(PhysAddr::new(0x8000_0000), 0x1234_0000);
+
+    assert_eq!(frame.badge(), 0, "a frame reported a badge");
+    assert_eq!(
+        frame.mapping(),
+        Some((PhysAddr::new(0x8000_0000), 0x1234_0000)),
+        "the mapping did not survive being read as a badge"
+    );
+    assert_eq!(untyped(12).badge(), 0, "untyped memory reported a badge");
 }
 
 // --- Carving ---
@@ -183,7 +204,7 @@ fn a_failed_retype_changes_nothing() {
     // Two frames do not fit in a 4 KiB region.
     let mut out = [RawCap::NULL; 2];
     assert_eq!(cap.retype(ObjectType::Frame, 0, &mut out), Err(CapError::NotEnoughSpace));
-    assert_eq!(cap.raw().watermark, 0, "a failed retype consumed part of the region");
+    assert_eq!(cap.raw().watermark(), 0, "a failed retype consumed part of the region");
 }
 
 #[test_case]

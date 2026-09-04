@@ -544,9 +544,9 @@ fn ipc_send(tcb: &mut Tcb, ep_cap: RawCap, info: MessageInfo, is_call: bool) -> 
     if let Some(mut waiting) = unsafe { ep.dequeue(EndpointState::Receiving) } {
         // SAFETY: taken off the endpoint queue, so nothing else refers to it.
         let receiver = unsafe { waiting.as_mut() };
-        deliver(tcb, receiver, info, ep_cap.badge);
-        LAST_BADGE.store(ep_cap.badge as usize, Ordering::Relaxed);
-        log_badge(ep_cap.badge);
+        deliver(tcb, receiver, info, ep_cap.badge());
+        LAST_BADGE.store(ep_cap.badge() as usize, Ordering::Relaxed);
+        log_badge(ep_cap.badge());
 
         if is_call {
             receiver.reply = ipc::reply_cap(tcb.self_paddr);
@@ -574,7 +574,7 @@ fn ipc_send(tcb: &mut Tcb, ep_cap: RawCap, info: MessageInfo, is_call: bool) -> 
     }
 
     // Nobody is waiting: park on the endpoint.
-    tcb.badge = ep_cap.badge;
+    tcb.badge = ep_cap.badge();
     tcb.call_pending = is_call;
     tcb.state = ThreadState::BlockedOnSend;
     let me = current_tcb().expect("no current thread");
@@ -636,7 +636,7 @@ fn notification_signal(tcb: &mut Tcb, cap: RawCap) -> ! {
     }
     // SAFETY: `cap` came from this thread's CSpace, so it names a live
     // notification.
-    if let Some(woken) = unsafe { signal(cap.paddr, cap.badge) } {
+    if let Some(woken) = unsafe { signal(cap.paddr, cap.badge()) } {
         QUEUE.lock().push(woken);
     }
     finish(tcb, result::OK)
@@ -680,12 +680,11 @@ fn invoke_irq_control(tcb: &mut Tcb, mut cs: CSpace, cptr: u64, info: MessageInf
         });
     }
 
-    let handler = RawCap {
-        kind: ObjectType::IrqHandler,
-        rights: rights::ALL,
-        irq: irq as u16,
-        ..RawCap::NULL
-    };
+    let mut handler =
+        RawCap::new(ObjectType::IrqHandler, rights::ALL, 0, crate::mm::PhysAddr::new(0));
+    // The source lives in the capability's own field, never in the badge, so a
+    // holder that re-mints cannot choose which interrupt it speaks for (D-041).
+    handler.irq = irq as u16;
     // A child of the `IrqControl` capability, so revoking that reclaims every
     // handler ever minted from it.
     let Ok(parent) = cs.resolve(cptr, depth) else { finish(tcb, result::ERR_BAD_CAP) };
@@ -709,7 +708,7 @@ fn invoke_irq_handler(tcb: &mut Tcb, cs: CSpace, cap: RawCap, info: MessageInfo)
             if Cap::<kind::Notification, { rights::WRITE }>::from_raw(n).is_err() {
                 finish(tcb, result::ERR_BAD_CAP);
             }
-            match crate::irq::bind(irq, n.paddr, n.badge) {
+            match crate::irq::bind(irq, n.paddr, n.badge()) {
                 Ok(()) => finish(tcb, result::OK),
                 Err(_) => finish(tcb, result::ERR_STATE),
             }
@@ -872,9 +871,7 @@ fn transfer_cap(from: &Tcb, to: &mut Tcb) -> Result<(), CapError> {
     // server, and this is a new holder. Nor does it carry the sender's
     // mapping. A mapping belongs to the capability that made it, so a
     // receiver can map what it was handed (D-047).
-    let mut copy = RawCap { badge: 0, ..cap };
-    copy.clear_mapping();
-    to_cs.insert(dst, depth, copy, Some(slot))
+    to_cs.insert(dst, depth, cap.fresh_copy(), Some(slot))
 }
 
 /// Deliver a message, and the capability riding with it if there is one.

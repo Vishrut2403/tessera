@@ -263,12 +263,12 @@ fn configuring_a_thread_needs_write_on_its_capability() {
     let tcb = make(&mut cs, ObjectType::Tcb, 0, CHILD_TCB);
     let other = make(&mut cs, ObjectType::Tcb, 0, SPARE);
 
-    let read_only = RawCap { rights: READ, ..tcb };
+    let read_only = tcb.with_rights(READ);
     assert!(matches!(
         kernel::cap::tcb::check(read_only, thread_of(&other)),
         Err(CapError::MissingRights { .. })
     ));
-    assert!(kernel::cap::tcb::check(RawCap { rights: WRITE, ..tcb }, thread_of(&other)).is_ok());
+    assert!(kernel::cap::tcb::check(tcb.with_rights(WRITE), thread_of(&other)).is_ok());
 }
 
 // --- End to end: a thread built by invocation actually runs ---
@@ -469,13 +469,13 @@ fn a_fault_endpoint_without_write_is_refused() {
     let target = thread_of(&child);
 
     assert_eq!(
-        kernel::cap::tcb::set_fault_ep(target, RawCap { rights: READ, ..ep }),
+        kernel::cap::tcb::set_fault_ep(target, ep.with_rights(READ)),
         Err(CapError::MissingRights { wanted: WRITE, held: READ }),
         "the kernel sends the fault, so the thread must be able to send it itself",
     );
     assert!(target.fault_ep.is_null(), "a refused fault endpoint must not be installed");
 
-    assert_eq!(kernel::cap::tcb::set_fault_ep(target, RawCap { rights: WRITE, ..ep }), Ok(()));
+    assert_eq!(kernel::cap::tcb::set_fault_ep(target, ep.with_rights(WRITE)), Ok(()));
     assert_eq!(target.fault_ep.paddr, ep.paddr);
 }
 

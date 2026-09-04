@@ -82,7 +82,11 @@ fn user_space(words: &[u32]) -> AddressSpace {
 /// A CSpace holding the same endpoint capability in slot 8.
 fn cspace_with(endpoint: RawCap, badge: u64) -> CSpace {
     let mut cs = bootstrap(aligned_region(18), D + SLOT_BITS).expect("bootstrap");
-    cs.insert(EP_SLOT, D, RawCap { badge, ..endpoint }, None).expect("insert endpoint");
+    let mut ep = endpoint;
+    if badge != 0 {
+        ep.set_badge(badge);
+    }
+    cs.insert(EP_SLOT, D, ep, None).expect("insert endpoint");
     cs
 }
 
@@ -378,7 +382,7 @@ fn a_message_can_carry_a_capability() {
     let arrived = recv_cs.read(DST_SLOT, D).unwrap();
     assert_eq!(arrived.kind, ObjectType::Endpoint, "no capability arrived");
     assert_eq!(arrived.paddr, gift.paddr, "a different object arrived");
-    assert_eq!(arrived.badge, 0, "the copy kept the sender's badge");
+    assert_eq!(arrived.badge(), 0, "the copy kept the sender's badge");
 
     // It is a derivative, so revoking the original takes it away again.
     assert_eq!(send_cs.descendants(SRC_SLOT, D).unwrap(), 1);
@@ -395,7 +399,7 @@ fn a_capability_without_grant_is_not_transferred() {
     let mut send_cs = cspace_with(ep, 0);
 
     // No GRANT, so the sender may hold it but not hand it on.
-    let gift = RawCap { rights: kernel::cap::rights::READ, ..endpoint() };
+    let gift = endpoint().with_rights(kernel::cap::rights::READ);
     send_cs.insert(SRC_SLOT, D, gift, None).expect("insert gift");
 
     let _s = spawn(cap_receiver().as_slice(), &recv_cs);
@@ -451,7 +455,7 @@ fn queued_senders_are_served_in_the_order_they_arrived() {
 /// The same endpoint in slot 8, held with exactly `rights`.
 fn cspace_holding(endpoint: RawCap, rights: u8) -> CSpace {
     let mut cs = bootstrap(aligned_region(18), D + SLOT_BITS).expect("bootstrap");
-    cs.insert(EP_SLOT, D, RawCap { rights, ..endpoint }, None).expect("insert endpoint");
+    cs.insert(EP_SLOT, D, endpoint.with_rights(rights), None).expect("insert endpoint");
     cs
 }
 
@@ -539,7 +543,7 @@ fn the_receive_half_of_reply_recv_needs_read() {
     // The server receives with a full capability and then names a send-only
     // copy of the same endpoint to `reply_recv`.
     let mut server_cs = cspace_holding(ep, ALL);
-    server_cs.insert(EP_WEAK, D, RawCap { rights: WRITE, ..ep }, None).expect("weak copy");
+    server_cs.insert(EP_WEAK, D, ep.with_rights(WRITE), None).expect("weak copy");
     let client_cs = cspace_holding(ep, WRITE);
 
     let space = spawn(reply_recv_recording().as_slice(), &server_cs);

@@ -56,8 +56,7 @@ pub fn map_frame(
         .map_leaf(vaddr, frame.paddr, 0, flags_for(granted, executable))
         .map_err(CapError::Map)?;
 
-    frame.mapped_root = vspace.paddr;
-    frame.mapped_vaddr = vaddr.as_usize();
+    frame.set_mapping(vspace.paddr, vaddr.as_usize());
     flush_tlb_page(vaddr);
     Ok(())
 }
@@ -83,8 +82,7 @@ pub fn map_table(
     let mut mapper = unsafe { mapper_for(vspace) };
     mapper.map_table(vaddr, table.paddr, level).map_err(CapError::Map)?;
 
-    table.mapped_root = vspace.paddr;
-    table.mapped_vaddr = vaddr.as_usize();
+    table.set_mapping(vspace.paddr, vaddr.as_usize());
     Ok(())
 }
 

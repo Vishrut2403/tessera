@@ -259,7 +259,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     cs.retype((0, 6), ObjectType::Endpoint, 0, (12, 6), &mut made[..1]).expect("retype");
     println!(
         "  retyped       : 4 frames + 1 endpoint, watermark now {} KiB",
-        cs.read(0, 6).unwrap().watermark / 1024
+        cs.read(0, 6).unwrap().watermark() / 1024
     );
 
     // Delegate the endpoint twice, weaker each time.
@@ -271,7 +271,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
             "  slot {slot:<2}       : {} rights={} badge={:#x}",
             c.kind.name(),
             kernel::cap::rights::name(c.rights),
-            c.badge
+            c.badge()
         );
     }
     println!("  descendants   : {} under slot 12", cs.descendants(12, 6).unwrap());

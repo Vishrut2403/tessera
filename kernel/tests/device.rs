@@ -200,8 +200,9 @@ fn retyping_ordinary_memory_still_zeroes_it() {
 fn get_address_needs_write_on_the_frame() {
     // The right check itself, at the seam where a runtime mask becomes a type.
     let pa = poisoned_region(0);
-    let writable = RawCap { kind: ObjectType::Frame, rights: ALL, size_bits: 12, paddr: pa, ..RawCap::NULL };
-    let read_only = RawCap { rights: READ, ..writable };
+    let writable = RawCap::new(ObjectType::Frame, ALL, 12, pa);
+    let mut read_only = writable;
+    read_only.rights = READ;
 
     assert!(Cap::<kind::Frame, { WRITE }>::from_raw(writable).is_ok());
     assert!(

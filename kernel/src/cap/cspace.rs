@@ -173,8 +173,17 @@ impl CSpace {
         // capability its own mapping slot for the same reason: without this a
         // receiver could not map a frame it was handed, and revoking a copy
         // would tear down the *original's* mapping (D-047).
-        let mut copy = RawCap { rights: original.rights & rights, badge, ..original };
-        copy.clear_mapping();
+        // A badge names a holder to a server, so only the two kinds with a
+        // server on the other end can carry one. That is also what lets a
+        // frame spend both payload words on its mapping (D-050).
+        if badge != 0 && !original.kind.is_badgeable() {
+            return Err(CapError::CannotBadge);
+        }
+        let mut copy = original.fresh_copy();
+        copy.rights = original.rights & rights;
+        if badge != 0 {
+            copy.set_badge(badge);
+        }
         Ok((copy, source))
     }
 
@@ -300,7 +309,7 @@ impl CSpace {
         }
 
         // SAFETY: the source slot is live and only we are writing it.
-        unsafe { source.as_mut().cap.watermark = watermark };
+        unsafe { source.as_mut().cap.set_watermark(watermark) };
         Ok(())
     }
 
@@ -346,7 +355,7 @@ pub fn bootstrap(mut region: RawCap, cnode_bits: u8) -> Result<CSpace, CapError>
     let cap = Cap::<super::kind::Untyped, { super::rights::WRITE }>::from_raw(region)?;
 
     let mut made = [RawCap::NULL; 1];
-    region.watermark = cap.retype(ObjectType::CNode, cnode_bits, &mut made)?;
+    region.set_watermark(cap.retype(ObjectType::CNode, cnode_bits, &mut made)?);
     let cnode = made[0];
 
     // SAFETY: freshly carved from the untyped, so nothing else refers to it.
