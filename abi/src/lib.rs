@@ -65,6 +65,9 @@ pub mod label {
     pub const IRQ_SET_NOTIFICATION: u64 = 15;
     /// IrqHandler: the device is quiet again; unmask the source.
     pub const IRQ_ACK: u64 = 16;
+    /// Take a capability out of one slot and put it in another, leaving
+    /// nothing behind. The only way to hand over untyped memory (D-049).
+    pub const MOVE: u64 = 17;
 
     /// Frame: where it physically is, for a device that does not walk page
     /// tables.

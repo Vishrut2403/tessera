@@ -81,11 +81,11 @@ same number of run queue operations.
 
 | | |
 |---|---|
-| trusted computing base | 6107 lines, 1038 unsafe (17.0%) |
-| unprivileged userspace | 1987 lines |
+| trusted computing base | 6177 lines, 1074 unsafe (17.4%) |
+| unprivileged userspace | 2018 lines |
 | null syscall | 127 instructions |
-| IPC round trip | 1134 instructions |
-| tests | 264 cases across 19 bootable images |
+| IPC round trip | 1136 instructions |
+| tests | 274 cases across 19 bootable images |
 
 `BENCHMARK.md` covers how these were measured, how the unsafe line count moved
 over time, and a 37% IPC regression that a bisect traced to one commit.
@@ -106,7 +106,7 @@ cargo install cargo-binutils
 | command | what it does |
 |---|---|
 | `cargo run` | boot the demo above |
-| `cargo test` | 264 cases across 19 images, each its own kernel |
+| `cargo test` | 274 cases across 19 images, each its own kernel |
 | `cargo bench-ipc --release` | measure the IPC fast path |
 | `./scripts/unsafe-audit.sh` | TCB lines against unsafe lines |
 | `cargo kdebug` | boot halted on a gdb stub |
@@ -132,18 +132,13 @@ There is no IOMMU, so a driver holding a device frame can point a bus master at
 any physical address. That puts it inside the TCB for integrity. seL4 without an
 SMMU has the same problem.
 
-Untyped capabilities can be copied, and each copy keeps its own watermark, so
-two copies of one region would hand out overlapping memory. Nothing in the
-system does that today, but nothing stops it either. The fix is a move operation
-that transfers a capability instead of copying it.
-
 A crash during a request leaves the caller stuck. There is no equivalent of
 Fuchsia's `PEER_CLOSED` and no timeout fault, which is why the demo crashes the
 driver between requests rather than during one.
 
 Everything runs on a single hart under QEMU, so there has been no concurrency
 testing and nothing has run on real hardware. The IPC fast path is also not
-hand-written assembly: about 280 of the 1134 instructions in a round trip are
+hand-written assembly: about 280 of the 1136 instructions in a round trip are
 the generic trap entry saving all 31 registers.
 
 Each of the claims above has a test behind it. Where a test could have passed

@@ -63,12 +63,29 @@ pub const FIRST_FREE: u64 = 24;
 
 /// One capability a parent hands a child at spawn time.
 #[derive(Clone, Copy)]
-pub struct Grant {
-    /// The slot it lives in, in the parent's own CSpace.
-    pub src: u64,
-    /// The slot it will live in, in the child's.
-    pub dst: u64,
-    pub rights: u8,
+pub enum Grant {
+    /// A copy, weakened to `rights`. The parent keeps its own.
+    Copy { src: u64, dst: u64, rights: u8 },
+    /// A handover: the parent's slot is left empty. This is the only way to
+    /// pass untyped memory, because a copy would carry a second watermark over
+    /// the same region and the two could hand out the same bytes (D-049).
+    Move { src: u64, dst: u64 },
+}
+
+impl Grant {
+    /// The slot this lands in, in the child.
+    pub const fn dst(&self) -> u64 {
+        match self {
+            Grant::Copy { dst, .. } | Grant::Move { dst, .. } => *dst,
+        }
+    }
+
+    /// The slot it came from, in the parent.
+    pub const fn src(&self) -> u64 {
+        match self {
+            Grant::Copy { src, .. } | Grant::Move { src, .. } => *src,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +202,12 @@ pub fn spawn(
     // Whatever else this particular task is trusted with. Each is a derivative
     // of the parent's own capability, so the parent can take any of them back.
     for g in grants {
-        sys::mint(cnode, g.src, g.dst, g.rights, 0)?;
+        match *g {
+            Grant::Copy { src, dst, rights } => sys::mint(cnode, src, dst, rights, 0)?,
+            Grant::Move { src, dst } => {
+                sys::move_cap(cnode, bootinfo::slot::CNODE, src, dst)?
+            }
+        }
     }
 
     // A fault endpoint at last: until now a spawned task that touched memory it
@@ -194,10 +216,9 @@ pub fn spawn(
     sys::tcb_write_registers(tcb, elf.entry(), STACK_TOP)?;
     sys::tcb_resume(tcb)?;
 
-    let untyped = grants
-        .iter()
-        .find(|g| g.dst == UNTYPED)
-        .map_or(0, |g| g.src);
+    // The parent slot the untyped was handed over from. It is empty now, and
+    // it is where the supervisor puts the region back if this task dies.
+    let untyped = grants.iter().find(|g| g.dst() == UNTYPED).map_or(0, |g| g.src());
     Ok(Child { cnode, vspace, tcb, fault_ep, shared, entry: elf.entry(), untyped })
 }
 

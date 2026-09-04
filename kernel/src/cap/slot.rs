@@ -133,6 +133,52 @@ pub unsafe fn unlink(mut slot: NonNull<Slot>) {
     }
 }
 
+/// Move the capability at `from` into `to`, taking its position in the
+/// derivation tree with it: the same parent, the same children, the same place
+/// among its siblings. Nothing is duplicated, which is what keeps an untyped
+/// region down to exactly one capability handing memory out of it (D-049).
+///
+/// # Safety
+/// As [`link`], and `to` must be empty and distinct from `from`.
+pub unsafe fn relocate(mut from: NonNull<Slot>, mut to: NonNull<Slot>) {
+    // SAFETY: the caller promised exclusive access to two distinct live slots.
+    unsafe {
+        let parent = from.as_ref().parent;
+        let (prev, next) = (from.as_ref().prev_sib, from.as_ref().next_sib);
+        let children = from.as_ref().first_child;
+
+        to.as_mut().cap = from.as_ref().cap;
+        to.as_mut().first_child = children;
+
+        // Every child has to be told where its parent went, or revocation
+        // would walk back into a slot that is now empty.
+        let mut cursor = children;
+        while let Some(mut child) = cursor {
+            child.as_mut().parent = Some(to);
+            cursor = child.as_ref().next_sib;
+        }
+
+        // Splice the new home in exactly where the old one sat, so the
+        // depth-first walk revocation uses is unchanged.
+        to.as_mut().parent = parent;
+        to.as_mut().prev_sib = prev;
+        to.as_mut().next_sib = next;
+        match prev {
+            Some(mut p) => p.as_mut().next_sib = Some(to),
+            None => {
+                if let Some(mut p) = parent {
+                    p.as_mut().first_child = Some(to);
+                }
+            }
+        }
+        if let Some(mut n) = next {
+            n.as_mut().prev_sib = Some(to);
+        }
+
+        *from.as_mut() = Slot::EMPTY;
+    }
+}
+
 /// Destroy every capability derived from `root`, leaving `root` itself alone.
 ///
 /// # Safety

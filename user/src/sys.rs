@@ -165,6 +165,13 @@ pub fn mint(cnode: u64, src: u64, dst: u64, rights: u8, badge: u64) -> Result {
     invoke(cnode, label::MINT, [src as usize, dst as usize, rights as usize, badge as usize], 4)
 }
 
+/// Take the capability at `src` in `src_cnode` and put it at `dst` in
+/// `dst_cnode`, leaving the source slot empty. The only way to hand over
+/// untyped memory, which cannot be copied (D-049).
+pub fn move_cap(dst_cnode: u64, src_cnode: u64, src: u64, dst: u64) -> Result {
+    invoke(dst_cnode, label::MOVE, [src as usize, dst as usize, src_cnode as usize, 0], 4)
+}
+
 pub fn revoke(cnode: u64, src: u64) -> Result {
     invoke(cnode, label::REVOKE, [src as usize, 0, 0, 0], 4)
 }

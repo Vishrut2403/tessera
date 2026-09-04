@@ -33,6 +33,9 @@ pub enum CapError {
     Resolve(cspace::ResolveError),
     /// The destination slot already holds a capability.
     SlotOccupied,
+    /// Untyped memory cannot be copied, only moved: a copy would carry a
+    /// second watermark over the same region (D-049).
+    CannotCopy,
     /// The capability already records a mapping; unmap it first.
     AlreadyMapped,
     /// The page table refused the mapping.

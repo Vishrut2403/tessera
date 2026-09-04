@@ -197,15 +197,16 @@ fn spawn_a_driver(
 
     // --- The driver: a device, an interrupt, and one service to answer ---
     let (transports, count) = virtio_transports(bi);
-    let mut grants = [spawn::Grant { src: 0, dst: 0, rights: 0 }; 2 + MAX_TRANSPORTS];
-    grants[0] = spawn::Grant { src: blk_ram, dst: spawn::UNTYPED, rights: rights::ALL };
-    grants[1] = spawn::Grant { src: blk_service, dst: spawn::SERVICE, rights: rights::READ };
+    // Memory and devices are handed over, not copied: an untyped region has to
+    // be named by exactly one capability or two watermarks would disagree about
+    // what is already spoken for (D-049). Endpoints are copied as before.
+    let mut grants = [spawn::Grant::Move { src: 0, dst: 0 }; 2 + MAX_TRANSPORTS];
+    grants[0] = spawn::Grant::Move { src: blk_ram, dst: spawn::UNTYPED };
+    grants[1] =
+        spawn::Grant::Copy { src: blk_service, dst: spawn::SERVICE, rights: rights::READ };
     for i in 0..count {
-        grants[i + 2] = spawn::Grant {
-            src: transports[i].1,
-            dst: spawn::FIRST_DEVICE + i as u64,
-            rights: rights::ALL,
-        };
+        grants[i + 2] =
+            spawn::Grant::Move { src: transports[i].1, dst: spawn::FIRST_DEVICE + i as u64 };
     }
     println!("    driver gets   : 256 KiB, {count} transports, and READ on the block service");
     let driver = spawn::spawn(module_bytes(blk), &mut nursery, parent, BLK, &grants[..count + 2])
@@ -219,6 +220,7 @@ fn spawn_a_driver(
         ntfn,
         badged,
         claimed: None,
+        kept: None,
         image: module_bytes(blk),
         grants,
         grant_count: count + 2,
@@ -234,9 +236,9 @@ fn spawn_a_driver(
 
     // --- The filesystem: a client of the driver, a server to everyone else ---
     let fs_grants = [
-        spawn::Grant { src: fs_ram, dst: spawn::UNTYPED, rights: rights::ALL },
-        spawn::Grant { src: blk_service, dst: spawn::UPSTREAM, rights: rights::WRITE },
-        spawn::Grant { src: fs_service, dst: spawn::SERVICE, rights: rights::READ },
+        spawn::Grant::Move { src: fs_ram, dst: spawn::UNTYPED },
+        spawn::Grant::Copy { src: blk_service, dst: spawn::UPSTREAM, rights: rights::WRITE },
+        spawn::Grant::Copy { src: fs_service, dst: spawn::SERVICE, rights: rights::READ },
     ];
     println!("    fs gets       : 128 KiB, WRITE on the block service, READ on its own");
     spawn::spawn(module_bytes(fs), &mut nursery, parent, FS, &fs_grants).expect("fs");
@@ -246,8 +248,8 @@ fn spawn_a_driver(
 
     // --- The client: a name, and nothing else ---
     let client_grants = [
-        spawn::Grant { src: client_ram, dst: spawn::UNTYPED, rights: rights::ALL },
-        spawn::Grant { src: fs_service, dst: spawn::UPSTREAM, rights: rights::WRITE },
+        spawn::Grant::Move { src: client_ram, dst: spawn::UNTYPED },
+        spawn::Grant::Copy { src: fs_service, dst: spawn::UPSTREAM, rights: rights::WRITE },
     ];
     println!("    client gets   : 64 KiB and WRITE on the fs service, and nothing else");
     spawn::spawn(module_bytes(client), &mut nursery, parent, CLIENT, &client_grants)
@@ -312,6 +314,9 @@ struct Supervisor<'a> {
     ntfn: u64,
     badged: u64,
     claimed: Option<u32>,
+    /// Which transport the driver kept. The others were handed back at claim
+    /// time; this one comes back when it dies (D-049).
+    kept: Option<usize>,
     /// What it takes to make another driver.
     image: &'a [u8],
     grants: [spawn::Grant; 2 + MAX_TRANSPORTS],
@@ -387,11 +392,24 @@ impl Supervisor<'_> {
         // a freed TCB (D-048).
         sys::tcb_suspend(self.driver.tcb).expect("suspend the dead driver");
 
-        // Revoking the untyped it was given destroys every object it made out
-        // of it (page tables, frames, the virtqueue) and unmaps them all
-        // (M6), then resets the region's watermark so it can be handed over
-        // again.
-        let reclaimed = sys::revoke(bootinfo::slot::CNODE, self.driver.untyped);
+        // Take the memory and the device back before the CSpace holding them
+        // is destroyed. They were handed over rather than copied, so these are
+        // the only capabilities to them and deleting the CSpace would lose
+        // both for good (D-049).
+        let home = self.driver.untyped;
+        sys::move_cap(bootinfo::slot::CNODE, self.driver.cnode, spawn::UNTYPED, home)
+            .expect("take the driver's memory back");
+        if let Some(i) = self.kept.take() {
+            let device = self.transports[i].1;
+            let slot = spawn::FIRST_DEVICE + i as u64;
+            let _ = sys::move_cap(bootinfo::slot::CNODE, self.driver.cnode, slot, device);
+            let _ = sys::revoke(bootinfo::slot::CNODE, device);
+        }
+
+        // Revoking the untyped destroys every object it made out of it (page
+        // tables, frames, the virtqueue), unmaps them all (M6), and resets the
+        // region's watermark so the same memory can be handed over again.
+        let reclaimed = sys::revoke(bootinfo::slot::CNODE, home);
         for slot in [self.driver.cnode, self.driver.vspace, self.driver.tcb, self.driver.fault_ep] {
             let _ = sys::delete(bootinfo::slot::CNODE, slot);
         }
@@ -453,16 +471,24 @@ impl Supervisor<'_> {
         )
         .expect("mint ntfn");
 
-        // Everything it probed but did not want. `delete` empties the slot in
-        // the child's CNode and revokes what was derived from it, so the frame
-        // the driver mapped over those registers is unmapped with it.
+        // Everything it probed but did not want, taken back rather than
+        // destroyed. These are now the only capabilities to those regions, so
+        // deleting them would lose the devices for good (D-049). Revoking each
+        // one afterwards undoes what the driver did with it, which unmaps the
+        // frame it laid over those registers.
         let mut taken = 0;
         for i in 0..self.transports.len() {
-            if i != index {
-                let _ = sys::delete(self.driver.cnode, spawn::FIRST_DEVICE + i as u64);
+            if i == index {
+                continue;
+            }
+            let home = self.transports[i].1;
+            let slot = spawn::FIRST_DEVICE + i as u64;
+            if sys::move_cap(bootinfo::slot::CNODE, self.driver.cnode, slot, home).is_ok() {
+                let _ = sys::revoke(bootinfo::slot::CNODE, home);
                 taken += 1;
             }
         }
+        self.kept = Some(index);
         println!(
             "    claim         : {:#x} raises source {irq}; {taken} unused transports taken back",
             device.paddr

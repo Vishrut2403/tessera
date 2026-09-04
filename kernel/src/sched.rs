@@ -935,6 +935,9 @@ fn invoke_cnode(tcb: &mut Tcb, cs: CSpace, cptr: u64, info: MessageInfo) -> ! {
     let dst = tcb.frame.x[reg::A0 + 3] as u64;
     let rights_mask = tcb.frame.x[reg::A0 + 4] as u8;
     let badge = tcb.frame.x[reg::A0 + 5] as u64;
+    // `Move` has no rights or badge to pass, so it spends that register on the
+    // CNode its source sits in instead (D-049).
+    let src_cnode = tcb.frame.x[reg::A0 + 4] as u64;
 
     // Writing a capability into a CNode is granting authority over whatever it
     // names, so the destination must be held with `WRITE`.
@@ -949,11 +952,33 @@ fn invoke_cnode(tcb: &mut Tcb, cs: CSpace, cptr: u64, info: MessageInfo) -> ! {
         label::MINT => cs
             .mint_into(&mut into, (src, depth), (dst, into_depth), rights_mask, badge)
             .map(|()| result::OK),
+        // The source may sit in any CNode the caller holds with `WRITE`, not
+        // only its own root, so a capability can be taken back out of a child
+        // as well as handed into one (D-049).
+        label::MOVE => move_between(&cs, &mut into, (src, dst, src_cnode), depth, into_depth),
         label::REVOKE => into.revoke(src, into_depth).map(|_| result::OK),
         label::DELETE => into.delete(src, into_depth).map(|_| result::OK),
         _ => finish(tcb, result::ERR_BAD_LABEL),
     };
     finish(tcb, outcome.unwrap_or(result::ERR_BAD_CAP))
+}
+
+/// Resolve the CNode a `Move` names its source in, and perform the move. The
+/// source CNode needs `WRITE` too: taking a capability out of a CNode changes
+/// it just as much as putting one in does.
+fn move_between(
+    cs: &CSpace,
+    into: &mut CSpace,
+    slots: (u64, u64, u64),
+    depth: u8,
+    into_depth: u8,
+) -> Result<usize, CapError> {
+    let (src, dst, src_cnode) = slots;
+    let root = cs.read(src_cnode, depth)?;
+    Cap::<kind::CNode, { rights::WRITE }>::from_raw(root)?;
+    let from = CSpace::new(root)?;
+    let from_depth = from.root_depth();
+    from.move_into(into, (src, from_depth), (dst, into_depth)).map(|()| result::OK)
 }
 
 /// `Map` and `Unmap`, invoked on the frame or page table being mapped (D-034).

@@ -272,3 +272,72 @@ fn a_missing_page_table_is_its_own_error() {
     assert_ne!(result::ERR_NO_TABLE, result::ERR_MAP);
     assert!(result::is_err(result::ERR_NO_TABLE));
 }
+
+// --- Handing a region over rather than copying it (D-049) ---
+
+/// `call(dst_cnode, Move, [src, dst, src_cnode]); *(sp - 8) = a0; exit()`.
+fn move_prog(dst_cnode: u64, src_cnode: u64, src: u64, dst: u64) -> Prog<24> {
+    Prog::new()
+        .li(A0, dst_cnode as u32)
+        .li(A0 + 1, MessageInfo::new(label::MOVE, 4, false).bits() as u32)
+        .li(A0 + 2, src as u32)
+        .li(A0 + 3, dst as u32)
+        .li(A0 + 4, src_cnode as u32)
+        .li(A0 + 5, 0)
+        .syscall(sched::syscall::CALL)
+        .raw(uprog::sd(2, A0, -8))
+        .exit()
+}
+
+#[test_case]
+fn an_untyped_cannot_be_copied_from_userspace() {
+    let cs = parent_cspace();
+    // Slot 0 is the region this whole space was bootstrapped out of.
+    let (_space, status) = run_recording(mint_prog(CHILD, 0, TARGET).as_slice(), &cs);
+    assert_eq!(status as usize, result::ERR_BAD_CAP, "an untyped was copied");
+    assert!(child_of(&cs).read(TARGET, D).unwrap().is_null());
+    assert!(!cs.read(0, D).unwrap().is_null(), "the refused copy took the original");
+}
+
+#[test_case]
+fn moving_into_a_child_leaves_the_parent_without_it() {
+    let cs = parent_cspace();
+    let was = cs.read(GIFT, D).unwrap();
+    let (_space, status) =
+        run_recording(move_prog(CHILD, 1, GIFT, TARGET).as_slice(), &cs);
+    assert_eq!(status as usize, result::OK, "the move was refused");
+
+    assert!(cs.read(GIFT, D).unwrap().is_null(), "the parent still holds it");
+    let landed = child_of(&cs).read(TARGET, D).expect("nothing reached the child");
+    assert_eq!(landed.paddr, was.paddr);
+    assert_eq!(landed.rights, was.rights, "a move changed the rights");
+}
+
+#[test_case]
+fn a_move_needs_write_on_the_cnode_it_takes_from() {
+    let cs = parent_cspace();
+    // First hand the gift over, so there is something in the child to take.
+    let (_a, ok) = run_recording(move_prog(CHILD, 1, GIFT, TARGET).as_slice(), &cs);
+    assert_eq!(ok as usize, result::OK);
+
+    // Now try to take it back through the read-only view of the child's CNode.
+    // Emptying a slot changes that CNode just as much as filling one does.
+    let (_b, status) =
+        run_recording(move_prog(1, CHILD_RO, TARGET, GIFT).as_slice(), &cs);
+    assert_eq!(status as usize, result::ERR_BAD_CAP, "a read-only CNode was emptied");
+    assert!(cs.read(GIFT, D).unwrap().is_null(), "the refused move handed it back anyway");
+}
+
+#[test_case]
+fn a_supervisor_can_take_a_region_back_out_of_a_child() {
+    let cs = parent_cspace();
+    let (_a, ok) = run_recording(move_prog(CHILD, 1, GIFT, TARGET).as_slice(), &cs);
+    assert_eq!(ok as usize, result::OK);
+    assert!(cs.read(GIFT, D).unwrap().is_null());
+
+    // The other direction, which is what a supervisor does to a dead task.
+    let (_b, back) = run_recording(move_prog(1, CHILD, TARGET, GIFT).as_slice(), &cs);
+    assert_eq!(back as usize, result::OK, "the supervisor could not reclaim it");
+    assert!(!cs.read(GIFT, D).unwrap().is_null(), "nothing came back");
+    assert!(child_of(&cs).read(TARGET, D).unwrap().is_null(), "the child kept it");
+}

@@ -161,6 +161,14 @@ impl CSpace {
                 held: original.rights,
             });
         }
+        // An untyped capability carries a watermark saying how much of its
+        // region is already handed out, and `retype` writes that back to the
+        // slot it was invoked through. A copy would carry a second watermark
+        // over the same memory, and retyping through both would hand the same
+        // bytes out twice. Untyped is moved, never copied (D-049).
+        if original.kind.is_untyped() {
+            return Err(CapError::CannotCopy);
+        }
         // A copy is not the mapping the original made. seL4 gives every page
         // capability its own mapping slot for the same reason: without this a
         // receiver could not map a frame it was handed, and revoking a copy
@@ -196,6 +204,35 @@ impl CSpace {
     ) -> Result<(), CapError> {
         let (copy, source) = self.prepare_mint(src, rights, badge)?;
         into.insert(dst.0, dst.1, copy, Some(source))
+    }
+
+    /// Move the capability at `src` in this space into `dst` in `into`, taking
+    /// its place in the derivation tree with it. The rights, the badge and an
+    /// untyped's watermark all travel unchanged, because nothing is copied:
+    /// afterwards the source slot is empty (D-049).
+    pub fn move_into(
+        &self,
+        into: &mut CSpace,
+        src: (u64, u8),
+        dst: (u64, u8),
+    ) -> Result<(), CapError> {
+        let from = self.resolve(src.0, src.1)?;
+        // SAFETY: a live slot we hold exclusively.
+        if unsafe { from.as_ref().is_empty() } {
+            return Err(CapError::Null);
+        }
+        let to = into.resolve(dst.0, dst.1)?;
+        // SAFETY: as above.
+        if !unsafe { to.as_ref().is_empty() } {
+            return Err(CapError::SlotOccupied);
+        }
+        if from == to {
+            return Ok(());
+        }
+        // SAFETY: two distinct live slots, and only this hart is touching the
+        // tree they are threaded onto.
+        unsafe { slot::relocate(from, to) };
+        Ok(())
     }
 
     /// Carve `count` objects out of the untyped at `src` and install them in

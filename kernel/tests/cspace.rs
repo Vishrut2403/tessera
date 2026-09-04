@@ -141,8 +141,10 @@ fn retyping_into_an_occupied_slot_is_refused_and_changes_nothing() {
 #[test_case]
 fn retyping_needs_write_on_the_untyped() {
     let mut cs = space();
-    // Hand a read-only copy of the untyped to slot 3, then try to retype it.
-    cs.mint((0, D), (3, D), READ, 0).expect("mint");
+    // Built by hand, because an untyped can no longer be copied at all (D-049)
+    // and a move would carry its rights along unchanged.
+    let weak = RawCap { rights: READ, ..cs.read(0, D).unwrap() };
+    cs.insert(3, D, weak, None).expect("insert a weakened untyped");
 
     let mut made = [RawCap::NULL; 1];
     assert_eq!(
@@ -453,4 +455,105 @@ fn an_occupied_slot_in_another_space_is_not_overwritten() {
         Err(CapError::SlotOccupied)
     );
     assert_eq!(child.read(3, D).unwrap().paddr, parent.read(8, D).unwrap().paddr);
+}
+
+// --- Untyped is moved, never copied (D-049) ---
+
+#[test_case]
+fn an_untyped_capability_cannot_be_copied() {
+    let mut cs = space();
+    // A copy would carry its own watermark over the same region, and retyping
+    // through both would hand the same bytes out twice.
+    assert_eq!(cs.mint((0, D), (3, D), ALL, 0), Err(CapError::CannotCopy));
+    assert!(cs.read(3, D).unwrap().is_null(), "the copy landed anyway");
+
+    let device = RawCap::device_untyped(cs.read(0, D).unwrap().paddr, 12, ALL);
+    cs.insert(4, D, device, None).expect("insert a device untyped");
+    assert_eq!(cs.mint((4, D), (5, D), ALL, 0), Err(CapError::CannotCopy));
+}
+
+#[test_case]
+fn moving_leaves_the_source_empty_and_carries_the_watermark() {
+    let mut cs = space();
+    cs.retype((0, D), ObjectType::Frame, 0, (8, D), &mut [RawCap::NULL]).expect("first frame");
+    let before = cs.read(0, D).unwrap();
+    assert!(before.watermark > 0, "the first retype left no watermark to carry");
+
+    let mut same = CSpace::new(*cs.root()).expect("same space");
+    cs.move_into(&mut same, (0, D), (9, D)).expect("move");
+
+    assert!(cs.read(0, D).unwrap().is_null(), "the source still holds it");
+    let after = cs.read(9, D).unwrap();
+    assert_eq!(after.paddr, before.paddr);
+    assert_eq!(after.watermark, before.watermark, "the watermark did not travel");
+
+    // And the region carries on where it left off rather than starting again.
+    cs.retype((9, D), ObjectType::Frame, 0, (10, D), &mut [RawCap::NULL]).expect("second frame");
+    assert_ne!(
+        cs.read(10, D).unwrap().paddr,
+        cs.read(8, D).unwrap().paddr,
+        "the moved untyped handed out the same memory twice"
+    );
+}
+
+#[test_case]
+fn a_moved_capability_keeps_its_place_in_the_derivation_tree() {
+    let mut cs = space();
+    // A sub-untyped, so revoking the parent later does not take the CNode this
+    // space lives in with it: `bootstrap` carved that from slot 0.
+    cs.retype((0, D), ObjectType::Untyped, 16, (8, D), &mut [RawCap::NULL]).expect("sub-untyped");
+    cs.retype((8, D), ObjectType::Frame, 0, (9, D), &mut [RawCap::NULL]).expect("frame");
+    assert_eq!(cs.descendants(8, D).unwrap(), 1);
+
+    let mut same = CSpace::new(*cs.root()).expect("same space");
+    cs.move_into(&mut same, (9, D), (10, D)).expect("move the frame");
+
+    // Still a child of the untyped it came from, so revoking that reaches it.
+    assert_eq!(cs.descendants(8, D).unwrap(), 1, "the move lost the derivation link");
+    assert_eq!(cs.revoke(8, D).unwrap(), 1);
+    assert!(cs.read(10, D).unwrap().is_null(), "a moved capability survived its parent");
+}
+
+#[test_case]
+fn a_move_carries_children_along_with_it() {
+    let mut cs = space();
+    // A sub-untyped with a frame of its own under it.
+    cs.retype((0, D), ObjectType::Untyped, 16, (8, D), &mut [RawCap::NULL]).expect("sub-untyped");
+    cs.retype((8, D), ObjectType::Frame, 0, (9, D), &mut [RawCap::NULL]).expect("frame");
+
+    let mut same = CSpace::new(*cs.root()).expect("same space");
+    cs.move_into(&mut same, (8, D), (10, D)).expect("move the sub-untyped");
+
+    assert_eq!(cs.descendants(10, D).unwrap(), 1, "the child did not follow");
+    assert_eq!(cs.revoke(10, D).unwrap(), 1, "revoking the new home missed the child");
+    assert!(cs.read(9, D).unwrap().is_null());
+}
+
+#[test_case]
+fn moving_between_capability_spaces_hands_a_region_over_completely() {
+    let mut parent = space();
+    parent
+        .retype((0, D), ObjectType::Untyped, 16, (8, D), &mut [RawCap::NULL])
+        .expect("sub-untyped");
+    let mut child = child_space(&mut parent);
+
+    parent.move_into(&mut child, (8, D), (3, D)).expect("hand it over");
+    assert!(parent.read(8, D).unwrap().is_null(), "the parent kept a copy");
+    assert!(!child.read(3, D).unwrap().is_null(), "the child got nothing");
+
+    // And back again, which is how a supervisor reclaims from a dead task.
+    child.move_into(&mut parent, (3, D), (8, D)).expect("take it back");
+    assert!(child.read(3, D).unwrap().is_null());
+    assert_eq!(parent.read(8, D).unwrap().kind, ObjectType::Untyped);
+}
+
+#[test_case]
+fn moving_onto_an_occupied_slot_is_refused() {
+    let mut cs = space();
+    cs.retype((0, D), ObjectType::Frame, 0, (8, D), &mut [RawCap::NULL]).expect("frames");
+    cs.retype((0, D), ObjectType::Frame, 0, (9, D), &mut [RawCap::NULL]).expect("frames");
+
+    let mut same = CSpace::new(*cs.root()).expect("same space");
+    assert_eq!(cs.move_into(&mut same, (8, D), (9, D)), Err(CapError::SlotOccupied));
+    assert!(!cs.read(8, D).unwrap().is_null(), "the refused move emptied the source");
 }

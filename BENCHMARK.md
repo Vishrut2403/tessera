@@ -38,9 +38,9 @@ Measured on QEMU 11.1.0, release profile:
 | what | instructions |
 |---|---|
 | null syscall (`ecall` in, `ecall` out) | 127 |
-| IPC round trip, no ASID (full TLB flush) | 1134 |
-| IPC round trip, ASID-tagged spaces | 1132 |
-| IPC round trip, one shared address space | 1122 |
+| IPC round trip, no ASID (full TLB flush) | 1136 |
+| IPC round trip, ASID-tagged spaces | 1134 |
+| IPC round trip, one shared address space | 1124 |
 | round trip / null syscall | 8x |
 
 ASIDs save only 2 instructions here, and that is worth stating rather than
@@ -52,7 +52,7 @@ the number should not be quoted as though it did.
 ## 3. A 37% regression, found and traced
 
 At M5 this benchmark reported 826 instructions for a round trip. It now reports
-1134. That is 308 more instructions, about 37%.
+1136. That is 310 more instructions, about 38%.
 
 The first question was whether the comparison was even valid, since the M5
 figure came from an earlier session on a possibly different toolchain. It is
@@ -73,9 +73,10 @@ commit:
 | M7d, notifications and interrupts | 127 | 1123 |
 | M7f, the filesystem server | 127 | 1129 |
 | M8, crash and restart | 127 | 1134 |
+| working tree, with D-049 | 127 | 1136 |
 
-**M6 accounts for 292 of the 308 instructions.** Everything built in M7 and M8,
-which is most of the system by line count, adds 16 in total. That is the useful
+**M6 accounts for 292 of the 310 instructions.** Everything built in M7 and M8,
+which is most of the system by line count, adds 18 in total. That is the useful
 result: a driver, a filesystem, three more processes and a supervisor cost
 almost nothing on the IPC fast path, and one earlier milestone cost a great
 deal.
@@ -141,8 +142,9 @@ would only flatter the number.
 | M6 userspace pager | 4463 | 859 | 19.2% |
 | M7 driver and filesystem | 6057 | 1013 | 16.7% |
 | M8 crash and restart | 6107 | 1038 | 17.0% |
+| untyped moved, not copied | 6177 | 1074 | 17.4% |
 
-Final figure: 6107 lines, 1038 of them inside `unsafe`, in 186 regions.
+Final figure: 6177 lines, 1074 of them inside `unsafe`, in 190 regions.
 
 Two movements need explaining rather than hiding.
 
@@ -155,13 +157,16 @@ instructions inside two blocks. That is roughly 190 lines of transcription, not
 from 53 to 87, and the new regions sit exactly where the design says they
 should: trap entry, FP state, context switch.
 
-M8 rose from 16.7% to 17.0%, the first rise since M3. The 25 new unsafe lines
-are all one shape. Recording which queue a blocked thread is on has to be
+M8 and D-049 together took it from 16.7% to 17.4%, the first rise since M3, and
+both are one shape. Recording which queue a blocked thread is on has to be
 written through a `NonNull<Tcb>` inside the endpoint and notification queue
 methods, which are already the most pointer-dense code in the kernel. Six new
 regions, each a field assignment beside an existing one under the same SAFETY
 comment. Setting it at the four call sites instead would have been safe code in
-more places and a rule enforced in none.
+more places and a rule enforced in none. D-049's `slot::relocate` is the same
+kind of thing: rewriting four pointers across three slots to move a capability
+without losing its place in the derivation tree, in one block because it is one
+operation rather than four hazards.
 
 The trend between them holds. From M3 to M7 the share fell every milestone while
 the kernel nearly doubled, because what was being added was safe code over an
@@ -171,8 +176,8 @@ unsafe core that had stopped growing.
 
 | | lines |
 |---|---|
-| TCB (`kernel/src` and `abi/`) | 6107 |
-| userspace (`user/src`), outside the TCB | 1987 |
+| TCB (`kernel/src` and `abi/`) | 6177 |
+| userspace (`user/src`), outside the TCB | 2018 |
 
 The most useful single figure the project produced: M7e and M7f, which are a
 virtio-blk driver, a filesystem server, a client and the protocols between them,
@@ -206,11 +211,6 @@ Stated because a benchmark document that only flatters is not evidence.
   address, so it is inside the TCB for integrity. seL4 without an SMMU has the
   same property. This is the largest gap between the architecture and its
   guarantees.
-- An untyped capability can be copied, and the copies keep independent
-  watermarks, so two copies of one region would hand out overlapping memory. The
-  code is safe by convention, not by enforcement. The fix is a `Move` that
-  transfers rather than copies, as seL4's `seL4_CNode_Move` does. This is the
-  most serious correctness hole left.
 - A crash during a request strands the caller. There is no `PEER_CLOSED` as in
   Fuchsia and no timeout fault as in seL4 MCS, so the demo crashes the driver
   between requests.
@@ -225,7 +225,7 @@ Stated because a benchmark document that only flatters is not evidence.
 ## 8. Reproducing all of it
 
 ```sh
-cargo test                 # 264 cases across 19 bootable images
+cargo test                 # 274 cases across 19 bootable images
 cargo test --release       # the same, optimised
 cargo run                  # boots the whole demo, ending in a crash and restart
 cargo bench-ipc --release  # the numbers in section 2
