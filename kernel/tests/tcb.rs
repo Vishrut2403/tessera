@@ -488,3 +488,92 @@ fn a_thread_may_still_be_configured_with_no_pager_at_all() {
     assert_eq!(kernel::cap::tcb::set_fault_ep(target, RawCap::NULL), Ok(()));
     assert!(target.fault_ep.is_null());
 }
+
+// --- Killing a thread that is not running (D-048) ---
+
+/// The endpoint, in the parent's CSpace and in the child's.
+const EP: u64 = 12;
+const CHILD_EP: u64 = 4;
+
+/// `recv(EP); exit()` — a child that blocks and never comes back on its own.
+fn blocking_child() -> Prog<16> {
+    Prog::new().li(A0, CHILD_EP as u32).syscall(sched::syscall::RECV).exit()
+}
+
+/// Build the child, let it block, then suspend it and record the status.
+fn suspending_parent() -> Prog<64> {
+    let configure = MessageInfo::new(sched::label::CONFIGURE, 3, false).bits() as u32;
+    let write_regs = MessageInfo::new(sched::label::WRITE_REGISTERS, 2, false).bits() as u32;
+    let resume = MessageInfo::new(sched::label::RESUME, 0, false).bits() as u32;
+    let suspend = MessageInfo::new(sched::label::SUSPEND, 0, false).bits() as u32;
+
+    Prog::<64>::new()
+        .li(A0, CHILD_TCB as u32)
+        .li(A0 + 1, configure)
+        .li(A0 + 2, CHILD_CNODE as u32)
+        .li(A0 + 3, CHILD_VSPACE as u32)
+        .li(A0 + 4, SPARE as u32)
+        .syscall(sched::syscall::CALL)
+        .li(A0, CHILD_TCB as u32)
+        .li(A0 + 1, write_regs)
+        .li(A0 + 2, (TEXT >> 12) as u32)
+        .raw(uprog::slli(A0 + 2, A0 + 2, 12))
+        .li(A0 + 3, ((STACK + PAGE_SIZE) >> 12) as u32)
+        .raw(uprog::slli(A0 + 3, A0 + 3, 12))
+        .syscall(sched::syscall::CALL)
+        .li(A0, CHILD_TCB as u32)
+        .li(A0 + 1, resume)
+        .syscall(sched::syscall::CALL)
+        // Two yields: the child has to actually reach `recv` and block before
+        // there is anything to take off a queue.
+        .syscall(sched::syscall::YIELD)
+        .syscall(sched::syscall::YIELD)
+        .li(A0, CHILD_TCB as u32)
+        .li(A0 + 1, suspend)
+        .syscall(sched::syscall::CALL)
+        .raw(uprog::sd(2, A0, -8))
+        .exit()
+}
+
+#[test_case]
+fn a_thread_blocked_on_an_endpoint_can_be_suspended_and_is_taken_off_it() {
+    let mut parent_cs = new_cspace();
+    make(&mut parent_cs, ObjectType::Tcb, 0, CHILD_TCB);
+    let child_cnode = make(&mut parent_cs, ObjectType::CNode, D + SLOT_BITS, CHILD_CNODE);
+    let ep = make(&mut parent_cs, ObjectType::Endpoint, 0, EP);
+
+    // The child needs the endpoint in its own space to block on it.
+    let mut child_cs = CSpace::new(child_cnode).expect("child cnode");
+    child_cs.insert(CHILD_EP, D, ep, None).expect("child endpoint");
+
+    let child_space = user_space(blocking_child().as_slice());
+    let mut vspace = vspace_cap(child_space.root());
+    vspace.asid = child_space.asid().as_u16();
+    parent_cs.insert(CHILD_VSPACE, D, vspace, None).expect("vspace slot");
+
+    let parent_space = user_space(suspending_parent().as_slice());
+    sched::spawn_with_cspace(
+        &parent_space,
+        VirtAddr::new(TEXT),
+        VirtAddr::new(STACK + PAGE_SIZE),
+        *parent_cs.root(),
+    )
+    .expect("spawn parent");
+    run();
+
+    let (pa, _, _) = parent_space.translate(VirtAddr::new(STACK)).expect("stack unmapped");
+    // SAFETY: the parent's stack page, read back through the direct map.
+    let status = unsafe {
+        core::ptr::read_volatile(mm::phys_to_virt(pa).as_ptr::<u64>().byte_add(PAGE_SIZE - 8))
+    };
+    assert_eq!(status as usize, kernel::sched::result::OK, "a blocked thread refused to suspend");
+
+    // The real assertion. Marking it inactive without unlinking it would leave
+    // a dead TCB on the queue for the next sender to be handed (D-048).
+    // SAFETY: an endpoint this test retyped and nothing else is touching.
+    let queue = unsafe { kernel::ipc::endpoint_at(ep.paddr) };
+    assert!(queue.is_empty(), "the suspended thread is still queued on the endpoint");
+
+    let child = thread_of(&parent_cs.read(CHILD_TCB, D).unwrap());
+    assert_eq!(child.state, ThreadState::Inactive);
+}

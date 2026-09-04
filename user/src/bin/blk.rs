@@ -38,6 +38,11 @@ const SECTOR: usize = 512;
 const BLK_T_IN: u32 = 0;
 const BLK_S_OK: u8 = 0;
 
+/// After this many blocks the driver walks into memory it holds no capability
+/// for. A crash we schedule is still a crash: the kernel reports it as a fault
+/// and the supervisor has to cope with it (D-048).
+const CRASH_AFTER: usize = 4;
+
 /// Two sectors far apart and clear of the filesystem, so "it always returns
 /// block zero" is not a way to
 /// pass. `kernel/build.rs` writes each block's own number into it.
@@ -50,7 +55,9 @@ fn main() {
     let vspace = bootinfo::slot::VSPACE;
     let mut alloc = vm::Alloc::new(spawn::UNTYPED, spawn::FIRST_FREE);
 
-    spawn::say_hello(MAGIC);
+    // The parent tells us whether we are the first driver or a replacement for
+    // one that died. Only the first is asked to crash (D-048).
+    let first_life = spawn::say_hello(MAGIC) == spawn::FIRST_LIFE;
 
     let mut frames = [0u64; CANDIDATES];
     let brought_up = match probe(&mut alloc, vspace, &mut frames) {
@@ -103,7 +110,7 @@ fn main() {
 
     // From here we are a server rather than a program that read two sectors.
     if let Some((queue, transport, _, _)) = brought_up {
-        let served = serve_blocks(&queue, &transport);
+        let served = serve_blocks(&queue, &transport, first_life);
         println!("    served        : {served} blocks before the client said stop");
     }
 }
@@ -201,47 +208,66 @@ fn read_into(queue: &Queue, transport: &Transport, sector: u64, dest_pa: u64) ->
 /// Serve blocks until a client says stop. `reply_recv` is the loop the kernel
 /// was built around (D-031): one syscall answers the last caller and waits for
 /// the next, and the scheduler is never consulted on the way through.
-fn serve_blocks(queue: &Queue, transport: &Transport) -> usize {
-    // The connect carries the client's frame. Every request after it is four
-    // registers and no capability at all -- which is the point: a 512-byte
-    // block never fits in a message, so the message carries authority instead.
-    let first = sys::recv_cap(spawn::SERVICE, spawn::CLIENT_FRAME);
+fn serve_blocks(queue: &Queue, transport: &Transport, may_crash: bool) -> usize {
     let ok = MessageInfo::new(0, 1, false);
-    if first.info.label() != block::CONNECT {
-        let _ = sys::reply(ok, [block::NO_BUFFER, 0, 0, 0]);
-        return 0;
-    }
-
-    // Ask where it is, and never map it. A descriptor needs a physical address
-    // and nothing else, so a client's page is never in this driver's address
-    // space at all (D-040, D-046).
-    let Ok(client_pa) = sys::get_address(spawn::CLIENT_FRAME) else {
-        let _ = sys::reply(ok, [block::FAILED, 0, 0, 0]);
-        return 0;
-    };
-    println!("    connected     : client buffer at {client_pa:#x}, never mapped here");
-
+    // Kept across requests, and *not* across a restart: a driver rebuilt from
+    // scratch has never heard of anyone, which is what forces its client to
+    // say who it is again (D-048).
+    let mut client_pa: Option<u64> = None;
     let mut served = 0usize;
-    let mut msg = sys::reply_recv(spawn::SERVICE, ok, [block::OK, 0, 0, 0]);
+
+    // Every receive names a slot, because a connect carries a capability and
+    // may arrive at any time -- the first message a restarted driver gets is
+    // a read from a client that thinks it is still connected.
+    let mut msg = sys::recv_cap(spawn::SERVICE, spawn::CLIENT_FRAME);
     loop {
         let status = match msg.info.label() {
-            block::READ => {
-                match read_into(queue, transport, msg.words[0] as u64, client_pa as u64) {
+            block::CONNECT => match sys::get_address(spawn::CLIENT_FRAME) {
+                // Asked for, never mapped: a descriptor needs a physical
+                // address and nothing else, so a client's page is never in
+                // this driver's address space at all (D-040, D-046).
+                Ok(pa) => {
+                    println!("    connected     : client buffer at {pa:#x}, never mapped here");
+                    client_pa = Some(pa as u64);
+                    block::OK
+                }
+                Err(_) => block::FAILED,
+            },
+            block::READ => match client_pa {
+                None => block::NO_BUFFER,
+                Some(pa) => match read_into(queue, transport, msg.words[0] as u64, pa) {
                     Some(()) => {
                         served += 1;
                         block::OK
                     }
                     None => block::FAILED,
-                }
-            }
+                },
+            },
             block::SHUTDOWN => {
                 let _ = sys::reply(ok, [block::OK, 0, 0, 0]);
                 return served;
             }
             _ => block::FAILED,
         };
-        msg = sys::reply_recv(spawn::SERVICE, ok, [status, 0, 0, 0]);
+
+        if may_crash && served == CRASH_AFTER {
+            // Answer first: once we are dead nobody can wake a caller blocked
+            // in `call`, so the crash happens between requests, never during
+            // one (D-048).
+            let _ = sys::reply(ok, [status, 0, 0, 0]);
+            crash();
+        }
+        msg = sys::reply_recv_cap(spawn::SERVICE, ok, [status, 0, 0, 0], spawn::CLIENT_FRAME);
     }
+}
+
+/// Read an address we hold no capability for. The kernel turns that into IPC
+/// to our fault endpoint (D-034), and we never run again.
+fn crash() -> ! {
+    println!("    crashing      : touching an address we hold no capability for");
+    // SAFETY: none, deliberately. This read is the fault.
+    unsafe { core::ptr::read_volatile(0xdead_0000 as *const u64) };
+    unreachable!("the kernel let a read of unmapped memory complete")
 }
 
 /// Map each transport the parent handed over and ask what is behind it.

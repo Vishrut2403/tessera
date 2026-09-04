@@ -39,6 +39,12 @@ pub const UNTYPED: u64 = bootinfo::slot::FIRST_UNTYPED;
 pub const IRQ_HANDLER: u64 = 9;
 /// The notification that source is bound to.
 pub const NOTIFICATION: u64 = 10;
+/// What a parent answers a task's first message with: whether this is the
+/// first of its name, or a replacement for one that died (D-048). A restarted
+/// task usually needs to behave differently, and this is how it finds out.
+pub const FIRST_LIFE: u64 = 0x0acc_e5ed;
+pub const REPLACEMENT: u64 = 0x2edb_0417;
+
 /// The badge a spawned driver's device interrupt arrives under, so both ends
 /// agree on what a notification word means (D-038).
 pub const DEVICE_BADGE: u64 = 1 << 1;
@@ -110,15 +116,30 @@ pub struct Child {
     pub cnode: u64,
     pub vspace: u64,
     pub tcb: u64,
-    /// The parent's end of the channel, held with every right.
-    pub endpoint: u64,
+    /// The parent's badged copy of its own endpoint, which is also what the
+    /// kernel sends this task's faults on (D-048).
+    pub fault_ep: u64,
     pub shared: u64,
     pub entry: usize,
+    /// The untyped this task was given, if it was given one. Revoking it is
+    /// how everything the task made is reclaimed.
+    pub untyped: u64,
 }
 
 /// Load `image` into a new address space, endow a new capability space, and
 /// start a thread in it. The child is running when this returns.
-pub fn spawn(image: &[u8], n: &mut Nursery, grants: &[Grant]) -> Result<Child, SpawnError> {
+/// `parent` is the endpoint the spawning task receives on, held with every
+/// right; `badge` is how it will tell this child from its siblings. One
+/// endpoint and a badge per child is what lets a supervisor wait in a single
+/// `recv` and still know who is talking -- including when the talker is the
+/// kernel, reporting a fault (D-048).
+pub fn spawn(
+    image: &[u8],
+    n: &mut Nursery,
+    parent: u64,
+    badge: u64,
+    grants: &[Grant],
+) -> Result<Child, SpawnError> {
     let elf = Elf::parse(image)?;
     let (_, image_end) = elf.image_range()?;
     if image_end > SHARED_VADDR {
@@ -144,8 +165,13 @@ pub fn spawn(image: &[u8], n: &mut Nursery, grants: &[Grant]) -> Result<Child, S
         vm::map(&mut n.alloc, vspace, frame, STACK_BOTTOM + i * PAGE_SIZE, rw, false)?;
     }
 
-    let endpoint = n.object(ObjectType::Endpoint, 0)?;
     let tcb = n.object(ObjectType::Tcb, 0)?;
+
+    // Two badged copies of the parent's endpoint: one for the child to call
+    // on, one for the kernel to report its faults on. Both carry the same
+    // badge, so a fault and a message arrive from the same identity.
+    let fault_ep = n.alloc.take();
+    sys::mint(bootinfo::slot::CNODE, parent, fault_ep, rights::WRITE, badge)?;
 
     // The child's whole world, in the slots `bootinfo::slot` names -- the same
     // convention the kernel uses for the root task, so one layout is learned
@@ -154,7 +180,7 @@ pub fn spawn(image: &[u8], n: &mut Nursery, grants: &[Grant]) -> Result<Child, S
     sys::mint(cnode, cnode, bootinfo::slot::CNODE, rights::ALL, 0)?;
     sys::mint(cnode, vspace, bootinfo::slot::VSPACE, rights::ALL, 0)?;
     sys::mint(cnode, tcb, bootinfo::slot::TCB, rights::ALL, 0)?;
-    sys::mint(cnode, endpoint, bootinfo::slot::ENDPOINT, rights::WRITE, 0)?;
+    sys::mint(cnode, parent, bootinfo::slot::ENDPOINT, rights::WRITE, badge)?;
 
     // Whatever else this particular task is trusted with. Each is a derivative
     // of the parent's own capability, so the parent can take any of them back.
@@ -162,11 +188,17 @@ pub fn spawn(image: &[u8], n: &mut Nursery, grants: &[Grant]) -> Result<Child, S
         sys::mint(cnode, g.src, g.dst, g.rights, 0)?;
     }
 
-    sys::tcb_configure(tcb, cnode, vspace, 0)?;
+    // A fault endpoint at last: until now a spawned task that touched memory it
+    // had no capability for died silently (D-037). Now its parent is told.
+    sys::tcb_configure(tcb, cnode, vspace, fault_ep)?;
     sys::tcb_write_registers(tcb, elf.entry(), STACK_TOP)?;
     sys::tcb_resume(tcb)?;
 
-    Ok(Child { cnode, vspace, tcb, endpoint, shared, entry: elf.entry() })
+    let untyped = grants
+        .iter()
+        .find(|g| g.dst == UNTYPED)
+        .map_or(0, |g| g.src);
+    Ok(Child { cnode, vspace, tcb, fault_ep, shared, entry: elf.entry(), untyped })
 }
 
 /// Copy one `PT_LOAD` segment into fresh frames and map it into the child.

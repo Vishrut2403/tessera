@@ -50,6 +50,9 @@ fn main() {
     checks += print_a_file("motd") as usize;
     checks += read_across_a_block("spans.bin") as usize;
     checks += a_missing_file_is_refused("nope.txt") as usize;
+    // Once more, at the end. If the disk subsystem was torn down and rebuilt
+    // underneath us while we worked, this is where we would find out (D-048).
+    checks += read_across_a_block("spans.bin") as usize;
 
     sys::call(spawn::UPSTREAM, MessageInfo::new(fs::SHUTDOWN, 0, false), [0; 4]);
     println!("    shutdown      : told the server to stop");

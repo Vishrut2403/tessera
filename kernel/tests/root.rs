@@ -278,7 +278,8 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
     // SAFETY: the same scratch page, one word further on.
     let spawned = unsafe { p.add(4).read_volatile() };
     assert_eq!(spawned >> 48, 0x5b1c, "the root task spawned nothing: {spawned:#x}");
-    assert!(spawned & 0xffff != 0, "the spawned task reported no thread id");
+    // The driver crashed once and the supervisor built another (D-048).
+    assert_eq!(spawned & 0xffff, 1, "the driver was restarted {} times, not once", spawned & 0xffff);
 
     // And it brought a real device up: probe, feature negotiation, a queue and
     // `DRIVER_OK`, all from an unprivileged process (D-044). The capacity is
@@ -300,7 +301,9 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
     // two blocks, and was refused a name that does not exist (D-046, D-047).
     // SAFETY: the same scratch page, one word further on.
     let checks = unsafe { p.add(6).read_volatile() };
-    assert_eq!(checks, 3, "the client passed {checks} of 3 checks against the filesystem");
+    // The last of the four runs *after* the driver died and was replaced, so it
+    // is the one that says the system survived (D-048).
+    assert_eq!(checks, 4, "the client passed {checks} of 4 checks against the filesystem");
 
     // The root task, the thread it made, and the three processes it loaded.
     assert_eq!(sched::exited() - before, 5);

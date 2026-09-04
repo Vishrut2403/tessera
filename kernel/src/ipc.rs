@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 
 use crate::cap::{ObjectType, RawCap};
 use crate::mm::{PhysAddr, phys_to_virt};
-use crate::thread::{Tcb, ThreadState};
+use crate::thread::{BlockedOn, Tcb, ThreadState};
 use crate::trap::reg;
 
 pub use abi::msg::{MSG_REGS, MessageInfo};
@@ -44,9 +44,13 @@ impl Endpoint {
     ///
     /// # Safety
     /// `tcb` must be a live TCB not already on any endpoint queue.
-    pub unsafe fn enqueue(&mut self, mut tcb: NonNull<Tcb>, state: EndpointState) {
+    pub unsafe fn enqueue(&mut self, mut tcb: NonNull<Tcb>, state: EndpointState, at: PhysAddr) {
         // SAFETY: the caller promised a live TCB only we are touching.
-        unsafe { tcb.as_mut().ipc_next = None };
+        unsafe {
+            tcb.as_mut().ipc_next = None;
+            // Which queue, so the thread can be taken off it again (D-048).
+            tcb.as_mut().blocked_on = BlockedOn::Endpoint(at);
+        }
         match self.tail {
             // SAFETY: as above.
             Some(mut t) => unsafe { t.as_mut().ipc_next = Some(tcb) },
@@ -66,7 +70,10 @@ impl Endpoint {
         }
         let mut head = self.head?;
         // SAFETY: the caller promised live TCBs.
-        let next = unsafe { head.as_mut().ipc_next.take() };
+        let next = unsafe {
+            head.as_mut().blocked_on = BlockedOn::Nothing;
+            head.as_mut().ipc_next.take()
+        };
         self.head = next;
         if next.is_none() {
             self.tail = None;
@@ -101,7 +108,10 @@ impl Endpoint {
                     self.tail = prev;
                 }
                 // SAFETY: as above.
-                unsafe { cur.as_mut().ipc_next = None };
+                unsafe {
+                    cur.as_mut().ipc_next = None;
+                    cur.as_mut().blocked_on = BlockedOn::Nothing;
+                }
                 if self.head.is_none() {
                     self.state = EndpointState::Idle;
                 }

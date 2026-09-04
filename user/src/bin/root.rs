@@ -5,7 +5,7 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use rt::abi::{BootInfo, MessageInfo, ObjectType, bootinfo, rights};
+use rt::abi::{BootInfo, MSG_REGS, MessageInfo, ObjectType, bootinfo, label, rights};
 use rt::abi::bootinfo::ModuleDesc;
 use rt::fdt::{Device, Fdt};
 use rt::{entry, println, spawn, sys, thread_entry};
@@ -139,9 +139,16 @@ fn main() {
     println!("root task: done.");
 }
 
-/// Load a boot module into a process of its own -- new address space, new
-/// capability space, new thread -- with no help from the kernel (D-043), then
-/// bring it up as a device driver over the endpoint it starts with (D-044).
+/// Badges: how the supervisor tells its children apart, in a message and in a
+/// fault alike (D-048).
+const BLK: u64 = 1;
+const FS: u64 = 2;
+const CLIENT: u64 = 3;
+
+/// Load three boot modules into processes of their own -- new address spaces,
+/// new capability spaces, new threads -- with no help from the kernel (D-043),
+/// bring the driver up (D-044), stack a filesystem on it (D-047), and stay
+/// standing when the driver crashes (D-048).
 fn spawn_a_driver(
     bi: &BootInfo,
     vspace: u64,
@@ -164,8 +171,8 @@ fn spawn_a_driver(
     // Four processes, one virtual address, four different frames.
     let (ours, blk_ram, fs_ram, client_ram) =
         (first_slot, first_slot + 1, first_slot + 2, first_slot + 3);
-    let (blk_service, fs_service) = (first_slot + 4, first_slot + 5);
-    let (handler, ntfn, badged) = (first_slot + 6, first_slot + 7, first_slot + 8);
+    let (blk_service, fs_service, parent) = (first_slot + 4, first_slot + 5, first_slot + 6);
+    let (handler, ntfn, badged) = (first_slot + 7, first_slot + 8, first_slot + 9);
 
     sys::retype(ram, ObjectType::Frame, 0, ours, 1).expect("shared frame");
     sys::map_frame(ours, vspace, spawn::SHARED_VADDR, rights::READ | rights::WRITE, false)
@@ -173,19 +180,20 @@ fn spawn_a_driver(
     // SAFETY: a frame we just retyped and mapped read-write.
     unsafe { (spawn::SHARED_VADDR as *mut u64).write_volatile(PARENT_MAGIC) };
 
-    // Memory of their own to retype from: a task that had to ask us for every
-    // page table would not be much of a separate process.
+    // Memory of their own to retype from. Revoking one of these is how
+    // everything that child made comes back (D-048).
     sys::retype(ram, ObjectType::Untyped, 18, blk_ram, 1).expect("driver untyped");
     sys::retype(ram, ObjectType::Untyped, 17, fs_ram, 1).expect("fs untyped");
     sys::retype(ram, ObjectType::Untyped, 16, client_ram, 1).expect("client untyped");
 
-    // Two endpoints, four halves. Each server holds one with `READ` and cannot
-    // send on it; each client holds one with `WRITE` and cannot receive on it.
-    // Nobody can impersonate the service they use (D-042).
+    // Two service endpoints, and one more that every child talks to us on. A
+    // server holds its service with `READ` and cannot send; its clients hold it
+    // with `WRITE` and cannot receive (D-042).
     sys::retype(ram, ObjectType::Endpoint, 0, blk_service, 1).expect("block service");
     sys::retype(ram, ObjectType::Endpoint, 0, fs_service, 1).expect("fs service");
+    sys::retype(ram, ObjectType::Endpoint, 0, parent, 1).expect("supervisor endpoint");
 
-    let mut nursery = spawn::Nursery::new(ram, first_slot + 9, vspace, scratch);
+    let mut nursery = spawn::Nursery::new(ram, first_slot + 10, vspace, scratch);
 
     // --- The driver: a device, an interrupt, and one service to answer ---
     let (transports, count) = virtio_transports(bi);
@@ -200,9 +208,26 @@ fn spawn_a_driver(
         };
     }
     println!("    driver gets   : 256 KiB, {count} transports, and READ on the block service");
-    let driver = spawn::spawn(module_bytes(blk), &mut nursery, &grants[..count + 2]).expect("blk");
-    let (result, ready) = serve(&driver, &transports[..count], ram, handler, ntfn, badged);
-    let (sectors, verified) = (ready & 0xffff_ffff, ready >> 32);
+    let driver = spawn::spawn(module_bytes(blk), &mut nursery, parent, BLK, &grants[..count + 2])
+        .expect("blk");
+
+    let mut sup = Supervisor {
+        parent,
+        ram,
+        transports: &transports[..count],
+        handler,
+        ntfn,
+        badged,
+        claimed: None,
+        image: module_bytes(blk),
+        grants,
+        grant_count: count + 2,
+        driver,
+        restarts: 0,
+    };
+
+    let ready = sup.until_ready(BLK, &mut nursery);
+    let (sectors, verified) = (ready[0] as u64, ready[1] as u64);
     println!("    driver up     : {sectors} sectors, {verified} of its own reads verified");
     assert!(sectors > 0, "the driver never brought a device up");
     assert_eq!(verified, 2, "the driver read back {verified} of its own 2 sectors");
@@ -214,10 +239,10 @@ fn spawn_a_driver(
         spawn::Grant { src: fs_service, dst: spawn::SERVICE, rights: rights::READ },
     ];
     println!("    fs gets       : 128 KiB, WRITE on the block service, READ on its own");
-    let server = spawn::spawn(module_bytes(fs), &mut nursery, &fs_grants).expect("fs");
-    let (_, mounted) = serve(&server, &[], ram, handler, ntfn, badged);
-    println!("    fs up         : {} files", mounted & 0xffff_ffff);
-    assert!(mounted & 0xffff_ffff > 0, "the filesystem server mounted nothing");
+    spawn::spawn(module_bytes(fs), &mut nursery, parent, FS, &fs_grants).expect("fs");
+    let mounted = sup.until_ready(FS, &mut nursery)[0];
+    println!("    fs up         : {mounted} files");
+    assert!(mounted > 0, "the filesystem server mounted nothing");
 
     // --- The client: a name, and nothing else ---
     let client_grants = [
@@ -225,12 +250,13 @@ fn spawn_a_driver(
         spawn::Grant { src: fs_service, dst: spawn::UPSTREAM, rights: rights::WRITE },
     ];
     println!("    client gets   : 64 KiB and WRITE on the fs service, and nothing else");
-    let task = spawn::spawn(module_bytes(client), &mut nursery, &client_grants).expect("client");
-    let (_, ready) = serve(&task, &[], ram, handler, ntfn, badged);
-    let checks = ready & 0xffff_ffff;
-    println!("    client done   : {checks} of 3 checks passed against the filesystem");
+    spawn::spawn(module_bytes(client), &mut nursery, parent, CLIENT, &client_grants)
+        .expect("client");
+    let checks = sup.until_ready(CLIENT, &mut nursery)[0];
+    println!("    client done   : {checks} of 4 checks passed, across {} crash", sup.restarts);
 
-    (result, sectors | verified << 32, checks as usize)
+    let result = SPAWNED | sup.restarts as u64;
+    (result, sectors | verified << 32, checks)
 }
 
 /// A boot module's bytes, as the root task sees them.
@@ -273,105 +299,176 @@ fn virtio_transports(bi: &BootInfo) -> ([(Device, u64); MAX_TRANSPORTS], usize) 
     (out, count)
 }
 
-/// The bring-up conversation, from the parent's side.
-fn serve(
-    child: &spawn::Child,
-    transports: &[(Device, u64)],
+/// Everything the supervisor needs to answer a child, and to build the driver
+/// again if it dies (D-048).
+struct Supervisor<'a> {
+    /// The one endpoint every child talks on, held with every right.
+    parent: u64,
     ram: u64,
+    transports: &'a [(Device, u64)],
+    /// The interrupt we hold on the driver's behalf, and the notification it
+    /// is bound to. Claimed once; a restarted driver is handed the same pair.
     handler: u64,
     ntfn: u64,
     badged: u64,
-) -> (u64, u64) {
-    let mut result = 0u64;
-
-    loop {
-        let msg = sys::recv(child.endpoint);
-        match msg.info.label() {
-            spawn::HELLO => {
-                // Answer before judging. A caller left blocked in `call` is a
-                // hung system, and an assertion that hangs reports nothing --
-                // the same reason `reply_recv` replies before it checks its
-                // endpoint (D-042).
-                sys::reply(MessageInfo::new(spawn::HELLO, 1, false), [0xacc_e5ed, 0, 0, 0])
-                    .expect("reply");
-
-                // SAFETY: our own frame, still mapped where we put it.
-                let ours = unsafe { (spawn::SHARED_VADDR as *const u64).read_volatile() };
-                println!("    child said    : thread {}, wrote {:#x}", msg.words[0], msg.words[1]);
-                println!("    {:#x}    : {ours:#x} to us, {:#x} to it", msg.words[2], msg.words[1]);
-                assert_eq!(ours, PARENT_MAGIC, "the child reached into our address space");
-                assert_ne!(msg.words[1] as u64, PARENT_MAGIC, "the child read our page");
-                result = SPAWNED | msg.words[0] as u64;
-            }
-            spawn::CLAIM_IRQ => {
-                let irq =
-                    claim_for(child, transports, msg.words[0], ram, handler, ntfn, badged);
-                sys::reply(MessageInfo::new(spawn::CLAIM_IRQ, 1, false), [irq, 0, 0, 0])
-                    .expect("reply");
-            }
-            spawn::READY => {
-                // Again: the caller is blocked in `call` until this returns,
-                // and it has to be free to run on before anything is judged.
-                sys::reply(MessageInfo::new(spawn::READY, 0, false), [0; 4]).expect("reply");
-                let (w0, w1) = (msg.words[0] as u64, msg.words[1] as u64);
-                return (result, w0 | w1 << 32);
-            }
-            other => {
-                println!("    unknown message {other:#x} from the driver");
-                sys::reply(MessageInfo::new(0, 0, false), [0; 4]).expect("reply");
-                return (result, 0);
-            }
-        }
-    }
+    claimed: Option<u32>,
+    /// What it takes to make another driver.
+    image: &'a [u8],
+    grants: [spawn::Grant; 2 + MAX_TRANSPORTS],
+    grant_count: usize,
+    driver: spawn::Child,
+    restarts: usize,
 }
 
-/// Claim the source the driver asked for, bind it to a notification, hand both
-/// over -- and take back every transport it did not keep. Probing needs breadth;
-/// running does not (D-044).
-#[allow(clippy::too_many_arguments)]
-fn claim_for(
-    child: &spawn::Child,
-    transports: &[(Device, u64)],
-    index: usize,
-    ram: u64,
-    handler: u64,
-    ntfn: u64,
-    badged: u64,
-) -> usize {
-    let Some((device, _)) = transports.get(index) else {
-        println!("    claim         : the driver asked for a transport we never gave it");
-        return 0;
-    };
-    let Some(irq) = device.irq else {
-        println!("    claim         : transport {index} raises no interrupt");
-        return 0;
-    };
+impl Supervisor<'_> {
+    /// Answer every child that speaks until `until` says it is ready, handling
+    /// whatever else arrives on the way -- including a fault.
+    fn until_ready(&mut self, until: u64, nursery: &mut spawn::Nursery) -> [usize; MSG_REGS] {
+        let answer = MessageInfo::new(spawn::READY, 1, false);
+        loop {
+            let msg = sys::recv(self.parent);
+            let who = msg.badge;
 
-    sys::retype(ram, ObjectType::Notification, 0, ntfn, 1).expect("notification");
-    sys::mint(bootinfo::slot::CNODE, ntfn, badged, rights::ALL, spawn::DEVICE_BADGE)
-        .expect("mint badge");
-    sys::irq_get(bootinfo::slot::IRQ_CONTROL, irq as usize, handler).expect("irq_get");
-    sys::irq_set_notification(handler, badged).expect("bind");
-
-    sys::mint(child.cnode, handler, spawn::IRQ_HANDLER, rights::ALL, 0).expect("mint handler");
-    sys::mint(child.cnode, badged, spawn::NOTIFICATION, rights::READ, spawn::DEVICE_BADGE)
-        .expect("mint ntfn");
-
-    // Everything it probed but did not want. `delete` empties the slot in the
-    // child's CNode and revokes what was derived from it, so the frame the
-    // driver mapped over those registers is unmapped with it.
-    let mut taken = 0;
-    for i in 0..transports.len() {
-        if i != index {
-            let _ = sys::delete(child.cnode, spawn::FIRST_DEVICE + i as u64);
-            taken += 1;
+            match msg.info.label() {
+                spawn::HELLO => {
+                    // Answer before judging: a caller left blocked in `call` is
+                    // a hung system, and an assertion that hangs reports
+                    // nothing (D-045).
+                    let life = if self.restarts == 0 || who != BLK {
+                        spawn::FIRST_LIFE
+                    } else {
+                        spawn::REPLACEMENT
+                    };
+                    sys::reply(MessageInfo::new(spawn::HELLO, 1, false), [life as usize, 0, 0, 0])
+                        .expect("reply");
+                    // SAFETY: our own frame, still mapped where we put it.
+                    let ours = unsafe { (spawn::SHARED_VADDR as *const u64).read_volatile() };
+                    assert_eq!(ours, PARENT_MAGIC, "a child reached into our address space");
+                    assert_ne!(msg.words[1] as u64, PARENT_MAGIC, "a child read our page");
+                }
+                spawn::CLAIM_IRQ => {
+                    let irq = self.claim(msg.words[0]);
+                    sys::reply(MessageInfo::new(spawn::CLAIM_IRQ, 1, false), [irq, 0, 0, 0])
+                        .expect("reply");
+                }
+                spawn::READY if who == until => {
+                    sys::reply(answer, [0; MSG_REGS]).expect("reply");
+                    return msg.words;
+                }
+                spawn::READY => {
+                    // A restarted driver announcing itself while we are waiting
+                    // for someone else. Acknowledge and carry on.
+                    sys::reply(answer, [0; MSG_REGS]).expect("reply");
+                    println!("    task {who}        : back up");
+                }
+                label::FAULT_VM => self.on_fault(who, &msg.words, nursery),
+                other => {
+                    println!("    task {who}        : unknown message {other:#x}");
+                    sys::reply(answer, [0; MSG_REGS]).expect("reply");
+                }
+            }
         }
     }
-    println!(
-        "    claim         : {:#x} raises source {irq}; {taken} unused transports taken back",
-        device.paddr
-    );
-    irq as usize
+
+    /// A child touched memory it holds no capability for. The kernel turned
+    /// that into IPC (D-034) and we are the pager, so it is ours to deal with.
+    /// We do not reply: a reply is permission to retry the faulting
+    /// instruction, and there is nothing to retry.
+    fn on_fault(&mut self, who: u64, words: &[usize; MSG_REGS], nursery: &mut spawn::Nursery) {
+        println!();
+        println!("  ** task {who} faulted at {:#x}, pc {:#x} **", words[0], words[1]);
+        if who != BLK {
+            println!("    not the driver; leaving it dead");
+            return;
+        }
+
+        // Suspend before reclaiming: a dead task must be off every queue
+        // before its memory goes back, or a live sender would later be handed
+        // a freed TCB (D-048).
+        sys::tcb_suspend(self.driver.tcb).expect("suspend the dead driver");
+
+        // Revoking the untyped it was given destroys every object it made out
+        // of it -- page tables, frames, the virtqueue -- and unmaps them all
+        // (M6), then resets the region's watermark so it can be handed over
+        // again.
+        let reclaimed = sys::revoke(bootinfo::slot::CNODE, self.driver.untyped);
+        for slot in [self.driver.cnode, self.driver.vspace, self.driver.tcb, self.driver.fault_ep] {
+            let _ = sys::delete(bootinfo::slot::CNODE, slot);
+        }
+        // It died holding its interrupt masked, because `Ack` never came
+        // (D-041). Nobody else will send it.
+        sys::irq_ack(self.handler).expect("unmask the source again");
+        println!("    torn down     : untyped revoked ({reclaimed:?}), source unmasked");
+
+        let fresh = spawn::spawn(
+            self.image,
+            nursery,
+            self.parent,
+            BLK,
+            &self.grants[..self.grant_count],
+        )
+        .expect("respawn the driver");
+        self.driver = fresh;
+        self.restarts += 1;
+        println!("    restarted     : a new driver at {:#x}", self.driver.entry);
+    }
+
+    /// Claim the source the driver asked for, bind it to a notification, hand
+    /// both over -- and take back every transport it did not keep. A restarted
+    /// driver asks again, and gets the source we already hold (D-044).
+    fn claim(&mut self, index: usize) -> usize {
+        let Some((device, _)) = self.transports.get(index) else {
+            println!("    claim         : a transport we never handed over");
+            return 0;
+        };
+        let Some(irq) = device.irq else {
+            println!("    claim         : transport {index} raises no interrupt");
+            return 0;
+        };
+
+        if self.claimed.is_none() {
+            sys::retype(self.ram, ObjectType::Notification, 0, self.ntfn, 1).expect("notification");
+            sys::mint(
+                bootinfo::slot::CNODE,
+                self.ntfn,
+                self.badged,
+                rights::ALL,
+                spawn::DEVICE_BADGE,
+            )
+            .expect("mint badge");
+            sys::irq_get(bootinfo::slot::IRQ_CONTROL, irq as usize, self.handler)
+                .expect("irq_get");
+            sys::irq_set_notification(self.handler, self.badged).expect("bind");
+            self.claimed = Some(irq);
+        }
+
+        sys::mint(self.driver.cnode, self.handler, spawn::IRQ_HANDLER, rights::ALL, 0)
+            .expect("mint handler");
+        sys::mint(
+            self.driver.cnode,
+            self.badged,
+            spawn::NOTIFICATION,
+            rights::READ,
+            spawn::DEVICE_BADGE,
+        )
+        .expect("mint ntfn");
+
+        // Everything it probed but did not want. `delete` empties the slot in
+        // the child's CNode and revokes what was derived from it, so the frame
+        // the driver mapped over those registers is unmapped with it.
+        let mut taken = 0;
+        for i in 0..self.transports.len() {
+            if i != index {
+                let _ = sys::delete(self.driver.cnode, spawn::FIRST_DEVICE + i as u64);
+                taken += 1;
+            }
+        }
+        println!(
+            "    claim         : {:#x} raises source {irq}; {taken} unused transports taken back",
+            device.paddr
+        );
+        irq as usize
+    }
 }
 
 /// Check what a device untyped is and is not allowed to become, from the

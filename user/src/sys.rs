@@ -142,6 +142,17 @@ pub fn reply_recv(ep: u64, info: MessageInfo, words: [usize; MSG_REGS]) -> Messa
     ecall(syscall::REPLY_RECV, ep, info, words, 0)
 }
 
+/// `reply_recv`, with the receive half naming where a granted capability
+/// lands -- what a server needs if a client may reconnect (D-048).
+pub fn reply_recv_cap(
+    ep: u64,
+    info: MessageInfo,
+    words: [usize; MSG_REGS],
+    slot: u64,
+) -> Message {
+    ecall(syscall::REPLY_RECV, ep, info, words, slot)
+}
+
 // --- Invocations on kernel objects ---
 
 /// Carve `count` objects out of `untyped` into consecutive slots from `dst`.

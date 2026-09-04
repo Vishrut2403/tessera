@@ -59,6 +59,15 @@ pub mod fs {
     pub const CLEAN: usize = 2 << SHIFT;
 }
 
+/// What a blocked thread is waiting on, so it can be removed from that queue
+/// without searching every object in the system (D-048).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedOn {
+    Nothing,
+    Endpoint(PhysAddr),
+    Notification(PhysAddr),
+}
+
 /// A thread control block.
 #[repr(C)]
 pub struct Tcb {
@@ -74,6 +83,10 @@ pub struct Tcb {
     pub next: Option<NonNull<Tcb>>,
     /// Intrusive endpoint queue link.
     pub ipc_next: Option<NonNull<Tcb>>,
+    /// The object this thread is queued on while blocked. The link above says
+    /// *where in* a queue it is; this says *which* queue, which is what lets a
+    /// blocked thread be taken off it and killed (D-048).
+    pub blocked_on: BlockedOn,
     /// The one-shot reply capability handed over by a `call` this thread
     /// received.
     pub reply: RawCap,
@@ -131,6 +144,7 @@ impl Tcb {
                 satp: space.satp(),
                 next: None,
                 ipc_next: None,
+                blocked_on: BlockedOn::Nothing,
                 reply: RawCap::NULL,
                 cspace: RawCap::NULL,
                 badge: 0,
@@ -164,6 +178,7 @@ impl Tcb {
                 satp: 0,
                 next: None,
                 ipc_next: None,
+                blocked_on: BlockedOn::Nothing,
                 reply: RawCap::NULL,
                 cspace: RawCap::NULL,
                 badge: 0,

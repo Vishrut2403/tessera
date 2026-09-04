@@ -1,9 +1,10 @@
 //! Notifications: the asynchronous half of IPC (D-041).
 
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mm::{PhysAddr, phys_to_virt};
-use crate::thread::Tcb;
+use crate::thread::{BlockedOn, Tcb};
 
 /// The rendezvous-free wake-up, living in the notification object's memory.
 #[repr(C)]
@@ -48,9 +49,14 @@ impl Notification {
     /// # Safety
     /// `tcb` must be a live TCB not already on any endpoint or notification
     /// queue: both use `ipc_next`, so being on two at once corrupts both.
-    pub unsafe fn enqueue(&mut self, mut tcb: NonNull<Tcb>) {
+    pub unsafe fn enqueue(&mut self, mut tcb: NonNull<Tcb>, at: PhysAddr) {
         // SAFETY: the caller promised a live TCB only we are touching.
-        unsafe { tcb.as_mut().ipc_next = None };
+        unsafe {
+            tcb.as_mut().ipc_next = None;
+            // Which queue, so the thread can be taken off it again (D-048).
+            tcb.as_mut().blocked_on = BlockedOn::Notification(at);
+        }
+        WAITERS.fetch_add(1, Ordering::Relaxed);
         match self.tail {
             // SAFETY: as above.
             Some(mut t) => unsafe { t.as_mut().ipc_next = Some(tcb) },
@@ -66,11 +72,15 @@ impl Notification {
     pub unsafe fn dequeue(&mut self) -> Option<NonNull<Tcb>> {
         let mut head = self.head?;
         // SAFETY: the caller promised live TCBs.
-        let next = unsafe { head.as_mut().ipc_next.take() };
+        let next = unsafe {
+            head.as_mut().blocked_on = BlockedOn::Nothing;
+            head.as_mut().ipc_next.take()
+        };
         self.head = next;
         if next.is_none() {
             self.tail = None;
         }
+        WAITERS.fetch_sub(1, Ordering::Relaxed);
         Some(head)
     }
 
@@ -94,7 +104,11 @@ impl Notification {
                     self.tail = prev;
                 }
                 // SAFETY: as above.
-                unsafe { cur.as_mut().ipc_next = None };
+                unsafe {
+                    cur.as_mut().ipc_next = None;
+                    cur.as_mut().blocked_on = BlockedOn::Nothing;
+                }
+                WAITERS.fetch_sub(1, Ordering::Relaxed);
                 return true;
             }
             prev = Some(cur);
@@ -102,6 +116,15 @@ impl Notification {
         }
         false
     }
+}
+
+/// How many threads are parked on notifications. The scheduler idles only
+/// while one of these exists: an interrupt can wake a waiter, and once the run
+/// queue is empty nothing else can wake anyone at all (D-048).
+static WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn waiters() -> usize {
+    WAITERS.load(Ordering::Relaxed)
 }
 
 /// Borrow the notification living at `paddr`.

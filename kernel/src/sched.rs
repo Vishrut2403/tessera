@@ -9,7 +9,7 @@ use crate::ipc::{self, EndpointState, MessageInfo};
 use crate::mm::page_table::MapError;
 use crate::mm::{AddressSpace, VirtAddr};
 use crate::sync::SpinLock;
-use crate::thread::{Tcb, ThreadId, ThreadState};
+use crate::thread::{BlockedOn, Tcb, ThreadId, ThreadState};
 use crate::trap::{Cause, TrapFrame, reg, return_to_user};
 
 pub use abi::{label, result, syscall};
@@ -298,8 +298,11 @@ fn take_next() -> Option<NonNull<Tcb>> {
         return Some(next);
     }
     // An empty queue is idle, not finished: hardware can still wake a thread
-    // blocked on a notification -- but only if some source is bound (D-041).
-    while crate::irq::any_bound() && LIVE.load(Ordering::Relaxed) > 0 {
+    // blocked on a notification -- but only if some source is bound (D-041)
+    // *and* somebody is actually parked on one. A live thread that is merely
+    // suspended will never be woken by an interrupt, and waiting for one that
+    // cannot help is how a system hangs instead of finishing (D-048).
+    while crate::irq::any_bound() && crate::notify::waiters() > 0 {
         idle();
         if let Some(next) = QUEUE.lock().pop() {
             return Some(next);
@@ -576,7 +579,7 @@ fn ipc_send(tcb: &mut Tcb, ep_cap: RawCap, info: MessageInfo, is_call: bool) -> 
     tcb.state = ThreadState::BlockedOnSend;
     let me = current_tcb().expect("no current thread");
     // SAFETY: this thread is current, so it is on no other queue.
-    unsafe { ep.enqueue(me, EndpointState::Sending) };
+    unsafe { ep.enqueue(me, EndpointState::Sending, ep_cap.paddr) };
     retire(Retire::Blocked)
 }
 
@@ -735,7 +738,7 @@ fn notification_wait(tcb: &mut Tcb, cap: RawCap) -> ! {
     tcb.state = ThreadState::BlockedOnRecv;
     let me = current_tcb().expect("no current thread");
     // SAFETY: this thread is current, so it is on no other queue.
-    unsafe { n.enqueue(me) };
+    unsafe { n.enqueue(me, cap.paddr) };
     retire(Retire::Blocked)
 }
 
@@ -771,7 +774,7 @@ fn receive_on(tcb: &mut Tcb, ep_cap: RawCap) -> ! {
     tcb.state = ThreadState::BlockedOnRecv;
     let me = current_tcb().expect("no current thread");
     // SAFETY: this thread is current, so it is on no other queue.
-    unsafe { ep.enqueue(me, EndpointState::Receiving) };
+    unsafe { ep.enqueue(me, EndpointState::Receiving, ep_cap.paddr) };
     retire(Retire::Blocked)
 }
 
@@ -789,6 +792,15 @@ fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
     // SAFETY: the caller is blocked in `AwaitingReply`, so it is on no queue
     // and nothing else is writing it.
     let callee = unsafe { caller.as_mut() };
+
+    // Unless it is not waiting any more. A thread can be suspended while it
+    // awaits a reply -- that is how a crashed task is torn down -- and the
+    // reply capability its server still holds must not resurrect it (D-048).
+    if callee.state != ThreadState::AwaitingReply {
+        tcb.reply = RawCap::NULL;
+        finish(tcb, result::ERR_NO_REPLY);
+    }
+
     if callee.faulted {
         // The reply is permission to carry on, not a return value.
         callee.faulted = false;
@@ -817,7 +829,7 @@ fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
             // SAFETY: this thread is current, so it is on no other queue.
             let me = current_tcb().expect("no current thread");
             // SAFETY: this thread is current, so it is on no other queue.
-            unsafe { ep.enqueue(me, EndpointState::Receiving) };
+            unsafe { ep.enqueue(me, EndpointState::Receiving, ep_cap.paddr) };
             // The server is parked, so the thread we just answered gets the
             // hart directly -- the other half of the fast path.
             switch_direct(caller);
@@ -1075,17 +1087,40 @@ fn resume(target: &mut Tcb, cap: &RawCap) -> Result<(), CapError> {
 
 /// Take a runnable thread off the run queue.
 fn suspend(target: &mut Tcb, cap: &RawCap) -> Result<(), CapError> {
+    // SAFETY: a live TCB from a capability; the lock serialises the queue.
+    let ptr = unsafe { crate::cap::tcb::tcb_ptr(cap) };
+
     match target.state {
-        ThreadState::Inactive => Ok(()),
+        ThreadState::Inactive | ThreadState::Exited => return Ok(()),
         ThreadState::Ready => {
-            // SAFETY: a live TCB from a capability; the lock serialises the queue.
-            let ptr = unsafe { crate::cap::tcb::tcb_ptr(cap) };
             QUEUE.lock().remove(ptr);
-            target.state = ThreadState::Inactive;
-            Ok(())
         }
-        _ => Err(CapError::NotInactive),
+        // Queued on a rendezvous. Knowing *which* object it is queued on is the
+        // whole reason `blocked_on` exists: without it a blocked thread could
+        // be marked inactive but not unlinked, and the next `dequeue` would
+        // hand a dead TCB to a live sender (D-048).
+        ThreadState::BlockedOnSend | ThreadState::BlockedOnRecv => match target.blocked_on {
+            BlockedOn::Endpoint(pa) => {
+                // SAFETY: the endpoint this thread recorded when it queued.
+                unsafe { ipc::endpoint_at(pa).remove(ptr) };
+            }
+            BlockedOn::Notification(pa) => {
+                // SAFETY: as above.
+                unsafe { crate::notify::at(pa).remove(ptr) };
+            }
+            BlockedOn::Nothing => {}
+        },
+        // On no queue at all: whoever received its call holds the reply
+        // capability. Marking it inactive is what makes that reply harmless.
+        ThreadState::AwaitingReply => {}
+        // The thread invoking this cannot be the target: `check` refuses a
+        // thread its own TCB capability (D-037).
+        ThreadState::Running => return Err(CapError::NotInactive),
     }
+
+    target.state = ThreadState::Inactive;
+    target.blocked_on = BlockedOn::Nothing;
+    Ok(())
 }
 
 /// Deliver a fault to this thread's pager as if the thread had called it.

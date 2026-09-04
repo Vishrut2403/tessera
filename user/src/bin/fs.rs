@@ -8,6 +8,8 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use rt::abi::{MessageInfo, ObjectType, PAGE_SIZE, bootinfo, rights};
 use rt::fsformat as fmt;
 use rt::{block, entry, fs, println, spawn, sys, vm};
@@ -16,6 +18,10 @@ entry!(main);
 
 /// What this task writes to the page its parent gave it.
 pub const MAGIC: u64 = 0xf115_0000_0000_0001;
+
+/// The frame the driver fills for us, remembered so we can offer it again if
+/// the driver is restarted underneath us (D-048).
+static DISK_FRAME: AtomicU64 = AtomicU64::new(0);
 
 /// One block, filled by the driver on our behalf.
 const DISK_VADDR: usize = 0x1200_0000;
@@ -35,13 +41,9 @@ fn main() {
     let rw = rights::READ | rights::WRITE;
     vm::map(&mut alloc, vspace, disk, DISK_VADDR, rw, false).expect("map disk frame");
 
-    let connect = sys::call_cap(
-        spawn::UPSTREAM,
-        MessageInfo::new(block::CONNECT, 0, true),
-        [0; 4],
-        disk,
-    );
-    if connect.words[0] != block::OK {
+    DISK_FRAME.store(disk, Ordering::Relaxed);
+    let connect = connect_to_driver();
+    if connect != block::OK {
         println!("    driver        : refused our buffer");
         report(0);
         return;
@@ -80,15 +82,37 @@ fn mount() -> Option<u32> {
     Some(files)
 }
 
+/// Offer the driver our block buffer. Done once at startup, and again if a
+/// restarted driver turns out never to have heard of us.
+fn connect_to_driver() -> usize {
+    let frame = DISK_FRAME.load(Ordering::Relaxed);
+    let reply =
+        sys::call_cap(spawn::UPSTREAM, MessageInfo::new(block::CONNECT, 0, true), [0; 4], frame);
+    reply.words[0]
+}
+
 /// Ask the driver for one block. It lands in our own frame, which the driver
 /// never maps and we never share.
+///
+/// A `NO_BUFFER` means the driver on the other end is not the one we connected
+/// to: it was rebuilt while we were working, and kept no state across the
+/// crash. Saying who we are again is the whole of our recovery (D-048).
 fn read_block(n: u32) -> Option<()> {
-    let reply = sys::call(
-        spawn::UPSTREAM,
-        MessageInfo::new(block::READ, 1, false),
-        [n as usize, 0, 0, 0],
-    );
-    (reply.words[0] == block::OK).then_some(())
+    let ask = MessageInfo::new(block::READ, 1, false);
+    for attempt in 0..2 {
+        let reply = sys::call(spawn::UPSTREAM, ask, [n as usize, 0, 0, 0]);
+        match reply.words[0] {
+            block::OK => return Some(()),
+            block::NO_BUFFER if attempt == 0 => {
+                println!("    reconnecting  : the driver below us was restarted");
+                if connect_to_driver() != block::OK {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The bytes of the block we last read.
