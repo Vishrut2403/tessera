@@ -91,14 +91,51 @@ Within M6, three suspects were measured and cleared:
 - The trap entry is not involved. The null syscall grew by 2 instructions across
   the whole period, so register save and restore is unchanged.
 
-That leaves roughly 287 instructions inside M6 that have not been isolated to a
-specific change. The remaining candidates are the `deliver` wrapper that M6
-introduced around the message copy to carry capabilities and fault replies, the
-`faulted` check on the reply path, and the growth of `RawCap` from 6 fields to
-8 when mappings began being recorded in capabilities, which doubled a capability
-slot from 64 to 128 bytes and made every lookup on the path move more data.
-Isolating further means selectively reverting features inside a single large
-commit, which has not been done.
+### Where the rest of it went
+
+Reverting features inside one large commit is awkward, so the path was
+instrumented instead. `rdinstret` probes were added either side of each stage of
+a round trip, on the current tree and on the M5 tree, and the benchmark run
+divided by the number of times each probe fired.
+
+One capability lookup, meaning `cspace_of` followed by `cs.read`, costs:
+
+| | instructions |
+|---|---|
+| M5 | 146 |
+| now | 223 |
+
+A round trip performs more than one. The client's `call` resolves the endpoint,
+and the server's `reply_recv` resolves it again on the receive half. So the
+lookup alone accounts for somewhere between 150 and 230 of the 310, depending on
+how many resolutions a given path makes.
+
+The cause is data size, not logic. The hot path functions are unchanged between
+M5 and M6 apart from the wrappers already accounted for above.
+
+| | M5 | now |
+|---|---|---|
+| `RawCap` | 32 bytes | 48 bytes |
+| `Slot` | 64 bytes | 128 bytes |
+
+`RawCap` grew when M6 began recording a mapping in the capability that made it
+(D-034), adding `mapped_root` and `mapped_vaddr`, and M7 later added `asid`. A
+`Slot` is a `RawCap` plus four derivation-tree pointers, so 48 plus 32 is 80,
+and a CNode's stride has to be a power of two, which rounded it to 128. Every
+lookup then copies a larger `RawCap` by value several times and indexes a slot
+array with twice the stride.
+
+The other stages, measured the same way on the current tree: `deliver` costs 107
+instructions, `ipc_send` from entry to the end of `deliver` costs 133, and
+`switch_direct` costs 32 and runs twice per round trip.
+
+**The fix, if it is ever wanted.** The fields that grew `RawCap` are mutually
+exclusive by object kind. A watermark only means something for untyped, a
+mapping only for a frame or a page table, a badge only for an endpoint or a
+notification. No capability needs two of them at once. Overlapping them would
+take `RawCap` back to 32 bytes and a `Slot` back to 64, which halves the memory
+a CNode occupies and should recover most of the 77 instructions per lookup. That
+is a refactor across the whole capability layer and has not been attempted.
 
 ### What is deliberately not optimised
 
@@ -122,8 +159,8 @@ lifted from published benchmarks on other hardware would not be a comparison
 either. They would be decoration.
 
 What can be said without it: a round trip costs 8 null syscalls, about a quarter
-of it is a register save and restore the fast path does not need, and 292 of its
-instructions arrived in one milestone and can be traced.
+of it is a register save and restore the fast path does not need, and the 310
+instructions it gained since M5 have been traced to a cause.
 
 ## 5. The trusted computing base
 
@@ -219,8 +256,8 @@ Stated because a benchmark document that only flatters is not evidence.
 - No real hardware. QEMU `virt` only. Nothing has run on silicon, and the
   `sstc`-absent timer path has never executed.
 - One client per server. Both servers keep a single connection's worth of state.
-- About 287 instructions of the IPC regression are traced to a milestone but not
-  to a change.
+- The IPC round trip is 37% slower than at M5, and the cause is understood
+  rather than fixed. See section 3.
 
 ## 8. Reproducing all of it
 
