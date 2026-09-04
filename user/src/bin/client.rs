@@ -75,7 +75,7 @@ fn print_a_file(name: &str) -> bool {
     // SAFETY: our own frame, mapped read-write, which the server has just
     // copied `got` bytes into.
     let bytes = unsafe { core::slice::from_raw_parts(BUFFER_VADDR as *const u8, got) };
-    println!("    {name:<10}    : {size} bytes --");
+    println!("    {name:<10}    : {size} bytes:");
     for line in bytes.split(|b| *b == b'\n') {
         if !line.is_empty() {
             println!("      | {}", core::str::from_utf8(line).unwrap_or("<not utf-8>"));
