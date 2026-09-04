@@ -156,7 +156,7 @@ pub unsafe fn revoke(root: NonNull<Slot>) -> usize {
             let next = match cursor.as_ref().next_sib {
                 Some(sibling) => Some(sibling),
                 // Last child: the parent is childless now, so it is the next
-                // leaf -- unless the parent is the root, which we do not touch.
+                // leaf, unless the parent is the root, which we do not touch.
                 None => match cursor.as_ref().parent {
                     Some(p) if p != root => Some(p),
                     _ => None,

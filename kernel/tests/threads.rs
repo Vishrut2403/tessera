@@ -174,7 +174,7 @@ fn three_threads_all_get_to_run() {
 
 #[test_case]
 fn yielding_puts_a_thread_at_the_back_and_it_comes_round_again() {
-    // yield, yield, exit -- only reachable if the queue really is circular.
+    // yield, yield, exit, only reachable if the queue really is circular.
     let mut words = [0u32; 6];
     words[0] = li(A7, sched::syscall::YIELD as u32);
     words[1] = ECALL;

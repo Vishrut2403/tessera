@@ -4,7 +4,7 @@ use core::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FdtError {
-    /// Magic number is not 0xd00dfeed — the pointer is not a DTB at all.
+    /// Magic number is not 0xd00dfeed, so the pointer is not a DTB at all.
     BadMagic,
     /// A read ran off the end of the blob.
     Truncated,

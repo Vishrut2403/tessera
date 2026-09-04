@@ -1,4 +1,4 @@
-//! tessera — a capability-based microkernel for RV64.
+//! tessera: a capability-based microkernel for RV64.
 
 #![no_std]
 #![cfg_attr(test, no_main)]

@@ -1,6 +1,6 @@
 //! A PT_LOAD-only ELF64 reader, unprivileged: the root task loads boot modules
 //! into processes of their own with it (D-043). A copy of the kernel's reader,
-//! for the same reason `fdt.rs` is one -- sharing it would put the loader back
+//! for the same reason `fdt.rs` is one. Sharing it would put the loader back
 //! inside the TCB.
 
 /// Why an image was refused.

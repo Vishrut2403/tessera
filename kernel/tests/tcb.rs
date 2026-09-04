@@ -495,7 +495,7 @@ fn a_thread_may_still_be_configured_with_no_pager_at_all() {
 const EP: u64 = 12;
 const CHILD_EP: u64 = 4;
 
-/// `recv(EP); exit()` — a child that blocks and never comes back on its own.
+/// `recv(EP); exit()`: a child that blocks and never comes back on its own.
 fn blocking_child() -> Prog<16> {
     Prog::new().li(A0, CHILD_EP as u32).syscall(sched::syscall::RECV).exit()
 }

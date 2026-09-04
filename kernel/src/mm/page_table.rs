@@ -94,7 +94,7 @@ impl core::ops::BitOr for PteFlags {
 
 impl fmt::Debug for PteFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // One letter per bit, a dash where clear -- easier to scan in a dump than hex.
+        // One letter per bit, a dash where clear. Easier to scan in a dump than hex.
         let table = [
             (Self::V, 'V'),
             (Self::R, 'R'),
@@ -202,7 +202,7 @@ unsafe fn table_ref<'a>(pa: PhysAddr) -> &'a PageTable {
 /// Mutably borrow the table at `pa`.
 ///
 /// # Safety
-/// As [`table_ref`], plus exclusive access to the tree -- in practice via a
+/// As [`table_ref`], plus exclusive access to the tree, in practice via a
 /// `&mut Mapper`.
 unsafe fn table_mut<'a>(pa: PhysAddr) -> &'a mut PageTable {
     unsafe { &mut *phys_to_virt(pa).as_mut_ptr::<PageTable>() }

@@ -2,7 +2,7 @@
 //!
 //! The first process that is both a client and a server: it calls the block
 //! driver below it and answers file requests from above. It holds no device
-//! capability, no interrupt, and no idea what a virtqueue is -- only a
+//! capability, no interrupt, and no idea what a virtqueue is, only a
 //! send-only endpoint to the driver and a receive-only endpoint of its own.
 
 #![no_std]

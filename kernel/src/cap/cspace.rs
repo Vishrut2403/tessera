@@ -183,7 +183,7 @@ impl CSpace {
         self.insert(dst.0, dst.1, copy, Some(source))
     }
 
-    /// `mint`, but into a slot of some *other* capability space -- how a parent
+    /// `mint`, but into a slot of some *other* capability space. This is how a parent
     /// endows a child it is building (D-043). The copy is still a derivative of
     /// the source, so revoking the original reclaims it across the boundary.
     pub fn mint_into(
@@ -254,8 +254,8 @@ impl CSpace {
             }
             if made.kind == ObjectType::CNode {
                 // SAFETY: just carved out of the untyped, so nothing refers to
-                // it yet. `zero` already made every slot empty -- an all-zero
-                // `Slot` is `Slot::EMPTY` -- but relying on that silently would
+                // it yet. `zero` already made every slot empty (an all-zero
+                // `Slot` is `Slot::EMPTY`), but relying on that silently would
                 // make the layout of `SlotRef` load-bearing.
                 unsafe { init_cnode(made.paddr, made.size_bits) };
             }

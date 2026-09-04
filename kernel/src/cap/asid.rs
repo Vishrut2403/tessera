@@ -39,7 +39,7 @@ impl AsidPool {
         const ASID_MASK: usize = 0xffff << 44;
 
         // SAFETY: satp is restored before returning, and no translation happens
-        // in between -- writing the ASID field alone does not change the root
+        // in between. Writing the ASID field alone does not change the root
         // page table, and this hart is not using ASIDs yet.
         let readback = unsafe {
             crate::csr::satp::write(original | ASID_MASK);

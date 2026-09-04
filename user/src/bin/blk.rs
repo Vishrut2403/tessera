@@ -3,8 +3,8 @@
 //!
 //! It holds no ambient authority at all: a CSpace, an address space, a TCB, an
 //! endpoint to its parent, one untyped region, and the device untypeds it was
-//! handed to probe. It cannot claim an interrupt -- only its parent holds
-//! `IrqControl` -- so it asks.
+//! handed to probe. It cannot claim an interrupt, because only its parent
+//! holds `IrqControl`, so it asks.
 
 #![no_std]
 #![no_main]
@@ -75,7 +75,7 @@ fn main() {
 
             // The transports we probed but did not keep are gone. Deleting the
             // untyped in our CSpace revoked what we derived from it, so the
-            // frame we mapped over those registers went with it -- asking that
+            // frame we mapped over those registers went with it. Asking that
             // frame where it is now finds nothing (D-043).
             let other = (index + 1) % CANDIDATES;
             assert!(
@@ -98,7 +98,7 @@ fn main() {
     };
 
     // Sent *before* the server loop, and sent whether or not the device came
-    // up. Our parent is blocked in `recv` until it arrives -- and it is the
+    // up. Our parent is blocked in `recv` until it arrives, and it is the
     // parent that then spawns the client we are about to wait for, so a driver
     // that started serving first would deadlock the pair of them.
     let (sectors, verified) = brought_up.as_ref().map_or((0, 0), |(_, _, s, v)| (*s, *v));
@@ -137,7 +137,7 @@ fn read_sectors(queue: &Queue, transport: &Transport) -> usize {
                     verified += 1;
                     println!("    read sector {sector:<4}: {first:#x}, and {last} at the far end");
                 } else {
-                    println!("    read sector {sector:<4}: wrong block -- {first:#x} / {last}");
+                    println!("    read sector {sector:<4}: wrong block: {first:#x} / {last}");
                 }
             }
             None => println!("    read sector {sector:<4}: failed"),
@@ -217,7 +217,7 @@ fn serve_blocks(queue: &Queue, transport: &Transport, may_crash: bool) -> usize 
     let mut served = 0usize;
 
     // Every receive names a slot, because a connect carries a capability and
-    // may arrive at any time -- the first message a restarted driver gets is
+    // may arrive at any time. The first message a restarted driver gets is
     // a read from a client that thinks it is still connected.
     let mut msg = sys::recv_cap(spawn::SERVICE, spawn::CLIENT_FRAME);
     loop {
@@ -323,7 +323,7 @@ fn bring_up(
 
     // One frame holds the descriptor table, the available ring and the used
     // ring. The device is a bus master, so what it is given is the *physical*
-    // address -- which is why `GetAddress` needs `WRITE` on the frame (D-040).
+    // address, which is why `GetAddress` needs `WRITE` on the frame (D-040).
     let Ok(frame) = alloc.object(ObjectType::Frame, 0) else { return None };
     let rw = rights::READ | rights::WRITE;
     if vm::map(alloc, vspace, frame, QUEUE_VADDR, rw, false).is_err() {
@@ -332,7 +332,7 @@ fn bring_up(
     }
     let Ok(base) = sys::get_address(frame) else { return None };
 
-    // SAFETY: a frame we retyped -- so it arrived zeroed -- mapped read-write
+    // SAFETY: a frame we retyped, so it arrived zeroed, mapped read-write
     // at `QUEUE_VADDR`, and `get_address` says where the device sees it.
     let queue = unsafe { Queue::new(QUEUE_VADDR, base as u64) };
 

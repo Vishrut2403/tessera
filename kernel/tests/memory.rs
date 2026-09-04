@@ -45,7 +45,7 @@ fn kernel_image_is_reserved() {
     let kernel = layout::kernel_phys_range();
     assert!(
         m.reserved.iter().any(|r| r.start <= kernel.start && r.end >= kernel.end),
-        "the kernel image is not reserved -- it could be handed out as a free frame"
+        "the kernel image is not reserved, so it could be handed out as a free frame"
     );
 }
 
@@ -55,7 +55,7 @@ fn device_tree_blob_is_reserved() {
     let dtb = PhysAddr::new(DTB.load(Ordering::Relaxed));
     assert!(
         m.reserved.iter().any(|r| r.contains(dtb)),
-        "the DTB itself is not reserved -- the memory map would be overwritten"
+        "the DTB itself is not reserved, so the memory map would be overwritten"
     );
 }
 

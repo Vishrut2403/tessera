@@ -192,7 +192,7 @@ fn a_frame_is_not_a_capability_space_to_mint_into() {
     let (_space, status) = run_recording(mint_prog(GIFT, GIFT, TARGET).as_slice(), &cs);
     // `invoke` dispatches on the invoked object's kind before any label is
     // read, so a frame is offered `Map`/`Unmap` and never reaches the CNode
-    // path at all -- the wrong label, not a bad capability.
+    // path at all, the wrong label, not a bad capability.
     assert_eq!(status as usize, result::ERR_BAD_LABEL, "a frame was treated as a CNode");
     assert!(cs.read(TARGET, D).unwrap().is_null());
 }
@@ -217,7 +217,7 @@ fn a_child_cnode_is_only_as_deep_as_its_own_radix() {
     assert_eq!(child.root_depth(), D, "the child's radix is not its own");
 
     // 2^D slots, so an index above that wraps into the child rather than
-    // reaching past it -- there is no second level to reach into.
+    // reaching past it. There is no second level to reach into.
     let (_space, status) = run_recording(mint_prog(CHILD, GIFT, 1 << D).as_slice(), &cs);
     assert_eq!(status as usize, result::OK);
     assert!(!child.read(0, D).unwrap().is_null(), "the index did not wrap to slot 0");

@@ -80,7 +80,7 @@ fn stack_has_room_to_spare() {
 
 #[test_case]
 fn kernel_is_loaded_where_opensbi_expects_it() {
-    // The load address, not the link address -- see D-002.
+    // The load address, not the link address. See D-002.
     assert_eq!(layout::kernel_phys_range().start.as_usize(), 0x8020_0000);
 }
 

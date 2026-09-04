@@ -44,7 +44,7 @@ fn kernel_text_is_executable_and_not_writable() {
     let m = build();
     let (_, flags, _) = m.translate(VirtAddr::new(layout::text_start())).expect(".text unmapped");
     assert!(flags.contains(PteFlags::X), ".text is not executable");
-    assert!(!flags.contains(PteFlags::W), ".text is WRITABLE -- W^X is broken");
+    assert!(!flags.contains(PteFlags::W), ".text is WRITABLE, so W^X is broken");
 }
 
 #[test_case]

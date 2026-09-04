@@ -234,7 +234,7 @@ fn cow_pager() -> Prog<128> {
         .li(A0 + 1, unmap0)
         .syscall(sched::syscall::CALL)
         // Release our own two scratch mappings, so the copy can be mapped
-        // elsewhere -- a capability records one mapping at a time (D-034).
+        // elsewhere. A capability records one mapping at a time (D-034).
         .li(A0, ORIG_COPY as u32)
         .li(A0 + 1, unmap0)
         .syscall(sched::syscall::CALL)
@@ -366,7 +366,7 @@ fn revoking_a_frame_removes_its_mapping() {
     }
 
     // Hand a copy to slot 20 and map *that*, so revoking the original has a
-    // derivative to tear down -- the case that matters.
+    // derivative to tear down, the case that matters.
     cs.mint((FRAME, D), (20, D), ALL, 0).expect("mint");
     let copy = cs.resolve(20, D).unwrap();
     // SAFETY: a live slot only this hart is touching.

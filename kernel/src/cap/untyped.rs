@@ -102,7 +102,7 @@ where
     ) -> Result<usize, CapError> {
         // `Null` is not an object, `Reply` is minted by the kernel on `call`
         // and never carved, and `DeviceUntyped` would be a claim that this RAM
-        // is device registers -- which is exactly the lie the whole distinction
+        // is device registers, which is exactly the lie the whole distinction
         // exists to prevent.
         if matches!(target, ObjectType::Null | ObjectType::Reply | ObjectType::DeviceUntyped) {
             return Err(CapError::BadObjectType);

@@ -73,7 +73,7 @@ pub struct RootTask {
     pub entry: usize,
     pub image: (usize, usize),
     /// Kept rather than forgotten: `AddressSpace` has no `Drop`, and holding it
-    /// lets the boot log -- and the tests -- look at what the root task built.
+    /// lets the boot log and the tests look at what the root task built.
     pub space: AddressSpace,
     pub cnode: RawCap,
     pub untypeds: usize,

@@ -131,7 +131,7 @@ pub struct Child {
 /// `parent` is the endpoint the spawning task receives on, held with every
 /// right; `badge` is how it will tell this child from its siblings. One
 /// endpoint and a badge per child is what lets a supervisor wait in a single
-/// `recv` and still know who is talking -- including when the talker is the
+/// `recv` and still know who is talking, including when the talker is the
 /// kernel, reporting a fault (D-048).
 pub fn spawn(
     image: &[u8],
@@ -173,7 +173,7 @@ pub fn spawn(
     let fault_ep = n.alloc.take();
     sys::mint(bootinfo::slot::CNODE, parent, fault_ep, rights::WRITE, badge)?;
 
-    // The child's whole world, in the slots `bootinfo::slot` names -- the same
+    // The child's whole world, in the slots `bootinfo::slot` names, the same
     // convention the kernel uses for the root task, so one layout is learned
     // rather than two. The endpoint goes in with `WRITE` alone: the child is
     // the client here, and `call` needs no more than that (D-042).

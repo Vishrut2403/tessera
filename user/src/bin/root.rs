@@ -18,8 +18,8 @@ static CHILD_RAN: AtomicUsize = AtomicUsize::new(0);
 /// Written to the scratch page when the root task has finished successfully.
 pub const DONE: u64 = 0xd02e_0000_0000_0000;
 
-/// What the root task writes to the page it shares an *address* -- not a page
-/// -- with the task it spawns.
+/// What the root task writes to the page it shares an *address*, though not a
+/// page, with the task it spawns.
 pub const PARENT_MAGIC: u64 = 0x0dad_0000_0000_0001;
 
 /// Written to the scratch page once a spawned task has answered.
@@ -77,7 +77,7 @@ fn main() {
     println!("  retyped       : 2 page tables, 2 frames, 1 thread out of slot {ut}");
 
     // Nothing maps `base` yet, and the two intermediate levels do not exist
-    // either -- the kernel will not create them, so we do (D-035).
+    // either. The kernel will not create them, so we do (D-035).
     let base = bi.free_vaddr as usize;
     let vspace = bootinfo::slot::VSPACE;
     sys::map_table(l1, vspace, base, 2).expect("map l1");
@@ -145,8 +145,8 @@ const BLK: u64 = 1;
 const FS: u64 = 2;
 const CLIENT: u64 = 3;
 
-/// Load three boot modules into processes of their own -- new address spaces,
-/// new capability spaces, new threads -- with no help from the kernel (D-043),
+/// Load three boot modules into processes of their own (new address spaces,
+/// new capability spaces, new threads) with no help from the kernel (D-043),
 /// bring the driver up (D-044), stack a filesystem on it (D-047), and stay
 /// standing when the driver crashes (D-048).
 fn spawn_a_driver(
@@ -322,7 +322,7 @@ struct Supervisor<'a> {
 
 impl Supervisor<'_> {
     /// Answer every child that speaks until `until` says it is ready, handling
-    /// whatever else arrives on the way -- including a fault.
+    /// whatever else arrives on the way, including a fault.
     fn until_ready(&mut self, until: u64, nursery: &mut spawn::Nursery) -> [usize; MSG_REGS] {
         let answer = MessageInfo::new(spawn::READY, 1, false);
         loop {
@@ -388,7 +388,7 @@ impl Supervisor<'_> {
         sys::tcb_suspend(self.driver.tcb).expect("suspend the dead driver");
 
         // Revoking the untyped it was given destroys every object it made out
-        // of it -- page tables, frames, the virtqueue -- and unmaps them all
+        // of it (page tables, frames, the virtqueue) and unmaps them all
         // (M6), then resets the region's watermark so it can be handed over
         // again.
         let reclaimed = sys::revoke(bootinfo::slot::CNODE, self.driver.untyped);
@@ -414,7 +414,7 @@ impl Supervisor<'_> {
     }
 
     /// Claim the source the driver asked for, bind it to a notification, hand
-    /// both over -- and take back every transport it did not keep. A restarted
+    /// both over, and take back every transport it did not keep. A restarted
     /// driver asks again, and gets the source we already hold (D-044).
     fn claim(&mut self, index: usize) -> usize {
         let Some((device, _)) = self.transports.get(index) else {
@@ -472,7 +472,7 @@ impl Supervisor<'_> {
 }
 
 /// Check what a device untyped is and is not allowed to become, from the
-/// outside — the same checks the kernel's tests make, made by a user program
+/// outside. These are the same checks the kernel's tests make, made by a user
 /// holding nothing but capabilities (D-040).
 fn check_device_untyped(bi: &BootInfo, vspace: u64, first_slot: u64, at: usize, ram: u64) {
     println!();

@@ -59,7 +59,7 @@ fn the_device_tree_names_an_interrupt_controller() {
 #[test_case]
 fn the_supervisor_context_is_read_not_assumed() {
     // QEMU virt lists hart 0's machine context first and its supervisor context
-    // second, so this is 1 -- but it is found by looking for cause 9 in
+    // second, so this is 1, but it is found by looking for cause 9 in
     // `interrupts-extended`, which is what makes it right on a board that
     // orders them differently.
     let info = map().plic.expect("no controller");

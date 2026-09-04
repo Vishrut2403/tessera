@@ -121,7 +121,7 @@ fn a_missing_file_is_refused(name: &str) -> bool {
     refused
 }
 
-/// A name is 24 bytes, which is exactly three registers -- so a whole filename
+/// A name is 24 bytes, which is exactly three registers, so a whole filename
 /// fits in one message and nothing has to be shared to ask a question (D-047).
 fn open(name: &str) -> Option<(usize, usize)> {
     let ask = MessageInfo::new(fs::OPEN, 3, false);

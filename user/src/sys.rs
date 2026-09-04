@@ -143,7 +143,7 @@ pub fn reply_recv(ep: u64, info: MessageInfo, words: [usize; MSG_REGS]) -> Messa
 }
 
 /// `reply_recv`, with the receive half naming where a granted capability
-/// lands -- what a server needs if a client may reconnect (D-048).
+/// lands, which is what a server needs if a client may reconnect (D-048).
 pub fn reply_recv_cap(
     ep: u64,
     info: MessageInfo,

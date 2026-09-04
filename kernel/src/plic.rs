@@ -96,8 +96,8 @@ pub fn init(info: PlicInfo) {
     BASE.store(crate::mm::phys_to_virt(info.region.start).as_usize(), Ordering::Relaxed);
     *INFO.lock() = Some(info);
 
-    // Every source starts at priority 1 -- above the threshold, so it can be
-    // delivered -- and disabled, so nothing arrives until someone claims it.
+    // Every source starts at priority 1, above the threshold so it can be
+    // delivered, and disabled so nothing arrives until someone claims it.
     for irq in 1..=info.ndev {
         write(reg::PRIORITY + irq * 4, 1);
         disable(irq);

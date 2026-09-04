@@ -3,12 +3,12 @@
 use crate::mm::{PAGE_SIZE, PhysAddr, phys_to_virt};
 
 pub const ECALL: u32 = 0x0000_0073;
-/// `jal x0, 0` — branch to itself. Only a timer gets a thread out of this.
+/// `jal x0, 0`: branch to itself. Only a timer gets a thread out of this.
 pub const SPIN: u32 = 0x0000_006f;
 /// `fmv.d.x f0, zero`. The instruction word O-008 saw in `stval`.
 pub const USE_FP: u32 = 0xf200_0053;
 
-/// `addi rd, zero, imm` — the `li` of a small constant.
+/// `addi rd, zero, imm`: the `li` of a small constant.
 pub const fn li(rd: usize, imm: u32) -> u32 {
     ((imm & 0xfff) << 20) | ((rd as u32) << 7) | 0x13
 }
@@ -16,7 +16,7 @@ pub const fn li(rd: usize, imm: u32) -> u32 {
 pub const A0: usize = 10;
 pub const A7: usize = 17;
 
-/// `lui rd, imm20` — the upper 20 bits of a constant.
+/// `lui rd, imm20`: the upper 20 bits of a constant.
 pub const fn lui(rd: usize, imm20: u32) -> u32 {
     ((imm20 & 0xf_ffff) << 12) | ((rd as u32) << 7) | 0x37
 }
@@ -26,7 +26,7 @@ pub const fn addi(rd: usize, rs1: usize, imm: i32) -> u32 {
     (((imm as u32) & 0xfff) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x13
 }
 
-/// `jal rd, offset` — offset in bytes from this instruction.
+/// `jal rd, offset`: offset in bytes from this instruction.
 pub const fn jal(rd: usize, offset: i32) -> u32 {
     let imm = offset as u32;
     ((imm & 0x10_0000) << 11)
@@ -37,7 +37,7 @@ pub const fn jal(rd: usize, offset: i32) -> u32 {
         | 0x6f
 }
 
-/// `bne rs1, rs2, offset` — offset in bytes from this instruction.
+/// `bne rs1, rs2, offset`: offset in bytes from this instruction.
 pub const fn bne(rs1: usize, rs2: usize, offset: i32) -> u32 {
     let imm = offset as u32;
     ((imm & 0x1000) << 19)
@@ -60,7 +60,7 @@ pub const fn srli(rd: usize, rs1: usize, shamt: u32) -> u32 {
     ((shamt & 0x3f) << 20) | ((rs1 as u32) << 15) | (0b101 << 12) | ((rd as u32) << 7) | 0x13
 }
 
-/// `mv rd, rs` — `addi rd, rs, 0`.
+/// `mv rd, rs`, the same as `addi rd, rs, 0`.
 pub const fn mv(rd: usize, rs: usize) -> u32 {
     addi(rd, rs, 0)
 }
@@ -118,7 +118,7 @@ impl<const N: usize> Prog<N> {
         self.len
     }
 
-    /// `bne rs, zero, <word `target`>` — the backward edge of a loop.
+    /// `bne rs, zero, <word `target`>`: the backward edge of a loop.
     pub const fn bne_back(self, rs: usize, target: usize) -> Self {
         let offset = (target as i32 - self.len as i32) * 4;
         self.raw(bne(rs, 0, offset))
@@ -155,7 +155,7 @@ impl<const N: usize> Default for Prog<N> {
     }
 }
 
-/// `addi rd, rd, imm` — the low half of a wide constant.
+/// `addi rd, rd, imm`: the low half of a wide constant.
 const fn li_add(rd: usize, imm: u32) -> u32 {
     ((imm & 0xfff) << 20) | ((rd as u32) << 15) | ((rd as u32) << 7) | 0x13
 }

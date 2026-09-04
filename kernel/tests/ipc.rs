@@ -109,7 +109,7 @@ fn endpoint() -> RawCap {
 
 // --- User programs ---
 
-/// `call(ep, label, mr0); exit()` — a client that asks once and stops.
+/// `call(ep, label, mr0); exit()`: a client that asks once and stops.
 fn client(label: u64, mr0: u32) -> Prog<16> {
     Prog::new()
         .li(A0, EP_SLOT as u32)
@@ -119,7 +119,7 @@ fn client(label: u64, mr0: u32) -> Prog<16> {
         .exit()
 }
 
-/// `recv(ep); reply(0x5a); exit()` — a server that answers once.
+/// `recv(ep); reply(0x5a); exit()`: a server that answers once.
 fn server_once() -> Prog<24> {
     Prog::new()
         .li(A0, EP_SLOT as u32)
@@ -148,7 +148,7 @@ fn client_loop(n: u32) -> Prog<32> {
         .exit()
 }
 
-/// `recv(ep); loop { reply_recv(ep) }` — a server that never stops.
+/// `recv(ep); loop { reply_recv(ep) }`: a server that never stops.
 fn server_loop() -> Prog<32> {
     let head = Prog::<32>::new().li(A0, EP_SLOT as u32).syscall(sched::syscall::RECV);
     let top = head.here();

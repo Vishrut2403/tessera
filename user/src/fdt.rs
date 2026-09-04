@@ -107,7 +107,7 @@ impl<'a> Fdt<'a> {
 
     /// Every device whose `compatible` list contains `what`, in tree order.
     /// Properties arrive grouped by node, so a node is complete as soon as the
-    /// next one starts -- which is why the last one is flushed after the walk.
+    /// next one starts, which is why the last one is flushed after the walk.
     pub fn each_compatible(&self, what: &[u8], mut f: impl FnMut(Device)) -> Option<()> {
         let mut name_buf = [0u8; 64];
         let mut name_len = 0usize;

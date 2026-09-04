@@ -99,7 +99,7 @@ fn segments_never_share_a_page() {
 #[test_case]
 fn a_bss_tail_is_described_by_memsz_exceeding_filesz() {
     // The root task has statics, so at least one segment must ask for more
-    // memory than the file provides -- the bytes the loader leaves zero.
+    // memory than the file provides, the bytes the loader leaves zero.
     let elf = Elf::parse(root::IMAGE).unwrap();
     assert!(
         elf.segments().any(|s| { let s = s.unwrap(); s.mem_size > s.data.len() }),
@@ -273,7 +273,7 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
     assert!(kernel::irq::is_claimed(irq), "source {irq} was never claimed");
 
     // The task it loaded out of a boot module, in an address space of its own,
-    // answered -- and its own page at the address the root task also has a page
+    // answered, and its own page at the address the root task also has a page
     // at held something else (D-043).
     // SAFETY: the same scratch page, one word further on.
     let spawned = unsafe { p.add(4).read_volatile() };
@@ -283,7 +283,7 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
 
     // And it brought a real device up: probe, feature negotiation, a queue and
     // `DRIVER_OK`, all from an unprivileged process (D-044). The capacity is
-    // the image `kernel/build.rs` writes, so this is end to end -- the driver
+    // the image `kernel/build.rs` writes, so this is end to end. The driver
     // read it out of the device's own configuration space.
     // SAFETY: the same scratch page, one word further on.
     let disk = unsafe { p.add(5).read_volatile() };

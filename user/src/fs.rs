@@ -5,7 +5,7 @@ use crate::abi::label;
 
 /// "Here is the frame I want file bytes copied into." Carries a capability.
 pub const CONNECT: u64 = label::APP_BASE + 0x20;
-/// "Which file is this?" The name is 24 bytes -- exactly three registers.
+/// "Which file is this?" The name is 24 bytes, exactly three registers.
 pub const OPEN: u64 = label::APP_BASE + 0x21;
 /// "Copy `w1` bytes from offset `w2` of file `w0` into my frame."
 pub const READ: u64 = label::APP_BASE + 0x22;

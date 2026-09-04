@@ -21,7 +21,7 @@ const LSR: usize = 5; // line status
 
 // Line status bits.
 const LSR_DATA_READY: u8 = 1 << 0;
-/// Transmit Holding Register Empty — the THR can accept another byte.
+/// Transmit Holding Register Empty: the THR can accept another byte.
 const LSR_THR_EMPTY: u8 = 1 << 5;
 
 // Line control bits.

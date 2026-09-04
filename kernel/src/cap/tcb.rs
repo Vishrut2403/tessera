@@ -14,7 +14,7 @@ type TcbCap = Cap<kind::Tcb, { rights::WRITE }>;
 ///
 /// # Safety
 /// `cap` must be a live TCB capability, and the caller must not already hold a
-/// reference to the same thread — which is why [`check`] refuses a thread
+/// reference to the same thread, which is why [`check`] refuses a thread
 /// invoking its own capability.
 pub unsafe fn tcb_at<'a>(cap: &RawCap) -> &'a mut Tcb {
     // SAFETY: the caller promised a live TCB object, reachable through the

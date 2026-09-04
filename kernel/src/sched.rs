@@ -298,7 +298,7 @@ fn take_next() -> Option<NonNull<Tcb>> {
         return Some(next);
     }
     // An empty queue is idle, not finished: hardware can still wake a thread
-    // blocked on a notification -- but only if some source is bound (D-041)
+    // blocked on a notification, but only if some source is bound (D-041)
     // *and* somebody is actually parked on one. A live thread that is merely
     // suspended will never be woken by an interrupt, and waiting for one that
     // cannot help is how a system hangs instead of finishing (D-048).
@@ -567,7 +567,7 @@ fn ipc_send(tcb: &mut Tcb, ep_cap: RawCap, info: MessageInfo, is_call: bool) -> 
         // the sender goes to the back of the queue.
         tcb.set_return(result::OK);
         // The lock is not reentrant, so `current_tcb` must be resolved before
-        // `push` takes it -- Rust evaluates the receiver first.
+        // `push` takes it. Rust evaluates the receiver first.
         let me = current_tcb().expect("no current thread");
         QUEUE.lock().push(me);
         switch_direct(waiting);
@@ -794,7 +794,7 @@ fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
     let callee = unsafe { caller.as_mut() };
 
     // Unless it is not waiting any more. A thread can be suspended while it
-    // awaits a reply -- that is how a crashed task is torn down -- and the
+    // awaits a reply, which is how a crashed task is torn down, and the
     // reply capability its server still holds must not resurrect it (D-048).
     if callee.state != ThreadState::AwaitingReply {
         tcb.reply = RawCap::NULL;
@@ -831,7 +831,7 @@ fn sys_reply(tcb: &mut Tcb, then_receive: bool) -> ! {
             // SAFETY: this thread is current, so it is on no other queue.
             unsafe { ep.enqueue(me, EndpointState::Receiving, ep_cap.paddr) };
             // The server is parked, so the thread we just answered gets the
-            // hart directly -- the other half of the fast path.
+            // hart directly, the other half of the fast path.
             switch_direct(caller);
         }
         finish(tcb, result::ERR_BAD_CAP);
@@ -870,7 +870,7 @@ fn transfer_cap(from: &Tcb, to: &mut Tcb) -> Result<(), CapError> {
     let depth = to_cs.root_depth();
     // The copy carries no badge of its own: badges identify a holder to a
     // server, and this is a new holder. Nor does it carry the sender's
-    // mapping -- a mapping belongs to the capability that made it, so a
+    // mapping. A mapping belongs to the capability that made it, so a
     // receiver can map what it was handed (D-047).
     let mut copy = RawCap { badge: 0, ..cap };
     copy.clear_mapping();
@@ -978,14 +978,14 @@ fn invoke_mapping(tcb: &mut Tcb, cs: CSpace, cptr: u64, info: MessageInfo) -> ! 
                 crate::cap::vspace::map_table(cap, &vspace, vaddr, level)
             } else {
                 // Executable only when the caller asks for it *and* the
-                // capability carries GRANT -- mapping someone else's memory
+                // capability carries GRANT. Mapping someone else's memory
                 // executable is not something a plain WRITE right should allow.
                 let executable = level != 0 && cap.rights & crate::cap::rights::GRANT != 0;
                 crate::cap::vspace::map_frame(cap, &vspace, vaddr, rights_mask, executable)
             };
             // Through `cap_result`, not a flat `ERR_MAP`, so a missing
             // intermediate level is distinguishable from every other way a
-            // mapping can fail -- which is what D-035 always assumed.
+            // mapping can fail, which is what D-035 always assumed.
             finish(tcb, outcome.map_or_else(cap_result, |()| result::OK))
         }
         label::UNMAP => {
@@ -1038,7 +1038,7 @@ fn invoke_tcb(tcb: &mut Tcb, cs: CSpace, cap: RawCap, info: MessageInfo) -> ! {
         Err(e) => finish(tcb, cap_result(e)),
     };
     // SAFETY: `check` proved this is a live TCB capability naming a thread
-    // other than the caller, so this is the only live reference to it -- the
+    // other than the caller, so this is the only live reference to it, the
     // single-hart invariant does the rest.
     let target = unsafe { crate::cap::tcb::tcb_at(typed.raw()) };
 

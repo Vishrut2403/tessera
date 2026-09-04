@@ -47,8 +47,8 @@ pub const VERSION: u32 = 2;
 
 pub const DEVICE_BLOCK: u32 = 2;
 
-/// Feature bit 32 — the device speaks the non-legacy interface — which is bit
-/// 0 of the high feature word.
+/// Feature bit 32, meaning the device speaks the non-legacy interface. It is
+/// bit 0 of the high feature word.
 pub const F_VERSION_1: u32 = 1;
 
 /// Queue slots. Eight is enough to have a queue at all and keeps the whole
@@ -62,7 +62,7 @@ pub const AVAIL_OFF: usize = 16 * QUEUE_SIZE as usize;
 pub const USED_OFF: usize = 256;
 
 /// Descriptor flags. `NEXT` chains, `WRITE` marks a buffer the *device* may
-/// write -- which is how it learns which parts of a request are output.
+/// write, which is how it learns which parts of a request are output.
 pub mod desc_flags {
     pub const NEXT: u16 = 1;
     pub const WRITE: u16 = 2;
@@ -182,7 +182,7 @@ impl Transport {
 
     /// Point queue `q` at rings that are already zeroed, and mark it ready.
     /// The addresses are physical because the device does not walk page
-    /// tables -- which is why `GetAddress` needs `WRITE` on the frame (D-040).
+    /// tables, which is why `GetAddress` needs `WRITE` on the frame (D-040).
     pub fn configure_queue(
         &self,
         q: u32,

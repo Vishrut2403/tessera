@@ -23,7 +23,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     kernel::init();
 
     println!();
-    println!("tessera :: M7 -- userspace drivers: ELF, device memory, interrupts");
+    println!("tessera :: M7, userspace drivers: ELF, device memory, interrupts");
     println!("  hart          : {}", hartid);
     println!("  device tree   : {:#x}", dtb_pa);
     println!("  sp            : {:#018x}", kernel::stack_pointer());
@@ -360,7 +360,7 @@ extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
 const USER_TEXT: usize = 0x1000_0000;
 const USER_STACK: usize = 0x2000_0000;
 
-/// `putc(letter); exit()` — the smallest program that proves a thread ran.
+/// `putc(letter); exit()`: the smallest program that proves a thread ran.
 fn greeter(letter: u8) -> [u32; 5] {
     [
         li(uprog::A0, letter as u32),
@@ -494,7 +494,7 @@ fn demand_paging_demo(kernel: &mm::Mapper) {
             println!("  after fault   : {:#x} -> {}  {:?}", LAZY, pa, flags);
             println!("  client's store: {v:#x} (it retried the instruction and it worked)");
         }
-        None => println!("  after fault   : still unmapped -- the pager did not run"),
+        None => println!("  after fault   : still unmapped, the pager did not run"),
     }
     core::mem::forget((ep_cs, pager_cs, client_cs));
 }

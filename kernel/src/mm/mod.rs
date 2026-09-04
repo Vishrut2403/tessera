@@ -151,7 +151,7 @@ pub fn discover(dtb: PhysAddr, kernel: Region) -> Result<MemoryMap, DiscoverErro
         let is_ram = p.depth == 1 && (p.node == "memory" || p.node.starts_with("memory@"));
         let is_reserved = p.depth == 2 && p.parent == "reserved-memory";
         // A device is a `reg` on a child of `/soc`, or a top-level node with a
-        // unit address that is not memory -- `flash@...`, `fw-cfg@...`.
+        // unit address that is not memory, such as `flash@...`, `fw-cfg@...`.
         let is_device = !is_ram
             && !is_reserved
             && ((p.depth == 2 && p.parent == "soc")

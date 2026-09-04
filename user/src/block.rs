@@ -4,7 +4,7 @@
 use crate::abi::label;
 
 /// "Here is the frame I want blocks read into." Carries a frame capability,
-/// once, at connect time -- a 512-byte block does not fit in four registers,
+/// once, at connect time. A 512-byte block does not fit in four registers,
 /// so the message carries the *authority* to memory and not the memory.
 pub const CONNECT: u64 = label::APP_BASE + 0x10;
 /// "Read block `w0` into the frame I gave you."

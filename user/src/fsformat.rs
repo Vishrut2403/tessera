@@ -27,7 +27,7 @@ pub const DIRECT: usize = 7;
 pub const MAX_FILES: usize = BLOCK_SIZE / INODE_SIZE;
 
 /// A name entry is 32 bytes too: 24 of name and an inode index. Twenty-four
-/// bytes is not a coincidence -- it is three registers, so a client can send a
+/// bytes is not a coincidence. It is three registers, so a client can send a
 /// whole filename in one four-register message (D-047).
 pub const NAME_LEN: usize = 24;
 pub const NAME_ENTRY: usize = 32;
@@ -91,7 +91,7 @@ pub fn inode_size(block: &[u8], i: usize) -> u32 {
     get_u32(block, i * INODE_SIZE)
 }
 
-/// The `k`th direct block of inode `i`, or zero if it has none -- block zero
+/// The `k`th direct block of inode `i`, or zero if it has none. Block zero
 /// is the superblock, so it can never be a file's data.
 pub fn inode_direct(block: &[u8], i: usize, k: usize) -> u32 {
     if k >= DIRECT { 0 } else { get_u32(block, i * INODE_SIZE + 4 + k * 4) }
