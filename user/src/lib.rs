@@ -4,6 +4,10 @@
 
 pub mod block;
 pub mod elf;
+pub mod fs;
+/// The on-disk filesystem layout, shared verbatim with the host-side image
+/// writer in `kernel/build.rs` (D-047).
+pub mod fsformat;
 pub mod fdt;
 pub mod io;
 pub mod spawn;

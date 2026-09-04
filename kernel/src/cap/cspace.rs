@@ -161,7 +161,13 @@ impl CSpace {
                 held: original.rights,
             });
         }
-        Ok((RawCap { rights: original.rights & rights, badge, ..original }, source))
+        // A copy is not the mapping the original made. seL4 gives every page
+        // capability its own mapping slot for the same reason: without this a
+        // receiver could not map a frame it was handed, and revoking a copy
+        // would tear down the *original's* mapping (D-047).
+        let mut copy = RawCap { rights: original.rights & rights, badge, ..original };
+        copy.clear_mapping();
+        Ok((copy, source))
     }
 
     /// Copy the capability at `src` into the empty slot at `dst`, weakened to

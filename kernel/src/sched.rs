@@ -857,8 +857,12 @@ fn transfer_cap(from: &Tcb, to: &mut Tcb) -> Result<(), CapError> {
 
     let depth = to_cs.root_depth();
     // The copy carries no badge of its own: badges identify a holder to a
-    // server, and this is a new holder.
-    to_cs.insert(dst, depth, RawCap { badge: 0, ..cap }, Some(slot))
+    // server, and this is a new holder. Nor does it carry the sender's
+    // mapping -- a mapping belongs to the capability that made it, so a
+    // receiver can map what it was handed (D-047).
+    let mut copy = RawCap { badge: 0, ..cap };
+    copy.clear_mapping();
+    to_cs.insert(dst, depth, copy, Some(slot))
 }
 
 /// Deliver a message, and the capability riding with it if there is one.

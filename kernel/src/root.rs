@@ -21,8 +21,9 @@ pub static IMAGE: &[u8] = include_bytes!(env!("ROOT_TASK_ELF"));
 /// frames and maps them read-only, and the root task loads them itself into
 /// processes of their own (D-043). Multiboot calls these modules; Fuchsia's
 /// kernel carries a whole bootfs the same way.
-pub static MODULES: [(&str, &[u8]); 2] = [
+pub static MODULES: [(&str, &[u8]); 3] = [
     ("blk", include_bytes!(env!("BLK_ELF"))),
+    ("fs", include_bytes!(env!("FS_ELF"))),
     ("client", include_bytes!(env!("CLIENT_ELF"))),
 ];
 

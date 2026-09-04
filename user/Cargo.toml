@@ -27,6 +27,11 @@ path = "src/bin/blk.rs"
 test = false
 
 [[bin]]
+name = "fs"
+path = "src/bin/fs.rs"
+test = false
+
+[[bin]]
 name = "client"
 path = "src/bin/client.rs"
 test = false

@@ -294,16 +294,16 @@ fn the_root_task_runs_and_starts_a_thread_of_its_own() {
     // driver blocked for (D-045).
     assert_eq!(verified, 2, "the driver read back {verified} of 2 sectors correctly");
 
-    // And then it served them. A third process -- holding a send-only
-    // capability to an endpoint the driver holds receive-only, and no device
-    // capability at all -- asked for three blocks through the driver and
-    // checked every one (D-046).
+    // And then it served them, through a filesystem server that is itself only
+    // a client of the driver, to a task holding nothing but a send-only
+    // endpoint and a filename: it printed a file, read a byte range spanning
+    // two blocks, and was refused a name that does not exist (D-046, D-047).
     // SAFETY: the same scratch page, one word further on.
-    let served = unsafe { p.add(6).read_volatile() };
-    assert_eq!(served, 3, "the client verified {served} of 3 blocks through the driver");
+    let checks = unsafe { p.add(6).read_volatile() };
+    assert_eq!(checks, 3, "the client passed {checks} of 3 checks against the filesystem");
 
-    // The root task, the thread it made, and the two processes it loaded.
-    assert_eq!(sched::exited() - before, 4);
+    // The root task, the thread it made, and the three processes it loaded.
+    assert_eq!(sched::exited() - before, 5);
 }
 
 // --- Boot modules (D-043) ---

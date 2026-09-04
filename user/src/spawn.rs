@@ -47,6 +47,9 @@ pub const DEVICE_BADGE: u64 = 1 << 1;
 pub const SERVICE: u64 = 11;
 /// Where a server puts a capability a client hands it.
 pub const CLIENT_FRAME: u64 = 12;
+/// The endpoint a task *calls*, held with `WRITE`. A task that is both a
+/// server and a client of another holds one of each (D-047).
+pub const UPSTREAM: u64 = 13;
 /// Device untypeds, one per candidate device, from here.
 pub const FIRST_DEVICE: u64 = 16;
 /// The first slot a spawned task may put objects of its own in.

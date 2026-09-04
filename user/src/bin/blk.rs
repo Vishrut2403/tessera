@@ -38,9 +38,10 @@ const SECTOR: usize = 512;
 const BLK_T_IN: u32 = 0;
 const BLK_S_OK: u8 = 0;
 
-/// Two sectors far apart, so "it always returns block zero" is not a way to
+/// Two sectors far apart and clear of the filesystem, so "it always returns
+/// block zero" is not a way to
 /// pass. `kernel/build.rs` writes each block's own number into it.
-const READ_SECTORS: [u64; 2] = [5, 1000];
+const READ_SECTORS: [u64; 2] = [100, 1000];
 
 fn main() {
     let id = sys::thread_id();

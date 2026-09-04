@@ -1,31 +1,32 @@
-//! A client of the block service (D-046).
+//! A client of the filesystem service (D-046, D-047).
 //!
 //! It holds a CSpace, an address space, a TCB, an endpoint to its parent, one
-//! untyped region, and a **send-only** capability to a driver it did not create
-//! and cannot receive on. It has no device capability, no interrupt, and no
-//! idea what a virtqueue is.
+//! untyped region, and a **send-only** capability to a filesystem server it did
+//! not create and cannot receive on. It has no device capability, no interrupt,
+//! no block-level access, and no idea what a virtqueue is.
 
 #![no_std]
 #![no_main]
 
 use rt::abi::{MessageInfo, ObjectType, bootinfo, rights};
-use rt::{block, entry, println, spawn, sys, vm};
+use rt::{entry, fs, println, spawn, sys, vm};
 
 entry!(main);
 
-/// What this task writes to the page its parent gave it, distinct from both the
-/// parent's word and the driver's.
+/// What this task writes to the page its parent gave it, distinct from every
+/// other task's word at the same address.
 pub const MAGIC: u64 = 0xc11e_0000_0000_0001;
 
-/// Where the buffer the driver fills is mapped, in our address space only.
+/// Where the buffer the server fills is mapped, in our address space.
 const BUFFER_VADDR: usize = 0x1200_0000;
 
-/// The first block, one in the middle, and the last. `kernel/build.rs` writes
-/// each block's own number into both ends of it.
-const WANTED: [u64; 3] = [0, 5, 2047];
+/// A read that starts inside one block and ends inside the next, so a server
+/// that only ever follows the first direct pointer cannot pass.
+const SPAN_OFFSET: usize = 500;
+const SPAN_LEN: usize = 200;
 
 fn main() {
-    println!("  blk client    : running as thread {}, send-only to the driver", sys::thread_id());
+    println!("  fs client     : running as thread {}, send-only to the server", sys::thread_id());
     spawn::say_hello(MAGIC);
 
     let vspace = bootinfo::slot::VSPACE;
@@ -35,65 +36,113 @@ fn main() {
     vm::map(&mut alloc, vspace, buffer, BUFFER_VADDR, rights::READ | rights::WRITE, false)
         .expect("map buffer");
 
-    // One capability, once. A 512-byte block will never fit in four registers,
-    // so the connect hands over the *authority* to a page and every request
-    // after it is a block number (D-046).
-    let connect = sys::call_cap(
-        spawn::SERVICE,
-        MessageInfo::new(block::CONNECT, 0, true),
-        [0; 4],
-        buffer,
-    );
-    if connect.words[0] != block::OK {
+    // One capability, once. Everything after this is four registers each way.
+    let connect =
+        sys::call_cap(spawn::UPSTREAM, MessageInfo::new(fs::CONNECT, 0, true), [0; 4], buffer);
+    if connect.words[0] != fs::OK {
         println!("    connect       : refused, {}", connect.words[0]);
         report(0);
         return;
     }
-    println!("    connected     : gave the driver one frame of ours to fill");
+    println!("    connected     : gave the server one frame of ours to fill");
 
-    let mut verified = 0usize;
-    for sector in WANTED {
-        // Something the driver must overwrite, so a read that never happened
-        // cannot pass for one that did.
-        // SAFETY: our own frame, mapped read-write just above.
-        unsafe { (BUFFER_VADDR as *mut u64).write_volatile(0) };
+    let mut checks = 0usize;
+    checks += print_a_file("motd") as usize;
+    checks += read_across_a_block("spans.bin") as usize;
+    checks += a_missing_file_is_refused("nope.txt") as usize;
 
-        let reply = sys::call(
-            spawn::SERVICE,
-            MessageInfo::new(block::READ, 1, false),
-            [sector as usize, 0, 0, 0],
-        );
-
-        // SAFETY: as above. The driver never mapped this page -- the device
-        // wrote it directly, from a physical address the driver was told.
-        let (first, last) = unsafe {
-            (
-                (BUFFER_VADDR as *const u64).read_volatile(),
-                ((BUFFER_VADDR + block::BLOCK - 8) as *const u64).read_volatile(),
-            )
-        };
-
-        let want = 0x07e5_5e7a_0000_0000 | sector;
-        if reply.words[0] == block::OK && first == want && last == sector {
-            verified += 1;
-            println!("    block {sector:<4}     : {first:#x}, and {last} at the far end");
-        } else {
-            let status = reply.words[0];
-            println!("    block {sector:<4}     : status {status} -- {first:#x} / {last}");
-        }
-    }
-
-    // A server loop needs an end, or the run queue never empties.
-    sys::call(spawn::SERVICE, MessageInfo::new(block::SHUTDOWN, 0, false), [0; 4]);
-    println!("    shutdown      : told the driver to stop serving");
-
-    report(verified);
+    sys::call(spawn::UPSTREAM, MessageInfo::new(fs::SHUTDOWN, 0, false), [0; 4]);
+    println!("    shutdown      : told the server to stop");
+    report(checks);
 }
 
-fn report(verified: usize) {
+/// Open a file, read all of it, and print it. Nothing about this asks where the
+/// bytes are: the client never sees a block number.
+fn print_a_file(name: &str) -> bool {
+    let Some((inode, size)) = open(name) else { return false };
+    if size == 0 {
+        println!("    {name:<10}    : the server says it is empty");
+        return false;
+    }
+    let got = read(inode, size, 0);
+    if got != size {
+        println!("    {name:<10}    : wanted {size} bytes, got {got}");
+        return false;
+    }
+    // SAFETY: our own frame, mapped read-write, which the server has just
+    // copied `got` bytes into.
+    let bytes = unsafe { core::slice::from_raw_parts(BUFFER_VADDR as *const u8, got) };
+    println!("    {name:<10}    : {size} bytes --");
+    for line in bytes.split(|b| *b == b'\n') {
+        if !line.is_empty() {
+            println!("      | {}", core::str::from_utf8(line).unwrap_or("<not utf-8>"));
+        }
+    }
+    true
+}
+
+/// Read a range that starts in one block and ends in the next, and check every
+/// byte against the pattern `kernel/build.rs` wrote.
+fn read_across_a_block(name: &str) -> bool {
+    let Some((inode, size)) = open(name) else { return false };
+    if size <= SPAN_OFFSET + SPAN_LEN {
+        println!("    {name:<10}    : only {size} bytes, too small to span a block");
+        return false;
+    }
+    let got = read(inode, SPAN_LEN, SPAN_OFFSET);
+    if got != SPAN_LEN {
+        println!("    {name:<10}    : wanted {SPAN_LEN} bytes at {SPAN_OFFSET}, got {got}");
+        return false;
+    }
+    // SAFETY: as above.
+    let bytes = unsafe { core::slice::from_raw_parts(BUFFER_VADDR as *const u8, got) };
+    for (i, b) in bytes.iter().enumerate() {
+        let want = ((SPAN_OFFSET + i) % 251) as u8;
+        if *b != want {
+            println!("    {name:<10}    : byte {} is {b}, not {want}", SPAN_OFFSET + i);
+            return false;
+        }
+    }
+    println!(
+        "    {name:<10}    : {size} bytes; {SPAN_LEN} of them from {SPAN_OFFSET} span two blocks"
+    );
+    true
+}
+
+fn a_missing_file_is_refused(name: &str) -> bool {
+    let words = fs::pack_name(name);
+    let reply = sys::call(spawn::UPSTREAM, MessageInfo::new(fs::OPEN, 3, false), words);
+    let refused = reply.words[0] == fs::NO_SUCH_FILE;
+    let said = if refused { "no such file, as it must be" } else { "found, which it must not be" };
+    println!("    {name:<10}    : {said}");
+    refused
+}
+
+/// A name is 24 bytes, which is exactly three registers -- so a whole filename
+/// fits in one message and nothing has to be shared to ask a question (D-047).
+fn open(name: &str) -> Option<(usize, usize)> {
+    let ask = MessageInfo::new(fs::OPEN, 3, false);
+    let reply = sys::call(spawn::UPSTREAM, ask, fs::pack_name(name));
+    if reply.words[0] != fs::OK {
+        println!("    {name:<10}    : open refused, {}", reply.words[0]);
+        return None;
+    }
+    Some((reply.words[1], reply.words[2]))
+}
+
+fn read(inode: usize, len: usize, offset: usize) -> usize {
+    // SAFETY: our own frame. Cleared so a read that never happened cannot pass
+    // for one that did.
+    unsafe { core::ptr::write_bytes(BUFFER_VADDR as *mut u8, 0, len) };
+    let reply =
+        sys::call(spawn::UPSTREAM, MessageInfo::new(fs::READ, 3, false), [inode, len, offset, 0]);
+    if reply.words[0] == fs::OK { reply.words[1] } else { 0 }
+}
+
+fn report(checks: usize) {
     sys::call(
         bootinfo::slot::ENDPOINT,
-        MessageInfo::new(spawn::READY, 2, false),
-        [verified, 0, 0, 0],
+        MessageInfo::new(spawn::READY, 1, false),
+        [checks, 0, 0, 0],
     );
 }

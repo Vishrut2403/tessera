@@ -152,23 +152,21 @@ fn spawn_a_driver(
     println!();
     println!("  spawning:");
 
-    let (Some(blk), Some(client)) = (bi.module("blk"), bi.module("client")) else {
+    let (Some(blk), Some(fs), Some(client)) =
+        (bi.module("blk"), bi.module("fs"), bi.module("client"))
+    else {
         println!("    the boot info is missing a module");
         return (0, 0, 0);
     };
-    println!("    modules       : {} and {}, mapped read-only", blk.name(), client.name());
+    println!("    modules       : {}, {} and {}", blk.name(), fs.name(), client.name());
 
-    // A page of our own at the address each child will also have a page at.
-    // Three processes, one virtual address, three different frames.
-    let (ours, blk_ram, client_ram, service, handler, ntfn, badged) = (
-        first_slot,
-        first_slot + 1,
-        first_slot + 2,
-        first_slot + 3,
-        first_slot + 4,
-        first_slot + 5,
-        first_slot + 6,
-    );
+    // A page of our own at the address every child will also have a page at.
+    // Four processes, one virtual address, four different frames.
+    let (ours, blk_ram, fs_ram, client_ram) =
+        (first_slot, first_slot + 1, first_slot + 2, first_slot + 3);
+    let (blk_service, fs_service) = (first_slot + 4, first_slot + 5);
+    let (handler, ntfn, badged) = (first_slot + 6, first_slot + 7, first_slot + 8);
+
     sys::retype(ram, ObjectType::Frame, 0, ours, 1).expect("shared frame");
     sys::map_frame(ours, vspace, spawn::SHARED_VADDR, rights::READ | rights::WRITE, false)
         .expect("map ours");
@@ -178,21 +176,22 @@ fn spawn_a_driver(
     // Memory of their own to retype from: a task that had to ask us for every
     // page table would not be much of a separate process.
     sys::retype(ram, ObjectType::Untyped, 18, blk_ram, 1).expect("driver untyped");
+    sys::retype(ram, ObjectType::Untyped, 17, fs_ram, 1).expect("fs untyped");
     sys::retype(ram, ObjectType::Untyped, 16, client_ram, 1).expect("client untyped");
 
-    // One endpoint object, two halves. The driver receives on it and cannot
-    // send; the client sends on it and cannot receive. Neither can impersonate
-    // the other, and it is a compile-time-shaped rule enforced at the syscall
-    // boundary (D-042).
-    sys::retype(ram, ObjectType::Endpoint, 0, service, 1).expect("service endpoint");
+    // Two endpoints, four halves. Each server holds one with `READ` and cannot
+    // send on it; each client holds one with `WRITE` and cannot receive on it.
+    // Nobody can impersonate the service they use (D-042).
+    sys::retype(ram, ObjectType::Endpoint, 0, blk_service, 1).expect("block service");
+    sys::retype(ram, ObjectType::Endpoint, 0, fs_service, 1).expect("fs service");
 
-    let mut nursery = spawn::Nursery::new(ram, first_slot + 7, vspace, scratch);
+    let mut nursery = spawn::Nursery::new(ram, first_slot + 9, vspace, scratch);
 
-    // --- The driver ---
+    // --- The driver: a device, an interrupt, and one service to answer ---
     let (transports, count) = virtio_transports(bi);
     let mut grants = [spawn::Grant { src: 0, dst: 0, rights: 0 }; 2 + MAX_TRANSPORTS];
     grants[0] = spawn::Grant { src: blk_ram, dst: spawn::UNTYPED, rights: rights::ALL };
-    grants[1] = spawn::Grant { src: service, dst: spawn::SERVICE, rights: rights::READ };
+    grants[1] = spawn::Grant { src: blk_service, dst: spawn::SERVICE, rights: rights::READ };
     for i in 0..count {
         grants[i + 2] = spawn::Grant {
             src: transports[i].1,
@@ -200,35 +199,42 @@ fn spawn_a_driver(
             rights: rights::ALL,
         };
     }
-    println!("    driver gets   : 256 KiB, {count} transports to probe, and READ on the service");
-
-    let driver = spawn::spawn(blk_image(blk), &mut nursery, &grants[..count + 2]).expect("driver");
-    println!("    loaded        : blk at entry {:#x}, running", driver.entry);
+    println!("    driver gets   : 256 KiB, {count} transports, and READ on the block service");
+    let driver = spawn::spawn(module_bytes(blk), &mut nursery, &grants[..count + 2]).expect("blk");
     let (result, ready) = serve(&driver, &transports[..count], ram, handler, ntfn, badged);
     let (sectors, verified) = (ready & 0xffff_ffff, ready >> 32);
     println!("    driver up     : {sectors} sectors, {verified} of its own reads verified");
     assert!(sectors > 0, "the driver never brought a device up");
     assert_eq!(verified, 2, "the driver read back {verified} of its own 2 sectors");
 
-    // --- The client ---
-    // It gets no device, no interrupt and no way to receive on the service.
+    // --- The filesystem: a client of the driver, a server to everyone else ---
+    let fs_grants = [
+        spawn::Grant { src: fs_ram, dst: spawn::UNTYPED, rights: rights::ALL },
+        spawn::Grant { src: blk_service, dst: spawn::UPSTREAM, rights: rights::WRITE },
+        spawn::Grant { src: fs_service, dst: spawn::SERVICE, rights: rights::READ },
+    ];
+    println!("    fs gets       : 128 KiB, WRITE on the block service, READ on its own");
+    let server = spawn::spawn(module_bytes(fs), &mut nursery, &fs_grants).expect("fs");
+    let (_, mounted) = serve(&server, &[], ram, handler, ntfn, badged);
+    println!("    fs up         : {} files", mounted & 0xffff_ffff);
+    assert!(mounted & 0xffff_ffff > 0, "the filesystem server mounted nothing");
+
+    // --- The client: a name, and nothing else ---
     let client_grants = [
         spawn::Grant { src: client_ram, dst: spawn::UNTYPED, rights: rights::ALL },
-        spawn::Grant { src: service, dst: spawn::SERVICE, rights: rights::WRITE },
+        spawn::Grant { src: fs_service, dst: spawn::UPSTREAM, rights: rights::WRITE },
     ];
-    println!("    client gets   : 64 KiB and WRITE on the service, and nothing else");
-
-    let task = spawn::spawn(blk_image(client), &mut nursery, &client_grants).expect("client");
-    println!("    loaded        : client at entry {:#x}, running", task.entry);
+    println!("    client gets   : 64 KiB and WRITE on the fs service, and nothing else");
+    let task = spawn::spawn(module_bytes(client), &mut nursery, &client_grants).expect("client");
     let (_, ready) = serve(&task, &[], ram, handler, ntfn, badged);
-    let served = ready & 0xffff_ffff;
-    println!("    client done   : {served} blocks read through the driver and checked");
+    let checks = ready & 0xffff_ffff;
+    println!("    client done   : {checks} of 3 checks passed against the filesystem");
 
-    (result, sectors | verified << 32, served as usize)
+    (result, sectors | verified << 32, checks as usize)
 }
 
 /// A boot module's bytes, as the root task sees them.
-fn blk_image(module: &ModuleDesc) -> &'static [u8] {
+fn module_bytes(module: &ModuleDesc) -> &'static [u8] {
     // SAFETY: the kernel mapped the module read-only before we ran, and the
     // boot info says how long it is.
     unsafe { core::slice::from_raw_parts(module.vaddr as *const u8, module.size as usize) }
