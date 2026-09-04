@@ -2,6 +2,7 @@
 
 #![no_std]
 
+pub mod block;
 pub mod elf;
 pub mod fdt;
 pub mod io;

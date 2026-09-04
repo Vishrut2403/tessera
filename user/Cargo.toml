@@ -20,10 +20,15 @@ name = "root"
 path = "src/bin/root.rs"
 test = false
 
-# A boot module, not loaded by the kernel: the root task loads it (D-043).
+# Boot modules, not loaded by the kernel: the root task loads them (D-043).
 [[bin]]
 name = "blk"
 path = "src/bin/blk.rs"
+test = false
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
 test = false
 
 [dependencies]

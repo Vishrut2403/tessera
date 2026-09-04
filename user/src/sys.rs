@@ -118,6 +118,12 @@ pub fn call(ep: u64, info: MessageInfo, words: [usize; MSG_REGS]) -> Message {
     ecall(syscall::CALL, ep, info, words, 0)
 }
 
+/// Call, granting the capability in `slot` to the receiver (D-036). The
+/// receiver names where it lands, so nobody is handed authority unasked.
+pub fn call_cap(ep: u64, info: MessageInfo, words: [usize; MSG_REGS], slot: u64) -> Message {
+    ecall(syscall::CALL, ep, info, words, slot)
+}
+
 pub fn recv(ep: u64) -> Message {
     ecall(syscall::RECV, ep, MessageInfo::default(), [0; MSG_REGS], 0)
 }

@@ -3,9 +3,9 @@
 //! Nothing here is privileged: every step is an invocation on a capability the
 //! parent already holds. The kernel is not told a process is being made.
 
-use crate::abi::{ObjectType, PAGE_SIZE, SLOT_BITS, bootinfo, label, rights};
+use crate::abi::{MessageInfo, ObjectType, PAGE_SIZE, SLOT_BITS, bootinfo, label, rights};
 use crate::elf::{Elf, ElfError, Segment};
-use crate::{Error, sys, vm};
+use crate::{Error, println, sys, vm};
 
 /// Where a spawned task finds the page its parent gave it. Both this and the
 /// stack sit in the same 2 MiB region as the image, so one intermediate page
@@ -42,6 +42,11 @@ pub const NOTIFICATION: u64 = 10;
 /// The badge a spawned driver's device interrupt arrives under, so both ends
 /// agree on what a notification word means (D-038).
 pub const DEVICE_BADGE: u64 = 1 << 1;
+/// A service endpoint: the server holds it with `READ`, its clients with
+/// `WRITE`, and neither can do the other's half (D-042).
+pub const SERVICE: u64 = 11;
+/// Where a server puts a capability a client hands it.
+pub const CLIENT_FRAME: u64 = 12;
 /// Device untypeds, one per candidate device, from here.
 pub const FIRST_DEVICE: u64 = 16;
 /// The first slot a spawned task may put objects of its own in.
@@ -196,4 +201,28 @@ fn load_segment(n: &mut Nursery, vspace: u64, seg: &Segment) -> Result<(), Spawn
         va += PAGE_SIZE;
     }
     Ok(())
+}
+
+/// The first exchange a spawned task has with its parent: write `magic` to the
+/// page the parent gave it, prove what comes back is its own word and not the
+/// parent's, and say which thread it is. Returns the parent's reply.
+pub fn say_hello(magic: u64) -> u64 {
+    // SAFETY: the parent mapped a frame here read-write before resuming us.
+    let seen = unsafe {
+        let p = SHARED_VADDR as *mut u64;
+        p.write_volatile(magic);
+        p.read_volatile()
+    };
+
+    // We hold the endpoint with `WRITE` and nothing else, which is exactly what
+    // `call` needs: the reply arrives through the Reply capability the kernel
+    // mints, never back through the endpoint (D-042).
+    let reply = sys::call(
+        bootinfo::slot::ENDPOINT,
+        MessageInfo::new(HELLO, 3, false),
+        [sys::thread_id(), seen as usize, SHARED_VADDR, 0],
+    );
+    println!("    shared page   : wrote {seen:#x} at {SHARED_VADDR:#x}");
+    println!("    parent said   : {:#x}", reply.words[0]);
+    reply.words[0] as u64
 }

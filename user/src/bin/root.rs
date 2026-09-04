@@ -6,6 +6,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use rt::abi::{BootInfo, MessageInfo, ObjectType, bootinfo, rights};
+use rt::abi::bootinfo::ModuleDesc;
 use rt::fdt::{Device, Fdt};
 use rt::{entry, println, spawn, sys, thread_entry};
 
@@ -125,12 +126,13 @@ fn main() {
 
     check_device_untyped(bi, vspace, f + 8, base + 0x10000, ut);
     wait_for_an_interrupt(bi, vspace, ut, f + 16, base + 0x20000);
-    let (spawned, sectors) = spawn_a_driver(bi, vspace, ut, f + 24, base + 0x30000);
+    let (spawned, disk, served) = spawn_a_driver(bi, vspace, ut, f + 24, base + 0x30000);
 
     // SAFETY: the scratch frame is still mapped read-write at `base`.
     unsafe {
         (base as *mut u64).add(4).write_volatile(spawned);
-        (base as *mut u64).add(5).write_volatile(sectors);
+        (base as *mut u64).add(5).write_volatile(disk);
+        (base as *mut u64).add(6).write_volatile(served as u64);
     }
 
     println!();
@@ -146,56 +148,90 @@ fn spawn_a_driver(
     ram: u64,
     first_slot: u64,
     scratch: usize,
-) -> (u64, u64) {
+) -> (u64, u64, usize) {
     println!();
     println!("  spawning:");
 
-    let Some(module) = bi.module("blk") else {
-        println!("    no blk module in the boot info");
-        return (0, 0);
+    let (Some(blk), Some(client)) = (bi.module("blk"), bi.module("client")) else {
+        println!("    the boot info is missing a module");
+        return (0, 0, 0);
     };
-    println!("    module        : {} at {:#x}, {} bytes", module.name(), module.vaddr, module.size);
+    println!("    modules       : {} and {}, mapped read-only", blk.name(), client.name());
 
-    // SAFETY: the kernel mapped the module read-only before we ran, and the
-    // boot info says how long it is.
-    let image =
-        unsafe { core::slice::from_raw_parts(module.vaddr as *const u8, module.size as usize) };
-
-    // A page of our own at the address the child will also have a page at.
-    // Two processes, one virtual address, two different frames.
-    let (ours, child_ram, handler, ntfn, badged) =
-        (first_slot, first_slot + 1, first_slot + 2, first_slot + 3, first_slot + 4);
+    // A page of our own at the address each child will also have a page at.
+    // Three processes, one virtual address, three different frames.
+    let (ours, blk_ram, client_ram, service, handler, ntfn, badged) = (
+        first_slot,
+        first_slot + 1,
+        first_slot + 2,
+        first_slot + 3,
+        first_slot + 4,
+        first_slot + 5,
+        first_slot + 6,
+    );
     sys::retype(ram, ObjectType::Frame, 0, ours, 1).expect("shared frame");
     sys::map_frame(ours, vspace, spawn::SHARED_VADDR, rights::READ | rights::WRITE, false)
         .expect("map ours");
     // SAFETY: a frame we just retyped and mapped read-write.
     unsafe { (spawn::SHARED_VADDR as *mut u64).write_volatile(PARENT_MAGIC) };
 
-    // Memory of its own to retype from: a driver that had to ask us for every
+    // Memory of their own to retype from: a task that had to ask us for every
     // page table would not be much of a separate process.
-    sys::retype(ram, ObjectType::Untyped, 18, child_ram, 1).expect("child untyped");
+    sys::retype(ram, ObjectType::Untyped, 18, blk_ram, 1).expect("driver untyped");
+    sys::retype(ram, ObjectType::Untyped, 16, client_ram, 1).expect("client untyped");
 
+    // One endpoint object, two halves. The driver receives on it and cannot
+    // send; the client sends on it and cannot receive. Neither can impersonate
+    // the other, and it is a compile-time-shaped rule enforced at the syscall
+    // boundary (D-042).
+    sys::retype(ram, ObjectType::Endpoint, 0, service, 1).expect("service endpoint");
+
+    let mut nursery = spawn::Nursery::new(ram, first_slot + 7, vspace, scratch);
+
+    // --- The driver ---
     let (transports, count) = virtio_transports(bi);
-    let mut grants = [spawn::Grant { src: 0, dst: 0, rights: 0 }; 1 + MAX_TRANSPORTS];
-    grants[0] = spawn::Grant { src: child_ram, dst: spawn::UNTYPED, rights: rights::ALL };
+    let mut grants = [spawn::Grant { src: 0, dst: 0, rights: 0 }; 2 + MAX_TRANSPORTS];
+    grants[0] = spawn::Grant { src: blk_ram, dst: spawn::UNTYPED, rights: rights::ALL };
+    grants[1] = spawn::Grant { src: service, dst: spawn::SERVICE, rights: rights::READ };
     for i in 0..count {
-        grants[i + 1] = spawn::Grant {
+        grants[i + 2] = spawn::Grant {
             src: transports[i].1,
             dst: spawn::FIRST_DEVICE + i as u64,
             rights: rights::ALL,
         };
     }
-    println!("    endowed       : 256 KiB of untyped and {count} virtio transports to probe");
+    println!("    driver gets   : 256 KiB, {count} transports to probe, and READ on the service");
 
-    let mut nursery = spawn::Nursery::new(ram, first_slot + 5, vspace, scratch);
-    let child = spawn::spawn(image, &mut nursery, &grants[..count + 1]).expect("spawn");
-    println!(
-        "    loaded        : entry {:#x}, {} objects retyped, running",
-        child.entry,
-        nursery.alloc.next_slot - first_slot - 5
-    );
+    let driver = spawn::spawn(blk_image(blk), &mut nursery, &grants[..count + 2]).expect("driver");
+    println!("    loaded        : blk at entry {:#x}, running", driver.entry);
+    let (result, ready) = serve(&driver, &transports[..count], ram, handler, ntfn, badged);
+    let (sectors, verified) = (ready & 0xffff_ffff, ready >> 32);
+    println!("    driver up     : {sectors} sectors, {verified} of its own reads verified");
+    assert!(sectors > 0, "the driver never brought a device up");
+    assert_eq!(verified, 2, "the driver read back {verified} of its own 2 sectors");
 
-    serve(&child, &transports[..count], ram, handler, ntfn, badged)
+    // --- The client ---
+    // It gets no device, no interrupt and no way to receive on the service.
+    let client_grants = [
+        spawn::Grant { src: client_ram, dst: spawn::UNTYPED, rights: rights::ALL },
+        spawn::Grant { src: service, dst: spawn::SERVICE, rights: rights::WRITE },
+    ];
+    println!("    client gets   : 64 KiB and WRITE on the service, and nothing else");
+
+    let task = spawn::spawn(blk_image(client), &mut nursery, &client_grants).expect("client");
+    println!("    loaded        : client at entry {:#x}, running", task.entry);
+    let (_, ready) = serve(&task, &[], ram, handler, ntfn, badged);
+    let served = ready & 0xffff_ffff;
+    println!("    client done   : {served} blocks read through the driver and checked");
+
+    (result, sectors | verified << 32, served as usize)
+}
+
+/// A boot module's bytes, as the root task sees them.
+fn blk_image(module: &ModuleDesc) -> &'static [u8] {
+    // SAFETY: the kernel mapped the module read-only before we ran, and the
+    // boot info says how long it is.
+    unsafe { core::slice::from_raw_parts(module.vaddr as *const u8, module.size as usize) }
 }
 
 /// How many virtio-mmio transports the platform is expected to present.
@@ -268,15 +304,11 @@ fn serve(
                     .expect("reply");
             }
             spawn::READY => {
-                // Again: the driver is blocked in `call` until this returns,
-                // and it has to be free to exit before anything is asserted.
+                // Again: the caller is blocked in `call` until this returns,
+                // and it has to be free to run on before anything is judged.
                 sys::reply(MessageInfo::new(spawn::READY, 0, false), [0; 4]).expect("reply");
-
-                let (sectors, verified) = (msg.words[0] as u64, msg.words[1]);
-                println!("    driver up     : {sectors} sectors, {verified} of them read back");
-                assert!(sectors > 0, "the driver never brought a device up");
-                assert_eq!(verified, 2, "the driver read back {verified} of 2 sectors");
-                return (result, sectors | (verified as u64) << 32);
+                let (w0, w1) = (msg.words[0] as u64, msg.words[1] as u64);
+                return (result, w0 | w1 << 32);
             }
             other => {
                 println!("    unknown message {other:#x} from the driver");

@@ -1,4 +1,5 @@
-//! The virtio-blk driver, as a process of its own (D-043, D-044).
+//! The virtio-blk driver: a process of its own (D-043), brought up without
+//! ambient authority (D-044), and a block server (D-046).
 //!
 //! It holds no ambient authority at all: a CSpace, an address space, a TCB, an
 //! endpoint to its parent, one untyped region, and the device untypeds it was
@@ -10,7 +11,7 @@
 
 use rt::abi::{MessageInfo, ObjectType, PAGE_SIZE, bootinfo, rights};
 use rt::virtio::{self, Queue, Transport, desc_flags};
-use rt::{entry, println, spawn, sys, vm};
+use rt::{block, entry, println, spawn, sys, vm};
 
 entry!(main);
 
@@ -48,10 +49,10 @@ fn main() {
     let vspace = bootinfo::slot::VSPACE;
     let mut alloc = vm::Alloc::new(spawn::UNTYPED, spawn::FIRST_FREE);
 
-    say_hello(id);
+    spawn::say_hello(MAGIC);
 
     let mut frames = [0u64; CANDIDATES];
-    let (sectors, verified) = match probe(&mut alloc, vspace, &mut frames) {
+    let brought_up = match probe(&mut alloc, vspace, &mut frames) {
         Some((index, transport)) => {
             // Only the parent holds `IrqControl`, so the source is its to
             // claim. It also takes back the transports we did not want, which
@@ -76,24 +77,34 @@ fn main() {
             assert!(sys::get_address(frames[index]).is_ok(), "our own transport went with them");
             println!("    narrowed      : the transports we did not keep are no longer ours");
 
-            match bring_up(&mut alloc, vspace, &transport) {
-                Some((queue, sectors)) => (sectors, read_sectors(&queue, &transport)),
-                None => (0, 0),
-            }
+            bring_up(&mut alloc, vspace, &transport)
+                .map(|(queue, sectors)| {
+                    let verified = read_sectors(&queue, &transport);
+                    (queue, transport, sectors, verified)
+                })
         }
         None => {
             println!("    probe         : no block device behind any of {CANDIDATES} transports");
-            (0, 0)
+            None
         }
     };
 
-    // Always sent, success or not: the parent is blocked in `recv` and a
-    // driver that gives up silently would hang it.
+    // Sent *before* the server loop, and sent whether or not the device came
+    // up. Our parent is blocked in `recv` until it arrives -- and it is the
+    // parent that then spawns the client we are about to wait for, so a driver
+    // that started serving first would deadlock the pair of them.
+    let (sectors, verified) = brought_up.as_ref().map_or((0, 0), |(_, _, s, v)| (*s, *v));
     sys::call(
         bootinfo::slot::ENDPOINT,
         MessageInfo::new(spawn::READY, 2, false),
         [sectors as usize, verified, 0, 0],
     );
+
+    // From here we are a server rather than a program that read two sectors.
+    if let Some((queue, transport, _, _)) = brought_up {
+        let served = serve_blocks(&queue, &transport);
+        println!("    served        : {served} blocks before the client said stop");
+    }
 }
 
 /// Read each of `READ_SECTORS` and check the block says which one it is.
@@ -101,8 +112,16 @@ fn main() {
 fn read_sectors(queue: &Queue, transport: &Transport) -> usize {
     let mut verified = 0;
     for sector in READ_SECTORS {
-        match read_one(queue, transport, sector) {
-            Some((first, last)) => {
+        match read_into(queue, transport, sector, queue.pa() + DATA_OFF as u64) {
+            Some(()) => {
+                // SAFETY: our own frame, at the offset we just told the device
+                // to fill.
+                let (first, last) = unsafe {
+                    (
+                        ((queue.va() + DATA_OFF) as *const u64).read_volatile(),
+                        ((queue.va() + DATA_OFF + SECTOR - 8) as *const u64).read_volatile(),
+                    )
+                };
                 // Each block of the image carries its own number at both ends,
                 // so a read of the wrong block says which one it fetched.
                 let want = 0x07e5_5e7a_0000_0000 | sector;
@@ -119,10 +138,14 @@ fn read_sectors(queue: &Queue, transport: &Transport) -> usize {
     verified
 }
 
-/// One 512-byte read: a three-descriptor chain, a kick, and a *blocking* wait
-/// on the notification. The run queue is empty while we are in `wait`, so the
-/// kernel idles until the device raises its line (D-041).
-fn read_one(queue: &Queue, transport: &Transport, sector: u64) -> Option<(u64, u64)> {
+/// One 512-byte read into `dest_pa`: a three-descriptor chain, a kick, and a
+/// *blocking* wait on the notification. The run queue is empty while we are in
+/// `wait`, so the kernel idles until the device raises its line (D-041).
+///
+/// `dest_pa` is a bare physical address on purpose. When a client asks for a
+/// block that address is the *client's* frame, which this driver never maps and
+/// therefore never has in its own address space at all (D-046).
+fn read_into(queue: &Queue, transport: &Transport, sector: u64, dest_pa: u64) -> Option<()> {
     let (va, pa) = (queue.va(), queue.pa());
 
     // SAFETY: our own frame, mapped read-write, and these offsets are past the
@@ -139,7 +162,7 @@ fn read_one(queue: &Queue, transport: &Transport, sector: u64) -> Option<(u64, u
     // Three descriptors, because the flags are how the device learns which
     // parts it may write, and the status must be separate from the data.
     queue.set_desc(0, pa + HEADER_OFF as u64, 16, desc_flags::NEXT, 1);
-    queue.set_desc(1, pa + DATA_OFF as u64, SECTOR as u32, desc_flags::NEXT | desc_flags::WRITE, 2);
+    queue.set_desc(1, dest_pa, SECTOR as u32, desc_flags::NEXT | desc_flags::WRITE, 2);
     queue.set_desc(2, pa + STATUS_OFF as u64, 1, desc_flags::WRITE, 0);
 
     let before = queue.used_idx();
@@ -171,42 +194,53 @@ fn read_one(queue: &Queue, transport: &Transport, sector: u64) -> Option<(u64, u
         return None;
     }
 
-    // SAFETY: as above -- the 512-byte data buffer.
-    unsafe {
-        Some((
-            ((va + DATA_OFF) as *const u64).read_volatile(),
-            ((va + DATA_OFF + SECTOR - 8) as *const u64).read_volatile(),
-        ))
-    }
+    Some(())
 }
 
-/// The isolation demonstration: our page at the address our parent also has a
-/// page at holds our word, not theirs.
-fn say_hello(id: usize) {
-    // SAFETY: the parent mapped a frame here read-write before resuming us.
-    let seen = unsafe {
-        let p = spawn::SHARED_VADDR as *mut u64;
-        p.write_volatile(MAGIC);
-        p.read_volatile()
+/// Serve blocks until a client says stop. `reply_recv` is the loop the kernel
+/// was built around (D-031): one syscall answers the last caller and waits for
+/// the next, and the scheduler is never consulted on the way through.
+fn serve_blocks(queue: &Queue, transport: &Transport) -> usize {
+    // The connect carries the client's frame. Every request after it is four
+    // registers and no capability at all -- which is the point: a 512-byte
+    // block never fits in a message, so the message carries authority instead.
+    let first = sys::recv_cap(spawn::SERVICE, spawn::CLIENT_FRAME);
+    let ok = MessageInfo::new(0, 1, false);
+    if first.info.label() != block::CONNECT {
+        let _ = sys::reply(ok, [block::NO_BUFFER, 0, 0, 0]);
+        return 0;
+    }
+
+    // Ask where it is, and never map it. A descriptor needs a physical address
+    // and nothing else, so a client's page is never in this driver's address
+    // space at all (D-040, D-046).
+    let Ok(client_pa) = sys::get_address(spawn::CLIENT_FRAME) else {
+        let _ = sys::reply(ok, [block::FAILED, 0, 0, 0]);
+        return 0;
     };
+    println!("    connected     : client buffer at {client_pa:#x}, never mapped here");
 
-    // We hold the endpoint with `WRITE` and nothing else, which is exactly
-    // what `call` needs: the reply arrives through the Reply capability the
-    // kernel mints, never back through the endpoint (D-042).
-    let reply = sys::call(
-        bootinfo::slot::ENDPOINT,
-        MessageInfo::new(spawn::HELLO, 3, false),
-        [id, seen as usize, spawn::SHARED_VADDR, 0],
-    );
-    println!("    shared page   : wrote {seen:#x} at {:#x}", spawn::SHARED_VADDR);
-    println!("    parent said   : {:#x}", reply.words[0]);
-
-    // An empty slot names nothing that can be copied out of it.
-    assert!(sys::mint(bootinfo::slot::CNODE, bootinfo::slot::NULL, 60, rights::ALL, 0).is_err());
-    assert!(
-        sys::mint(bootinfo::slot::CNODE, bootinfo::slot::IRQ_CONTROL, 60, rights::ALL, 0).is_err(),
-        "a driver was holding IrqControl"
-    );
+    let mut served = 0usize;
+    let mut msg = sys::reply_recv(spawn::SERVICE, ok, [block::OK, 0, 0, 0]);
+    loop {
+        let status = match msg.info.label() {
+            block::READ => {
+                match read_into(queue, transport, msg.words[0] as u64, client_pa as u64) {
+                    Some(()) => {
+                        served += 1;
+                        block::OK
+                    }
+                    None => block::FAILED,
+                }
+            }
+            block::SHUTDOWN => {
+                let _ = sys::reply(ok, [block::OK, 0, 0, 0]);
+                return served;
+            }
+            _ => block::FAILED,
+        };
+        msg = sys::reply_recv(spawn::SERVICE, ok, [status, 0, 0, 0]);
+    }
 }
 
 /// Map each transport the parent handed over and ask what is behind it.

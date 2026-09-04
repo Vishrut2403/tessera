@@ -44,7 +44,8 @@ fn make_disk(kernel_dir: &PathBuf) {
 
 /// The user binaries the kernel embeds: the root task it loads, and the boot
 /// modules it only maps read-only for the root task to load itself (D-043).
-const BINS: [(&str, &str); 2] = [("root", "ROOT_TASK_ELF"), ("blk", "BLK_ELF")];
+const BINS: [(&str, &str); 3] =
+    [("root", "ROOT_TASK_ELF"), ("blk", "BLK_ELF"), ("client", "CLIENT_ELF")];
 
 /// Build every user binary and hand each ELF to the kernel to embed (D-039).
 fn build_user(kernel_dir: &PathBuf) {
